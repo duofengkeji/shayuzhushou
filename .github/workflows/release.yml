@@ -7,6 +7,12 @@ on:
 permissions:
   contents: write
 
+# A force-pushed release tag starts a new run. Keep only one run for the tag
+# so two matrices never upload to the same draft release simultaneously.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   desktop-release:
     strategy:
@@ -30,7 +36,9 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
-      - uses: tauri-apps/tauri-action@v0
+      # v1 replaces matching assets on an existing draft release, allowing a
+      # corrected release tag to be built again without asset-name conflicts.
+      - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
