@@ -1,12 +1,52 @@
+use aes_gcm::aead::{rand_core::RngCore, Aead, KeyInit, OsRng};
+use aes_gcm::{Aes256Gcm, Nonce};
+use base64::Engine as _;
 use chrono::Utc;
 use rusqlite::{params, Connection};
-use serde::Serialize;
-use std::{fs, sync::Mutex};
-use tauri::Manager;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{collections::HashMap, fs, sync::Mutex};
+use tauri::{Emitter, Manager};
 use uuid::Uuid;
+
+mod xianyu_im_local;
+mod xianyu_local;
 
 struct AppState {
     db: Mutex<Connection>,
+    secret_key: [u8; 32],
+    chat_listeners: Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
+    im_statuses: Mutex<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatImEvent {
+    account_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImStatusEvent {
+    account_id: String,
+    status: String,
+    message: String,
+}
+
+fn update_im_status(app: &tauri::AppHandle, account_id: &str, status: &str, message: &str) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut statuses) = state.im_statuses.lock() {
+            statuses.insert(account_id.to_owned(), status.to_owned());
+        }
+    }
+    let _ = app.emit(
+        "im-status",
+        ImStatusEvent {
+            account_id: account_id.to_owned(),
+            status: status.to_owned(),
+            message: message.to_owned(),
+        },
+    );
 }
 
 #[derive(Debug, Serialize)]
@@ -20,6 +60,17 @@ struct Account {
     last_sync_at: String,
     product_count: i64,
     order_count: i64,
+    source_url: String,
+    remote_account_id: String,
+    conversation_name: String,
+    avatar_url: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AccountProfile {
+    nickname: String,
+    avatar_url: String,
+    cookie: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,6 +84,26 @@ struct Product {
     status: String,
     updated_at: String,
     tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct QuickReplyImage {
+    name: String,
+    mime_type: String,
+    data_url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickReply {
+    id: String,
+    account_id: String,
+    title: String,
+    content: String,
+    short_code: String,
+    images: Vec<QuickReplyImage>,
+    updated_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,8 +129,354 @@ struct DashboardStats {
     pending_orders: i64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncResult {
+    account: Account,
+    products_changed: usize,
+    orders_changed: usize,
+    source_connected: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncJob {
+    id: String,
+    account_id: String,
+    resource: String,
+    status: String,
+    started_at: String,
+    finished_at: String,
+    error_message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatContactsPage {
+    items: Vec<xianyu_im_local::ChatContact>,
+    next_cursor: Option<i64>,
+    has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatMessagesPage {
+    items: Vec<xianyu_im_local::ChatMessage>,
+    next_cursor: Option<i64>,
+    has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QrLoginStart {
+    success: bool,
+    session_id: String,
+    qr_code_url: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QrLoginStatus {
+    success: bool,
+    status: String,
+    message: String,
+    face_qr_url: String,
+    verification_url: String,
+    account_id: String,
+    display_name: String,
+    is_new_account: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupData {
+    exported_at: String,
+    accounts: Vec<Account>,
+    products: Vec<Product>,
+    orders: Vec<Order>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountInput {
+    display_name: String,
+    alias: String,
+    platform: String,
+    status: String,
+    #[serde(default)]
+    source_url: String,
+    #[serde(default)]
+    remote_account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductInput {
+    account_id: String,
+    title: String,
+    price: f64,
+    stock: i64,
+    status: String,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrderInput {
+    account_id: String,
+    product_title: String,
+    buyer_masked_name: String,
+    amount: f64,
+    status: String,
+    note: String,
+}
+
 fn to_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+fn encrypt_secret(secret_key: &[u8; 32], value: &str) -> Result<String, String> {
+    let cipher = Aes256Gcm::new_from_slice(secret_key).map_err(to_error)?;
+    let mut nonce_bytes = [0_u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let encrypted = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), value.as_bytes())
+        .map_err(|_| "本机会话加密失败".to_owned())?;
+    let mut payload = nonce_bytes.to_vec();
+    payload.extend(encrypted);
+    Ok(format!(
+        "enc:v1:{}",
+        base64::engine::general_purpose::STANDARD.encode(payload)
+    ))
+}
+
+fn decrypt_secret(secret_key: &[u8; 32], value: &str) -> Result<String, String> {
+    let Some(encoded) = value.strip_prefix("enc:v1:") else {
+        return Ok(value.to_owned());
+    };
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "本机会话密文已损坏".to_owned())?;
+    if payload.len() <= 12 {
+        return Err("本机会话密文已损坏".to_owned());
+    }
+    let cipher = Aes256Gcm::new_from_slice(secret_key).map_err(to_error)?;
+    let decrypted = cipher
+        .decrypt(Nonce::from_slice(&payload[..12]), &payload[12..])
+        .map_err(|_| "无法解密本机会话，请重新扫码登录".to_owned())?;
+    String::from_utf8(decrypted).map_err(|_| "本机会话内容无效".to_owned())
+}
+
+fn value_string(value: &Value, names: &[&str]) -> String {
+    names
+        .iter()
+        .find_map(|name| value.get(*name))
+        .map(|value| match value {
+            Value::String(text) => text.trim().to_owned(),
+            Value::Number(number) => number.to_string(),
+            _ => String::new(),
+        })
+        .unwrap_or_default()
+}
+
+fn value_number(value: &Value, names: &[&str]) -> f64 {
+    names
+        .iter()
+        .find_map(|name| value.get(*name))
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_f64(),
+            Value::String(text) => text.parse::<f64>().ok(),
+            _ => None,
+        })
+        .unwrap_or(0.0)
+}
+
+fn value_i64(value: &Value, names: &[&str]) -> i64 {
+    value_number(value, names).max(0.0) as i64
+}
+
+fn cookie_value(cookie: &str, names: &[&str]) -> String {
+    cookie
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| names.contains(&name.trim()).then(|| value.trim().to_owned()))
+        .unwrap_or_default()
+}
+
+fn decode_cookie_text(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let decode = |value: u8| match value {
+                b'0'..=b'9' => Some(value - b'0'),
+                b'a'..=b'f' => Some(value - b'a' + 10),
+                b'A'..=b'F' => Some(value - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(high), Some(low)) = (decode(bytes[index + 1]), decode(bytes[index + 2])) {
+                output.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(if bytes[index] == b'+' { b' ' } else { bytes[index] });
+        index += 1;
+    }
+    String::from_utf8(output).unwrap_or_else(|_| value.to_owned())
+}
+
+async fn fetch_account_profile(cookie: &str) -> Result<AccountProfile, String> {
+    let user_id = cookie_value(cookie, &["unb", "munb"]);
+    if user_id.is_empty() {
+        return Err("当前登录会话缺少闲鱼用户标识".to_owned());
+    }
+    // The platform accepts both an IM-style session id and a bare user id,
+    // depending on the account's current login route. Try both forms so QR
+    // logins and restored local sessions share the same profile flow.
+    let session_ids = if user_id.contains('@') {
+        vec![user_id]
+    } else {
+        vec![format!("{user_id}@goofish"), user_id]
+    };
+    let mut current_cookie = cookie.to_owned();
+    // tracknick belongs to the account that completed the QR login. Unlike the
+    // IM profile query, it cannot resolve to the conversation peer, so use it
+    // as the display-name authority whenever the platform provided it.
+    let cookie_nickname = decode_cookie_text(&cookie_value(cookie, &["tracknick"]));
+    let mut last_error = String::new();
+    for session_id in session_ids {
+        match xianyu_local::mtop_call(
+            &current_cookie,
+            "mtop.taobao.idlemessage.pc.user.query",
+            "4.0",
+            "originaljson",
+            &serde_json::json!({
+                "type": 0,
+                "sessionType": 1,
+                "sessionId": session_id,
+                "isOwner": true,
+            }),
+        )
+        .await
+        {
+            Ok((_body, renewed_cookie)) => {
+                current_cookie = renewed_cookie;
+                let result = AccountProfile {
+                    // `user.query` sometimes returns the conversation peer's
+                    // nick even with isOwner=true. Only the login cookie's
+                    // tracknick may update the account title here; the IM
+                    // stream can later provide the verified seller name.
+                    nickname: cookie_nickname.clone(),
+                    // Do not use the generic profile avatar here: for some
+                    // IM sessions it belongs to the conversation peer. The
+                    // verified avatar is collected from outgoing IM messages.
+                    avatar_url: String::new(),
+                    cookie: current_cookie.clone(),
+                };
+                if !result.nickname.is_empty() || !result.avatar_url.is_empty() {
+                    return Ok(result);
+                }
+                last_error = "闲鱼账号资料返回为空".to_owned();
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    Err(if last_error.is_empty() {
+        "无法读取闲鱼账号资料".to_owned()
+    } else {
+        last_error
+    })
+}
+
+fn save_account_profile(
+    conn: &Connection,
+    account_id: &str,
+    profile: &AccountProfile,
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO account_profiles (account_id, nickname, avatar_url, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(account_id) DO UPDATE SET nickname = CASE WHEN excluded.nickname <> '' THEN excluded.nickname ELSE account_profiles.nickname END, avatar_url = CASE WHEN excluded.avatar_url <> '' THEN excluded.avatar_url ELSE account_profiles.avatar_url END, updated_at = excluded.updated_at",
+        params![account_id, profile.nickname, profile.avatar_url, now],
+    )
+    .map_err(to_error)?;
+    if !profile.nickname.is_empty() {
+        conn.execute(
+            "UPDATE accounts SET display_name = ?1 WHERE id = ?2",
+            params![profile.nickname, account_id],
+        )
+        .map_err(to_error)?;
+    }
+    Ok(())
+}
+
+fn value_list(payload: &Value) -> Vec<&Value> {
+    if let Some(items) = payload.as_array() {
+        return items.iter().collect();
+    }
+    for key in ["items", "data", "list", "records"] {
+        if let Some(items) = payload.get(key).and_then(Value::as_array) {
+            return items.iter().collect();
+        }
+        if let Some(items) = payload
+            .get(key)
+            .and_then(|value| value.get("items"))
+            .and_then(Value::as_array)
+        {
+            return items.iter().collect();
+        }
+        if let Some(items) = payload
+            .get(key)
+            .and_then(|value| value.get("list"))
+            .and_then(Value::as_array)
+        {
+            return items.iter().collect();
+        }
+    }
+    Vec::new()
+}
+
+fn normalize_product_status(raw: String, stock: i64) -> String {
+    if stock == 0 {
+        return "已下架".to_owned();
+    }
+    match raw.as_str() {
+        "已上架" | "上架" | "online" | "active" | "1" => "已上架".to_owned(),
+        "已下架" | "下架" | "offline" | "inactive" | "0" => "已下架".to_owned(),
+        _ => "已上架".to_owned(),
+    }
+}
+
+fn normalize_order_status(raw: String) -> String {
+    match raw.as_str() {
+        "待付款" | "待支付" | "unpaid" | "pending_payment" => "待付款".to_owned(),
+        "待发货" | "待寄件" | "paid" | "pending_shipment" => "待发货".to_owned(),
+        "已发货" | "shipped" | "pending_receipt" => "待收货".to_owned(),
+        "已完成" | "交易成功" | "completed" | "success" => "已完成".to_owned(),
+        "退款成功" | "已退款" | "refunded" => "已退款".to_owned(),
+        "退款中" | "refunding" | "refund" => "退款中".to_owned(),
+        "交易关闭" | "已关闭" | "退款关闭" | "cancelled" | "closed" => {
+            "已关闭".to_owned()
+        }
+        _ if raw.trim().is_empty() => "待处理".to_owned(),
+        _ => raw,
+    }
+}
+
+fn record_sync_job(
+    conn: &Connection,
+    account_id: &str,
+    status: &str,
+    started_at: &str,
+    error_message: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO sync_jobs (id, account_id, resource, status, started_at, finished_at, error_message) VALUES (?1, ?2, 'local-connector', ?3, ?4, ?4, ?5)",
+        params![Uuid::new_v4().to_string(), account_id, status, started_at, error_message],
+    )?;
+    Ok(())
 }
 
 fn count_for(conn: &Connection, table: &str, account_id: &str) -> rusqlite::Result<i64> {
@@ -72,15 +489,22 @@ fn count_for(conn: &Connection, table: &str, account_id: &str) -> rusqlite::Resu
 
 fn get_account(conn: &Connection, account_id: &str) -> rusqlite::Result<Account> {
     let account = conn.query_row(
-        "SELECT id, display_name, alias, platform, status, last_sync_at FROM accounts WHERE id = ?1",
+        "SELECT a.id, a.display_name, a.alias, a.platform, a.status, a.last_sync_at, COALESCE(s.source_url, ''), COALESCE(s.remote_account_id, ''), COALESCE(CASE WHEN p.avatar_source = 'im_message' THEN p.avatar_url ELSE '' END, '') FROM accounts a LEFT JOIN account_sources s ON s.account_id = a.id LEFT JOIN account_profiles p ON p.account_id = a.id WHERE a.id = ?1",
         [account_id],
         |row| {
             Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?,
             ))
         },
     )?;
+    let conversation_name = conn
+        .query_row(
+            "SELECT conversation_name FROM conversation_preferences WHERE account_id = ?1",
+            [account_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default();
     Ok(Account {
         id: account.0,
         display_name: account.1,
@@ -90,6 +514,10 @@ fn get_account(conn: &Connection, account_id: &str) -> rusqlite::Result<Account>
         last_sync_at: account.5,
         product_count: count_for(conn, "products", account_id)?,
         order_count: count_for(conn, "orders", account_id)?,
+        source_url: account.6,
+        remote_account_id: account.7,
+        conversation_name,
+        avatar_url: account.8,
     })
 }
 
@@ -115,51 +543,132 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
           id TEXT PRIMARY KEY, account_id TEXT NOT NULL, resource TEXT NOT NULL,
           status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, error_message TEXT
         );
+        CREATE TABLE IF NOT EXISTS account_sources (
+          account_id TEXT PRIMARY KEY, source_url TEXT NOT NULL, remote_account_id TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS account_credentials (
+          account_id TEXT PRIMARY KEY, cookie TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS account_profiles (
+          account_id TEXT PRIMARY KEY, nickname TEXT NOT NULL DEFAULT '',
+          avatar_url TEXT NOT NULL DEFAULT '', avatar_source TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS chat_contacts (
+          account_id TEXT NOT NULL, chat_id TEXT NOT NULL, other_user_id TEXT NOT NULL,
+          other_user_name TEXT NOT NULL, avatar_url TEXT NOT NULL DEFAULT '',
+          item_id TEXT NOT NULL, item_title TEXT NOT NULL,
+          item_image_url TEXT NOT NULL DEFAULT '', order_status TEXT NOT NULL DEFAULT '',
+          buyer_tag TEXT NOT NULL DEFAULT '',
+          profile_synced_at TEXT NOT NULL DEFAULT '',
+          latest_message TEXT NOT NULL, latest_message_time TEXT NOT NULL, unread_count INTEGER NOT NULL,
+          PRIMARY KEY (account_id, chat_id)
+        );
+        CREATE TABLE IF NOT EXISTS chat_messages (
+          account_id TEXT NOT NULL, id TEXT NOT NULL, chat_id TEXT NOT NULL,
+          sender_user_id TEXT NOT NULL, sender_user_name TEXT NOT NULL, direction TEXT NOT NULL,
+          content_kind TEXT NOT NULL, text TEXT NOT NULL, media_url TEXT NOT NULL DEFAULT '', sent_at TEXT NOT NULL, send_status TEXT NOT NULL,
+          PRIMARY KEY (account_id, id)
+        );
+        CREATE TABLE IF NOT EXISTS quick_replies (
+          id TEXT PRIMARY KEY, account_id TEXT NOT NULL, title TEXT NOT NULL,
+          content TEXT NOT NULL, short_code TEXT NOT NULL, images TEXT NOT NULL DEFAULT '[]',
+          updated_at TEXT NOT NULL, UNIQUE(account_id, short_code)
+        );
+        CREATE TABLE IF NOT EXISTS chat_read_state (
+          account_id TEXT NOT NULL, chat_id TEXT NOT NULL, read_at TEXT NOT NULL,
+          PRIMARY KEY (account_id, chat_id)
+        );
+        CREATE TABLE IF NOT EXISTS conversation_preferences (
+          account_id TEXT PRIMARY KEY, conversation_name TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(account_id, chat_id, sent_at);
         ",
     )?;
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))?;
-    if count == 0 {
-        let first = create_demo_account(conn, "鲨鱼精选店", "主运营账号", "授权有效")?;
-        let _second = create_demo_account(conn, "海风数码店", "华东账号", "即将过期")?;
-        seed_demo_records(conn, &first.id)?;
+    let has_avatar_source = conn
+        .prepare("PRAGMA table_info(account_profiles)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|column| column == "avatar_source");
+    if !has_avatar_source {
+        conn.execute("ALTER TABLE account_profiles ADD COLUMN avatar_source TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    let _ = conn.execute(
+        "ALTER TABLE chat_contacts ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_contacts ADD COLUMN item_image_url TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_contacts ADD COLUMN order_status TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_contacts ADD COLUMN buyer_tag TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_contacts ADD COLUMN profile_synced_at TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_messages ADD COLUMN media_url TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    conn.execute(
+        "DELETE FROM chat_messages WHERE rowid IN (
+          SELECT CASE
+            WHEN older.id LIKE '%.PNM' AND newer.id NOT LIKE '%.PNM' THEN newer.rowid
+            WHEN newer.id LIKE '%.PNM' AND older.id NOT LIKE '%.PNM' THEN older.rowid
+            ELSE newer.rowid
+          END
+          FROM chat_messages older
+          JOIN chat_messages newer
+            ON newer.account_id = older.account_id
+           AND newer.chat_id = older.chat_id
+           AND newer.direction = older.direction
+           AND newer.content_kind = older.content_kind
+           AND newer.text = older.text
+           AND newer.rowid > older.rowid
+           AND ABS((julianday(newer.sent_at) - julianday(older.sent_at)) * 86400.0) < 1.0
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn save_account_source(
+    conn: &Connection,
+    account_id: &str,
+    source_url: &str,
+    remote_account_id: &str,
+) -> rusqlite::Result<()> {
+    if source_url.trim().is_empty() && remote_account_id.trim().is_empty() {
+        conn.execute(
+            "DELETE FROM account_sources WHERE account_id = ?1",
+            [account_id],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO account_sources (account_id, source_url, remote_account_id) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET source_url = excluded.source_url, remote_account_id = excluded.remote_account_id",
+            params![account_id, source_url.trim().trim_end_matches('/'), remote_account_id.trim()],
+        )?;
     }
     Ok(())
 }
 
-fn create_demo_account(conn: &Connection, display_name: &str, alias: &str, status: &str) -> rusqlite::Result<Account> {
-    let id = Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO accounts (id, display_name, alias, platform, status, last_sync_at) VALUES (?1, ?2, ?3, '闲鱼（演示）', ?4, ?5)",
-        params![id, display_name, alias, status, now],
-    )?;
-    get_account(conn, &id)
-}
-
-fn seed_demo_records(conn: &Connection, account_id: &str) -> rusqlite::Result<()> {
-    let now = Utc::now().to_rfc3339();
-    let product_data = [
-        ("便携式蓝牙耳机｜降噪长续航", 89.0, 36, "已上架", "数码,热销"),
-        ("全新机械键盘｜青轴 87 键", 128.0, 12, "已上架", "数码,现货"),
-        ("桌面氛围灯｜暖白三档可调", 49.0, 0, "已下架", "家居,缺货"),
-    ];
-    for (index, (title, price, stock, status, tags)) in product_data.iter().enumerate() {
-        let product_id = format!("DEMO-P-{:03}", index + 1);
-        conn.execute(
-            "INSERT OR IGNORE INTO products (id, account_id, title, price, stock, status, updated_at, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![product_id, account_id, title, price, stock, status, now, tags],
-        )?;
-    }
-    let order_data = [
-        ("XY202609180001", "便携式蓝牙耳机｜降噪长续航", "林**", 89.0, "待发货", "请尽快发货"),
-        ("XY202609180002", "全新机械键盘｜青轴 87 键", "陈**", 128.0, "待付款", ""),
-        ("XY202609170031", "便携式蓝牙耳机｜降噪长续航", "周**", 89.0, "已完成", "已确认收货"),
-    ];
-    for (index, (order_no, product_title, buyer, amount, status, note)) in order_data.iter().enumerate() {
-        conn.execute(
-            "INSERT OR IGNORE INTO orders (id, account_id, order_no, product_title, buyer_masked_name, amount, status, created_at, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![format!("DEMO-O-{:03}", index + 1), account_id, order_no, product_title, buyer, amount, status, now, note],
-        )?;
+fn ensure_account_exists(conn: &Connection, account_id: &str) -> Result<(), String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM accounts WHERE id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )
+        .map_err(to_error)?;
+    if count == 0 {
+        return Err("账号不存在或已被删除".to_owned());
     }
     Ok(())
 }
@@ -167,38 +676,174 @@ fn seed_demo_records(conn: &Connection, account_id: &str) -> rusqlite::Result<()
 #[tauri::command]
 fn list_accounts(state: tauri::State<'_, AppState>) -> Result<Vec<Account>, String> {
     let conn = state.db.lock().map_err(to_error)?;
-    let mut stmt = conn.prepare("SELECT id FROM accounts ORDER BY last_sync_at DESC").map_err(to_error)?;
-    let ids = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(to_error)?;
-    ids.map(|id| get_account(&conn, &id?)).collect::<Result<Vec<_>, _>>().map_err(to_error)
+    let mut stmt = conn
+        .prepare("SELECT id FROM accounts ORDER BY last_sync_at DESC")
+        .map_err(to_error)?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(to_error)?;
+    ids.map(|id| get_account(&conn, &id?))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)
 }
 
 #[tauri::command]
-fn list_products(account_id: Option<String>, state: tauri::State<'_, AppState>) -> Result<Vec<Product>, String> {
+fn update_conversation_name(
+    account_id: String,
+    conversation_name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Account, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &account_id)?;
+    let conversation_name = conversation_name.trim();
+    if conversation_name.chars().count() > 30 {
+        return Err("会话名称不能超过 30 个字符".to_owned());
+    }
+    if conversation_name.is_empty() {
+        conn.execute(
+            "DELETE FROM conversation_preferences WHERE account_id = ?1",
+            [&account_id],
+        )
+        .map_err(to_error)?;
+    } else {
+        conn.execute(
+            "INSERT INTO conversation_preferences (account_id, conversation_name) VALUES (?1, ?2) ON CONFLICT(account_id) DO UPDATE SET conversation_name = excluded.conversation_name",
+            params![account_id, conversation_name],
+        )
+        .map_err(to_error)?;
+    }
+    get_account(&conn, &account_id).map_err(to_error)
+}
+
+#[tauri::command]
+fn list_products(
+    account_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Product>, String> {
     let conn = state.db.lock().map_err(to_error)?;
     let query = "SELECT id, account_id, title, price, stock, status, updated_at, tags FROM products WHERE (?1 IS NULL OR account_id = ?1) ORDER BY updated_at DESC";
     let mut statement = conn.prepare(query).map_err(to_error)?;
+    let rows = statement
+        .query_map([account_id], |row| {
+            let tag_string: String = row.get(7)?;
+            Ok(Product {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                title: row.get(2)?,
+                price: row.get(3)?,
+                stock: row.get(4)?,
+                status: row.get(5)?,
+                updated_at: row.get(6)?,
+                tags: tag_string.split(',').map(str::to_owned).collect(),
+            })
+        })
+        .map_err(to_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
+}
+
+fn validate_quick_reply(title: &str, short_code: &str, images: &[QuickReplyImage]) -> Result<String, String> {
+    if title.trim().is_empty() {
+        return Err("快捷回复标题不能为空".to_owned());
+    }
+    let code = short_code.trim().trim_start_matches('/').to_lowercase();
+    if code.is_empty() || !code.chars().all(|value| value.is_ascii_alphanumeric() || value == '_' || value == '-') {
+        return Err("快捷回复简码只能使用字母、数字、下划线或连字符".to_owned());
+    }
+    if code.len() > 32 {
+        return Err("快捷回复简码不能超过 32 个字符".to_owned());
+    }
+    if images.len() > 6 {
+        return Err("每条快捷回复最多添加 6 张图片".to_owned());
+    }
+    if images.iter().any(|image| !image.mime_type.starts_with("image/") || image.data_url.len() > 8 * 1024 * 1024) {
+        return Err("快捷回复图片格式或大小无效".to_owned());
+    }
+    Ok(code)
+}
+
+fn read_quick_replies(conn: &Connection, account_id: &str) -> Result<Vec<QuickReply>, String> {
+    let mut statement = conn.prepare("SELECT id, account_id, title, content, short_code, images, updated_at FROM quick_replies WHERE account_id = ?1 ORDER BY updated_at DESC").map_err(to_error)?;
     let rows = statement.query_map([account_id], |row| {
-        let tag_string: String = row.get(7)?;
-        Ok(Product { id: row.get(0)?, account_id: row.get(1)?, title: row.get(2)?, price: row.get(3)?, stock: row.get(4)?, status: row.get(5)?, updated_at: row.get(6)?, tags: tag_string.split(',').map(str::to_owned).collect() })
+        let serialized_images: String = row.get(5)?;
+        Ok(QuickReply {
+            id: row.get(0)?, account_id: row.get(1)?, title: row.get(2)?, content: row.get(3)?, short_code: row.get(4)?,
+            images: serde_json::from_str(&serialized_images).unwrap_or_default(), updated_at: row.get(6)?,
+        })
     }).map_err(to_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
 }
 
 #[tauri::command]
-fn list_orders(account_id: Option<String>, state: tauri::State<'_, AppState>) -> Result<Vec<Order>, String> {
+fn list_quick_replies(account_id: String, state: tauri::State<'_, AppState>) -> Result<Vec<QuickReply>, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &account_id)?;
+    read_quick_replies(&conn, &account_id)
+}
+
+#[tauri::command]
+fn create_quick_reply(account_id: String, title: String, content: String, short_code: String, images: Vec<QuickReplyImage>, state: tauri::State<'_, AppState>) -> Result<QuickReply, String> {
+    let code = validate_quick_reply(&title, &short_code, &images)?;
+    if content.trim().is_empty() && images.is_empty() { return Err("快捷回复至少需要文字或图片".to_owned()); }
+    let id = format!("QR-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let updated_at = Utc::now().to_rfc3339();
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &account_id)?;
+    conn.execute("INSERT INTO quick_replies (id, account_id, title, content, short_code, images, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![id, account_id, title.trim(), content.trim(), code, serde_json::to_string(&images).map_err(to_error)?, updated_at]).map_err(|error| if error.to_string().contains("UNIQUE") { "该简码已被使用".to_owned() } else { error.to_string() })?;
+    read_quick_replies(&conn, &account_id)?.into_iter().find(|reply| reply.id == id).ok_or_else(|| "读取快捷回复失败".to_owned())
+}
+
+#[tauri::command]
+fn update_quick_reply(id: String, account_id: String, title: String, content: String, short_code: String, images: Vec<QuickReplyImage>, state: tauri::State<'_, AppState>) -> Result<QuickReply, String> {
+    let code = validate_quick_reply(&title, &short_code, &images)?;
+    if content.trim().is_empty() && images.is_empty() { return Err("快捷回复至少需要文字或图片".to_owned()); }
+    let updated_at = Utc::now().to_rfc3339();
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &account_id)?;
+    let changed = conn.execute("UPDATE quick_replies SET title = ?1, content = ?2, short_code = ?3, images = ?4, updated_at = ?5 WHERE id = ?6 AND account_id = ?7", params![title.trim(), content.trim(), code, serde_json::to_string(&images).map_err(to_error)?, updated_at, id, account_id]).map_err(|error| if error.to_string().contains("UNIQUE") { "该简码已被使用".to_owned() } else { error.to_string() })?;
+    if changed == 0 { return Err("快捷回复不存在".to_owned()); }
+    read_quick_replies(&conn, &account_id)?.into_iter().find(|reply| reply.id == id).ok_or_else(|| "读取快捷回复失败".to_owned())
+}
+
+#[tauri::command]
+fn delete_quick_reply(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    conn.execute("DELETE FROM quick_replies WHERE id = ?1", [id]).map_err(to_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_orders(
+    account_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Order>, String> {
     let conn = state.db.lock().map_err(to_error)?;
     let query = "SELECT id, account_id, order_no, product_title, buyer_masked_name, amount, status, created_at, note FROM orders WHERE (?1 IS NULL OR account_id = ?1) ORDER BY created_at DESC";
     let mut statement = conn.prepare(query).map_err(to_error)?;
-    let rows = statement.query_map([account_id], |row| {
-        Ok(Order { id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, product_title: row.get(3)?, buyer_masked_name: row.get(4)?, amount: row.get(5)?, status: row.get(6)?, created_at: row.get(7)?, note: row.get(8)? })
-    }).map_err(to_error)?;
+    let rows = statement
+        .query_map([account_id], |row| {
+            Ok(Order {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                order_no: row.get(2)?,
+                product_title: row.get(3)?,
+                buyer_masked_name: row.get(4)?,
+                amount: row.get(5)?,
+                status: row.get(6)?,
+                created_at: row.get(7)?,
+                note: row.get(8)?,
+            })
+        })
+        .map_err(to_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
 }
 
 #[tauri::command]
 fn dashboard_stats(state: tauri::State<'_, AppState>) -> Result<DashboardStats, String> {
     let conn = state.db.lock().map_err(to_error)?;
-    let count = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, i64>(0)).map_err(to_error);
+    let count = |sql: &str| {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .map_err(to_error)
+    };
     Ok(DashboardStats {
         total_accounts: count("SELECT COUNT(*) FROM accounts")?,
         healthy_accounts: count("SELECT COUNT(*) FROM accounts WHERE status = '授权有效'")?,
@@ -208,23 +853,1200 @@ fn dashboard_stats(state: tauri::State<'_, AppState>) -> Result<DashboardStats, 
 }
 
 #[tauri::command]
-fn add_demo_account(display_name: String, state: tauri::State<'_, AppState>) -> Result<Account, String> {
+fn list_sync_jobs(
+    account_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<SyncJob>, String> {
     let conn = state.db.lock().map_err(to_error)?;
-    let account = create_demo_account(&conn, &display_name, "本地演示账号", "授权有效").map_err(to_error)?;
-    seed_demo_records(&conn, &account.id).map_err(to_error)?;
-    get_account(&conn, &account.id).map_err(to_error)
+    let mut statement = conn.prepare(
+        "SELECT id, account_id, resource, status, started_at, COALESCE(finished_at, ''), COALESCE(error_message, '') FROM sync_jobs WHERE (?1 IS NULL OR account_id = ?1) ORDER BY started_at DESC LIMIT 100"
+    ).map_err(to_error)?;
+    let rows = statement
+        .query_map([account_id], |row| {
+            Ok(SyncJob {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                resource: row.get(2)?,
+                status: row.get(3)?,
+                started_at: row.get(4)?,
+                finished_at: row.get(5)?,
+                error_message: row.get(6)?,
+            })
+        })
+        .map_err(to_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
 }
 
 #[tauri::command]
-fn sync_account(account_id: String, state: tauri::State<'_, AppState>) -> Result<Account, String> {
+async fn generate_qr_login() -> Result<QrLoginStart, String> {
+    let result = xianyu_local::generate_qr().await?;
+    Ok(QrLoginStart {
+        success: true,
+        session_id: result.session_id,
+        qr_code_url: result.qr_code_url,
+        message: result.message,
+    })
+}
+
+#[tauri::command]
+async fn check_qr_login_status(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<QrLoginStatus, String> {
+    if session_id.trim().is_empty() {
+        return Err("二维码会话 ID 不能为空".to_owned());
+    }
+    let result = xianyu_local::poll_qr(session_id.trim()).await?;
+    let mut display_name = result.account_id.clone();
+    let mut is_new_account = false;
+    if result.status == "success" && !result.account_id.is_empty() && !result.cookie.is_empty() {
+        // The profile endpoint is the source of truth for the logged-in
+        // account's nickname and avatar. A profile failure must not invalidate
+        // an otherwise successful QR login, so retain the cookie either way.
+        let profile = fetch_account_profile(&result.cookie).await.ok();
+        let conn = state.db.lock().map_err(to_error)?;
+        let existing = conn
+            .query_row(
+                "SELECT account_id FROM account_sources WHERE remote_account_id = ?1 LIMIT 1",
+                [&result.account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        let local_id = if let Some(id) = existing {
+            id
+        } else {
+            is_new_account = true;
+            let id = Uuid::new_v4().to_string();
+            let now = Utc::now().to_rfc3339();
+            conn.execute("INSERT INTO accounts (id, display_name, alias, platform, status, last_sync_at) VALUES (?1, ?2, '本机扫码登录', '闲鱼', '授权有效', ?3)", params![id, result.account_id, now]).map_err(to_error)?;
+            save_account_source(&conn, &id, "", &result.account_id).map_err(to_error)?;
+            id
+        };
+        let latest_cookie = profile
+            .as_ref()
+            .filter(|profile| !profile.cookie.is_empty())
+            .map(|profile| profile.cookie.as_str())
+            .unwrap_or(&result.cookie);
+        let encrypted_cookie = encrypt_secret(&state.secret_key, latest_cookie)?;
+        conn.execute("INSERT INTO account_credentials (account_id, cookie, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET cookie = excluded.cookie, updated_at = excluded.updated_at", params![local_id, encrypted_cookie, Utc::now().to_rfc3339()]).map_err(to_error)?;
+        if let Some(profile) = profile.as_ref() {
+            save_account_profile(&conn, &local_id, profile)?;
+        }
+        display_name = get_account(&conn, &local_id)
+            .map_err(to_error)?
+            .display_name;
+    }
+    Ok(QrLoginStatus {
+        success: true,
+        status: result.status,
+        message: result.message,
+        face_qr_url: result.verification_qr_url,
+        verification_url: result.verification_url,
+        account_id: result.account_id,
+        display_name,
+        is_new_account,
+    })
+}
+
+#[tauri::command]
+fn create_account(
+    input: AccountInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<Account, String> {
+    if input.display_name.trim().is_empty() {
+        return Err("店铺名称不能为空".to_owned());
+    }
     let conn = state.db.lock().map_err(to_error)?;
+    let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
-    conn.execute("UPDATE accounts SET last_sync_at = ?1 WHERE id = ?2", params![now, account_id]).map_err(to_error)?;
     conn.execute(
-        "INSERT INTO sync_jobs (id, account_id, resource, status, started_at, finished_at, error_message) VALUES (?1, ?2, 'local-demo', '已完成', ?3, ?3, '')",
-        params![Uuid::new_v4().to_string(), account_id, now],
+        "INSERT INTO accounts (id, display_name, alias, platform, status, last_sync_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, input.display_name.trim(), input.alias.trim(), input.platform.trim(), &input.status, now],
     ).map_err(to_error)?;
-    get_account(&conn, &account_id).map_err(to_error)
+    save_account_source(&conn, &id, &input.source_url, &input.remote_account_id)
+        .map_err(to_error)?;
+    get_account(&conn, &id).map_err(to_error)
+}
+
+#[tauri::command]
+fn update_account(
+    id: String,
+    input: AccountInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<Account, String> {
+    if input.display_name.trim().is_empty() {
+        return Err("店铺名称不能为空".to_owned());
+    }
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &id)?;
+    conn.execute(
+        "UPDATE accounts SET display_name = ?1, alias = ?2, platform = ?3, status = ?4 WHERE id = ?5",
+        params![input.display_name.trim(), input.alias.trim(), input.platform.trim(), &input.status, id],
+    ).map_err(to_error)?;
+    save_account_source(&conn, &id, &input.source_url, &input.remote_account_id)
+        .map_err(to_error)?;
+    get_account(&conn, &id).map_err(to_error)
+}
+
+#[tauri::command]
+fn delete_account(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut conn = state.db.lock().map_err(to_error)?;
+    delete_account_records(&mut conn, &id)
+}
+
+fn delete_account_records(conn: &mut Connection, id: &str) -> Result<(), String> {
+    ensure_account_exists(&conn, &id)?;
+    let transaction = conn.transaction().map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM products WHERE account_id = ?1", [&id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM orders WHERE account_id = ?1", [&id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM sync_jobs WHERE account_id = ?1", [&id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM chat_messages WHERE account_id = ?1", [&id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM chat_contacts WHERE account_id = ?1", [&id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM chat_read_state WHERE account_id = ?1", [&id])
+        .map_err(to_error)?;
+    transaction
+        .execute(
+            "DELETE FROM conversation_preferences WHERE account_id = ?1",
+            [&id],
+        )
+        .map_err(to_error)?;
+    transaction
+        .execute(
+            "DELETE FROM account_credentials WHERE account_id = ?1",
+            [&id],
+        )
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM account_sources WHERE account_id = ?1", [&id])
+        .map_err(to_error)?;
+    let deleted = transaction
+        .execute("DELETE FROM accounts WHERE id = ?1", [&id])
+        .map_err(to_error)?;
+    if deleted != 1 {
+        return Err("账号删除失败，请刷新账号列表后重试".to_owned());
+    }
+    transaction.commit().map_err(to_error)?;
+    Ok(())
+}
+
+fn local_session(
+    conn: &Connection,
+    account_id: &str,
+    secret_key: &[u8; 32],
+) -> Result<String, String> {
+    ensure_account_exists(conn, account_id)?;
+    let cookie = conn
+        .query_row(
+            "SELECT cookie FROM account_credentials WHERE account_id = ?1",
+            [account_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default();
+    if cookie.trim().is_empty() {
+        return Err("当前账号没有本机会话，请先扫码登录".to_owned());
+    }
+    decrypt_secret(secret_key, &cookie)
+}
+
+fn save_renewed_session(
+    conn: &Connection,
+    account_id: &str,
+    cookie: &str,
+    secret_key: &[u8; 32],
+) -> Result<(), String> {
+    let encrypted_cookie = encrypt_secret(secret_key, cookie)?;
+    conn.execute(
+        "UPDATE account_credentials SET cookie = ?1, updated_at = ?2 WHERE account_id = ?3",
+        params![encrypted_cookie, Utc::now().to_rfc3339(), account_id],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
+fn read_chat_contacts(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<Vec<xianyu_im_local::ChatContact>, String> {
+    let mut statement = conn.prepare("SELECT c.account_id, c.chat_id, c.other_user_id, c.other_user_name, c.avatar_url, c.item_id, c.item_title, c.item_image_url, c.order_status, c.buyer_tag, c.latest_message, c.latest_message_time, CASE WHEN c.latest_message_time <= COALESCE(r.read_at, '') THEN 0 ELSE c.unread_count END, c.profile_synced_at FROM chat_contacts c LEFT JOIN chat_read_state r ON r.account_id = c.account_id AND r.chat_id = c.chat_id WHERE c.account_id = ?1 ORDER BY c.latest_message_time DESC").map_err(to_error)?;
+    let mut contacts = statement
+        .query_map([account_id], |row| {
+            Ok(xianyu_im_local::ChatContact {
+                account_id: row.get(0)?,
+                chat_id: row.get(1)?,
+                other_user_id: row.get(2)?,
+                other_user_name: row.get(3)?,
+                avatar_url: row.get(4)?,
+                item_id: row.get(5)?,
+                item_title: row.get(6)?,
+                item_image_url: row.get(7)?,
+                order_status: row.get(8)?,
+                buyer_tag: row.get(9)?,
+                latest_message: row.get(10)?,
+                latest_message_time: row.get(11)?,
+                unread_count: row.get(12)?,
+                profile_synced_at: row.get(13)?,
+            })
+        })
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    // A buyer may have several local conversation ids.  Older rows can have
+    // been saved with our temporary `用户 <id>` label while another row already
+    // contains the official nickname.  Normalize the in-memory list by buyer
+    // id before it reaches the UI so stale duplicate rows never surface.
+    let mut official_names = std::collections::HashMap::<String, String>::new();
+    for contact in &contacts {
+        let name = contact.other_user_name.trim();
+        let is_fallback = name
+            .strip_prefix("用户 ")
+            .or_else(|| name.strip_prefix("用户_"))
+            .is_some_and(|suffix| suffix.chars().all(|character| character.is_ascii_digit()));
+        if !name.is_empty() && !is_fallback {
+            official_names
+                .entry(contact.other_user_id.clone())
+                .or_insert_with(|| contact.other_user_name.clone());
+        }
+    }
+    for contact in &mut contacts {
+        let is_fallback = contact
+            .other_user_name
+            .trim()
+            .strip_prefix("用户 ")
+            .or_else(|| contact.other_user_name.trim().strip_prefix("用户_"))
+            .is_some_and(|suffix| suffix.chars().all(|character| character.is_ascii_digit()));
+        if is_fallback {
+            if let Some(name) = official_names.get(&contact.other_user_id) {
+                contact.other_user_name = name.clone();
+            }
+        }
+    }
+    Ok(contacts)
+}
+
+#[tauri::command]
+fn list_chat_contacts(
+    account_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<xianyu_im_local::ChatContact>, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &account_id)?;
+    read_chat_contacts(&conn, &account_id)
+}
+
+#[tauri::command]
+fn chat_unread_totals(
+    state: tauri::State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, i64>, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT c.account_id, COALESCE(SUM(CASE WHEN c.latest_message_time <= COALESCE(r.read_at, '') THEN 0 ELSE c.unread_count END), 0) \
+             FROM chat_contacts c \
+             LEFT JOIN chat_read_state r ON r.account_id = c.account_id AND r.chat_id = c.chat_id \
+             GROUP BY c.account_id",
+        )
+        .map_err(to_error)?;
+    let totals = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(to_error)?
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()
+        .map_err(to_error)?;
+    Ok(totals)
+}
+
+#[tauri::command]
+async fn start_chat_listener(
+    account_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        match local_session(&conn, &account_id, &state.secret_key) {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                update_im_status(&app, &account_id, "not_logged_in", &error);
+                return Err(error);
+            }
+        }
+    };
+    let mut listeners = state.chat_listeners.lock().map_err(to_error)?;
+    if listeners.contains_key(&account_id) {
+        return Ok(());
+    }
+    update_im_status(&app, &account_id, "connecting", "正在连接闲鱼 IM");
+    let listener_account_id = account_id.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        let mut cookie = cookie;
+        loop {
+            update_im_status(&app, &listener_account_id, "connecting", "正在连接闲鱼 IM");
+            let connected_app = app.clone();
+            let connected_account_id = listener_account_id.clone();
+            let push_app = app.clone();
+            let push_account_id = listener_account_id.clone();
+            let push_cookie = cookie.clone();
+            match xianyu_im_local::listen_for_push(&cookie, move || {
+                update_im_status(&connected_app, &connected_account_id, "connected", "闲鱼 IM 已连接");
+            }, move |value| {
+                let _ = ingest_im_push(&push_app, &push_account_id, &push_cookie, value);
+                let _ = push_app.emit(
+                    "chat-im-event",
+                    ChatImEvent { account_id: push_account_id.clone() },
+                );
+            }).await {
+                Ok(renewed_cookie) => {
+                    cookie = renewed_cookie;
+                    update_im_status(&app, &listener_account_id, "disconnected", "闲鱼 IM 连接已结束");
+                }
+                Err(error) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[im] account={} disconnected: {}", listener_account_id, error);
+                    update_im_status(&app, &listener_account_id, "disconnected", &error);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        }
+    });
+    listeners.insert(account_id, handle);
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_chat_listener(account_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if let Some(handle) = state.chat_listeners.lock().map_err(to_error)?.remove(&account_id) {
+        handle.abort();
+    }
+    if let Ok(mut statuses) = state.im_statuses.lock() {
+        statuses.insert(account_id, "stopped".to_owned());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_im_statuses(state: tauri::State<'_, AppState>) -> Result<HashMap<String, String>, String> {
+    state.im_statuses.lock().map(|statuses| statuses.clone()).map_err(to_error)
+}
+
+fn set_chat_read(conn: &Connection, account_id: &str, chat_id: &str) -> Result<(), String> {
+    let read_at = conn
+        .query_row(
+            "SELECT latest_message_time FROM chat_contacts WHERE account_id = ?1 AND chat_id = ?2",
+            params![account_id, chat_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| Utc::now().to_rfc3339());
+    conn.execute(
+        "INSERT INTO chat_read_state (account_id, chat_id, read_at) VALUES (?1, ?2, ?3) ON CONFLICT(account_id, chat_id) DO UPDATE SET read_at = CASE WHEN excluded.read_at > chat_read_state.read_at THEN excluded.read_at ELSE chat_read_state.read_at END",
+        params![account_id, chat_id, read_at],
+    )
+    .map_err(to_error)?;
+    conn.execute(
+        "UPDATE chat_contacts SET unread_count = 0 WHERE account_id = ?1 AND chat_id = ?2",
+        params![account_id, chat_id],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mark_chat_read(
+    account_id: String,
+    chat_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // Mark locally first so the UI never gets stuck behind a transient IM
+    // connection.  The remote call below is best-effort and idempotent.
+    let (cookie, message_id) = {
+        let conn = state.db.lock().map_err(to_error)?;
+        ensure_account_exists(&conn, &account_id)?;
+        let cookie = local_session(&conn, &account_id, &state.secret_key)?;
+        let message_id = conn
+            .query_row(
+                "SELECT id FROM chat_messages WHERE account_id = ?1 AND chat_id = ?2 ORDER BY sent_at DESC LIMIT 1",
+                params![account_id, chat_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_default();
+        set_chat_read(&conn, &account_id, &chat_id)?;
+        (cookie, message_id)
+    };
+
+    if !message_id.trim().is_empty() {
+        if let Ok((_, renewed_cookie)) = xianyu_im_local::clear_red_point(&cookie, &chat_id, &message_id).await {
+            let conn = state.db.lock().map_err(to_error)?;
+            let _ = save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn sync_chat_contacts(
+    account_id: String,
+    cursor: Option<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<ChatContactsPage, String> {
+    let (cookie, cached_profiles) = {
+        let conn = state.db.lock().map_err(to_error)?;
+        let cookie = local_session(&conn, &account_id, &state.secret_key)?;
+        let profiles = read_chat_contacts(&conn, &account_id)?
+            .into_iter()
+            .fold(std::collections::HashMap::new(), |mut profiles, contact| {
+                let profile = xianyu_im_local::CachedChatProfile {
+                    display_name: contact.other_user_name,
+                    avatar_url: contact.avatar_url,
+                    buyer_tag: contact.buyer_tag,
+                    profile_synced_at: contact.profile_synced_at,
+                };
+                // The same buyer can have more than one conversation id. Keep
+                // a second cache key by buyer id so a newer conversation can
+                // reuse the official nickname/avatar from an older one.
+                profiles.insert(contact.chat_id, profile.clone());
+                let user_key = format!("user:{}", contact.other_user_id);
+                let should_replace_shared = profiles
+                    .get(&user_key)
+                    .map(|cached| {
+                        cached.display_name.trim().is_empty()
+                            || cached.display_name.starts_with("用户 ")
+                            || cached.display_name.starts_with("用户_")
+                    })
+                    .unwrap_or(true);
+                if should_replace_shared {
+                    profiles.insert(user_key, profile);
+                }
+                profiles
+            });
+        (cookie, profiles)
+    };
+    let page =
+        xianyu_im_local::fetch_contacts(&account_id, &cookie, &cached_profiles, cursor).await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    for contact in &page.items {
+        conn.execute(
+            "INSERT INTO chat_contacts (account_id, chat_id, other_user_id, other_user_name, avatar_url, item_id, item_title, item_image_url, order_status, buyer_tag, latest_message, latest_message_time, unread_count, profile_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT(account_id, chat_id) DO UPDATE SET other_user_id = excluded.other_user_id, other_user_name = excluded.other_user_name, avatar_url = CASE WHEN excluded.avatar_url <> '' THEN excluded.avatar_url ELSE chat_contacts.avatar_url END, item_id = CASE WHEN excluded.item_id <> '' THEN excluded.item_id ELSE chat_contacts.item_id END, item_title = CASE WHEN excluded.item_title <> '' THEN excluded.item_title ELSE chat_contacts.item_title END, item_image_url = CASE WHEN excluded.item_image_url <> '' THEN excluded.item_image_url ELSE chat_contacts.item_image_url END, order_status = excluded.order_status, buyer_tag = excluded.buyer_tag, latest_message = excluded.latest_message, latest_message_time = excluded.latest_message_time, unread_count = CASE WHEN EXISTS (SELECT 1 FROM chat_read_state WHERE account_id = excluded.account_id AND chat_id = excluded.chat_id AND read_at >= excluded.latest_message_time) THEN 0 ELSE MAX(chat_contacts.unread_count, excluded.unread_count) END, profile_synced_at = excluded.profile_synced_at",
+            params![contact.account_id, contact.chat_id, contact.other_user_id, contact.other_user_name, contact.avatar_url, contact.item_id, contact.item_title, contact.item_image_url, contact.order_status, contact.buyer_tag, contact.latest_message, contact.latest_message_time, contact.unread_count, contact.profile_synced_at],
+        ).map_err(to_error)?;
+    }
+    save_renewed_session(&conn, &account_id, &page.cookie, &state.secret_key)?;
+    Ok(ChatContactsPage {
+        items: read_chat_contacts(&conn, &account_id)?,
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+    })
+}
+
+fn read_chat_messages(
+    conn: &Connection,
+    account_id: &str,
+    chat_id: &str,
+) -> Result<Vec<xianyu_im_local::ChatMessage>, String> {
+    let mut statement = conn.prepare("SELECT id, account_id, chat_id, sender_user_id, sender_user_name, direction, content_kind, text, media_url, sent_at, send_status FROM chat_messages WHERE account_id = ?1 AND chat_id = ?2 ORDER BY sent_at ASC").map_err(to_error)?;
+    let messages = statement
+        .query_map(params![account_id, chat_id], |row| {
+            Ok(xianyu_im_local::ChatMessage {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                chat_id: row.get(2)?,
+                sender_user_id: row.get(3)?,
+                sender_user_name: row.get(4)?,
+                direction: row.get(5)?,
+                content_kind: row.get(6)?,
+                text: row.get(7)?,
+                media_url: row.get(8)?,
+                sent_at: row.get(9)?,
+                send_status: row.get(10)?,
+            })
+        })
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    let mut deduplicated = Vec::<xianyu_im_local::ChatMessage>::with_capacity(messages.len());
+    let mut latest_by_content = std::collections::HashMap::<String, (i64, usize)>::new();
+    for message in messages {
+        let sent_millis = chrono::DateTime::parse_from_rfc3339(&message.sent_at)
+            .map(|value| value.timestamp_millis())
+            .unwrap_or(i64::MIN);
+        let key = format!(
+            "{}\u{0}{}\u{0}{}",
+            message.direction, message.content_kind, message.text
+        );
+        if let Some((previous_millis, previous_index)) = latest_by_content.get(&key).copied() {
+            if sent_millis != i64::MIN && (sent_millis - previous_millis).abs() < 1_000 {
+                let previous_is_remote = deduplicated[previous_index].id.ends_with(".PNM");
+                let current_is_remote = message.id.ends_with(".PNM");
+                if current_is_remote && !previous_is_remote {
+                    deduplicated[previous_index] = message;
+                    latest_by_content.insert(key, (sent_millis, previous_index));
+                }
+                continue;
+            }
+        }
+        let index = deduplicated.len();
+        deduplicated.push(message);
+        latest_by_content.insert(key, (sent_millis, index));
+    }
+    Ok(deduplicated)
+}
+
+fn remove_near_duplicate_messages(
+    conn: &Connection,
+    account_id: &str,
+    chat_id: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM chat_messages WHERE rowid IN (
+          SELECT CASE
+            WHEN older.id LIKE '%.PNM' AND newer.id NOT LIKE '%.PNM' THEN newer.rowid
+            WHEN newer.id LIKE '%.PNM' AND older.id NOT LIKE '%.PNM' THEN older.rowid
+            ELSE newer.rowid
+          END
+          FROM chat_messages older
+          JOIN chat_messages newer
+            ON newer.account_id = older.account_id
+           AND newer.chat_id = older.chat_id
+           AND newer.direction = older.direction
+           AND newer.content_kind = older.content_kind
+           AND newer.text = older.text
+           AND newer.rowid > older.rowid
+           AND ABS((julianday(newer.sent_at) - julianday(older.sent_at)) * 86400.0) < 1.0
+          WHERE older.account_id = ?1 AND older.chat_id = ?2
+        )",
+        params![account_id, chat_id],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_chat_messages(
+    account_id: String,
+    chat_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<xianyu_im_local::ChatMessage>, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &account_id)?;
+    read_chat_messages(&conn, &account_id, &chat_id)
+}
+
+fn upsert_chat_message(
+    conn: &Connection,
+    message: &xianyu_im_local::ChatMessage,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO chat_messages (account_id, id, chat_id, sender_user_id, sender_user_name, direction, content_kind, text, media_url, sent_at, send_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(account_id, id) DO UPDATE SET sender_user_name = excluded.sender_user_name, direction = excluded.direction, content_kind = excluded.content_kind, text = excluded.text, media_url = excluded.media_url, sent_at = excluded.sent_at, send_status = excluded.send_status",
+        params![message.account_id, message.id, message.chat_id, message.sender_user_id, message.sender_user_name, message.direction, message.content_kind, message.text, message.media_url, message.sent_at, message.send_status],
+    ).map_err(to_error)?;
+    Ok(())
+}
+
+fn ingest_im_push(
+    app: &tauri::AppHandle,
+    account_id: &str,
+    cookie: &str,
+    value: &Value,
+) -> Result<usize, String> {
+    let messages = xianyu_im_local::parse_push_messages(value, account_id, cookie);
+    if messages.is_empty() {
+        return Ok(0);
+    }
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "应用状态尚未初始化".to_owned())?;
+    let conn = state.db.lock().map_err(to_error)?;
+    let mut inserted = 0;
+    for message in &messages {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM chat_messages WHERE account_id = ?1 AND id = ?2 LIMIT 1",
+                params![account_id, message.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok();
+        upsert_chat_message(&conn, message)?;
+        if !exists {
+            inserted += 1;
+        }
+        let is_incoming = message.direction == "incoming";
+        let incoming = i64::from(is_incoming);
+        let unread_increment = if exists { 0 } else { incoming };
+        let other_user_id = if is_incoming {
+            message.sender_user_id.clone()
+        } else {
+            String::new()
+        };
+        let other_user_name = if is_incoming && !message.sender_user_name.trim().is_empty() {
+            message.sender_user_name.clone()
+        } else {
+            String::new()
+        };
+        conn.execute(
+            "INSERT INTO chat_contacts (account_id, chat_id, other_user_id, other_user_name, avatar_url, item_id, item_title, item_image_url, order_status, buyer_tag, latest_message, latest_message_time, unread_count, profile_synced_at) VALUES (?1, ?2, ?3, ?4, '', '', '', '', '', '', ?5, ?6, ?7, '') ON CONFLICT(account_id, chat_id) DO UPDATE SET other_user_id = CASE WHEN excluded.other_user_id <> '' THEN excluded.other_user_id ELSE chat_contacts.other_user_id END, other_user_name = CASE WHEN excluded.other_user_name <> '' THEN excluded.other_user_name ELSE chat_contacts.other_user_name END, latest_message = CASE WHEN excluded.latest_message_time >= chat_contacts.latest_message_time THEN excluded.latest_message ELSE chat_contacts.latest_message END, latest_message_time = CASE WHEN excluded.latest_message_time >= chat_contacts.latest_message_time THEN excluded.latest_message_time ELSE chat_contacts.latest_message_time END, unread_count = chat_contacts.unread_count + excluded.unread_count",
+            params![account_id, message.chat_id, other_user_id, other_user_name, message.text, message.sent_at, unread_increment],
+        ).map_err(to_error)?;
+    }
+    Ok(inserted)
+}
+
+#[tauri::command]
+async fn sync_chat_messages(
+    account_id: String,
+    chat_id: String,
+    cursor: Option<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<ChatMessagesPage, String> {
+    if chat_id.trim().is_empty() {
+        return Err("会话 ID 不能为空".to_owned());
+    }
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    let page = xianyu_im_local::fetch_messages(&account_id, &chat_id, &cookie, cursor).await?;
+    // The official client clears the remote red point using the last message
+    // currently loaded. This also covers the first open, when the local cache
+    // did not yet contain a message id for the conversation.
+    let mut renewed_cookie = page.cookie.clone();
+    if let Some(last_message) = page.items.last().filter(|message| !message.id.trim().is_empty()) {
+        if let Ok((_, remote_cookie)) = xianyu_im_local::clear_red_point(&page.cookie, &chat_id, &last_message.id).await {
+            renewed_cookie = remote_cookie;
+        }
+    }
+    let conn = state.db.lock().map_err(to_error)?;
+    if let Some(owner_name) = page.items.iter().find_map(|message| {
+        let value = message.sender_user_name.trim();
+        (message.direction == "outgoing" && !value.is_empty() && value != "我").then(|| value.to_owned())
+    }) {
+        // Message-level sender titles identify the actual seller, while the
+        // conversation-level title can be a member/login name. Prefer this
+        // value when it is available from an outgoing message.
+        conn.execute("UPDATE accounts SET display_name = ?1 WHERE id = ?2", params![owner_name, account_id]).map_err(to_error)?;
+        conn.execute("UPDATE account_profiles SET nickname = ?1, updated_at = ?2 WHERE account_id = ?3", params![owner_name, Utc::now().to_rfc3339(), account_id]).map_err(to_error)?;
+    }
+    if !page.own_avatar_url.is_empty() {
+        conn.execute("UPDATE account_profiles SET avatar_url = ?1, avatar_source = 'im_message', updated_at = ?2 WHERE account_id = ?3", params![page.own_avatar_url, Utc::now().to_rfc3339(), account_id]).map_err(to_error)?;
+    }
+    for message in &page.items {
+        upsert_chat_message(&conn, message)?;
+    }
+    remove_near_duplicate_messages(&conn, &account_id, &chat_id)?;
+    set_chat_read(&conn, &account_id, &chat_id)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(ChatMessagesPage {
+        items: read_chat_messages(&conn, &account_id, &chat_id)?,
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+    })
+}
+
+#[tauri::command]
+async fn send_chat_message(
+    account_id: String,
+    chat_id: String,
+    receiver_user_id: String,
+    text: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<xianyu_im_local::ChatMessage, String> {
+    if chat_id.trim().is_empty() || receiver_user_id.trim().is_empty() {
+        return Err("会话或收件人信息不完整".to_owned());
+    }
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    let (message, renewed_cookie) =
+        xianyu_im_local::send_text(&account_id, &chat_id, &receiver_user_id, &cookie, &text)
+            .await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    upsert_chat_message(&conn, &message)?;
+    conn.execute("UPDATE chat_contacts SET latest_message = ?1, latest_message_time = ?2 WHERE account_id = ?3 AND chat_id = ?4", params![message.text, message.sent_at, account_id, chat_id]).map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(message)
+}
+
+#[tauri::command]
+async fn send_chat_image(
+    account_id: String,
+    chat_id: String,
+    receiver_user_id: String,
+    file_name: String,
+    mime_type: String,
+    image_data: String,
+    width: u32,
+    height: u32,
+    state: tauri::State<'_, AppState>,
+) -> Result<xianyu_im_local::ChatMessage, String> {
+    if chat_id.trim().is_empty() || receiver_user_id.trim().is_empty() {
+        return Err("会话或收件人信息不完整".to_owned());
+    }
+    let encoded = image_data
+        .split_once(',')
+        .map(|(_, value)| value)
+        .unwrap_or(image_data.as_str());
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "图片数据格式无效".to_owned())?;
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    let (message, renewed_cookie) = xianyu_im_local::send_image(
+        &account_id,
+        &chat_id,
+        &receiver_user_id,
+        &cookie,
+        &file_name,
+        &mime_type,
+        bytes,
+        width,
+        height,
+    )
+    .await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    upsert_chat_message(&conn, &message)?;
+    conn.execute("UPDATE chat_contacts SET latest_message = ?1, latest_message_time = ?2 WHERE account_id = ?3 AND chat_id = ?4", params![message.text, message.sent_at, account_id, chat_id]).map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(message)
+}
+
+#[tauri::command]
+fn create_product(
+    input: ProductInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<Product, String> {
+    if input.title.trim().is_empty() {
+        return Err("商品标题不能为空".to_owned());
+    }
+    if input.price < 0.0 || input.stock < 0 {
+        return Err("价格和库存不能为负数".to_owned());
+    }
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &input.account_id)?;
+    let id = format!("LOCAL-P-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let now = Utc::now().to_rfc3339();
+    let tags = input
+        .tags
+        .iter()
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(
+        "INSERT INTO products (id, account_id, title, price, stock, status, updated_at, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id, input.account_id, input.title.trim(), input.price, input.stock, input.status, now, tags],
+    ).map_err(to_error)?;
+    Ok(Product {
+        id,
+        account_id: input.account_id,
+        title: input.title.trim().to_owned(),
+        price: input.price,
+        stock: input.stock,
+        status: input.status,
+        updated_at: now,
+        tags: input.tags,
+    })
+}
+
+#[tauri::command]
+fn update_product(
+    id: String,
+    input: ProductInput,
+    state: tauri::State<'_, AppState>,
+) -> Result<Product, String> {
+    if input.title.trim().is_empty() {
+        return Err("商品标题不能为空".to_owned());
+    }
+    if input.price < 0.0 || input.stock < 0 {
+        return Err("价格和库存不能为负数".to_owned());
+    }
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &input.account_id)?;
+    let now = Utc::now().to_rfc3339();
+    let tags = input
+        .tags
+        .iter()
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    let changed = conn.execute(
+        "UPDATE products SET account_id = ?1, title = ?2, price = ?3, stock = ?4, status = ?5, updated_at = ?6, tags = ?7 WHERE id = ?8",
+        params![input.account_id, input.title.trim(), input.price, input.stock, input.status, now, tags, id],
+    ).map_err(to_error)?;
+    if changed == 0 {
+        return Err("商品不存在或已被删除".to_owned());
+    }
+    Ok(Product {
+        id,
+        account_id: input.account_id,
+        title: input.title.trim().to_owned(),
+        price: input.price,
+        stock: input.stock,
+        status: input.status,
+        updated_at: now,
+        tags: input.tags,
+    })
+}
+
+#[tauri::command]
+fn delete_product(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    let changed = conn
+        .execute("DELETE FROM products WHERE id = ?1", [id])
+        .map_err(to_error)?;
+    if changed == 0 {
+        return Err("商品不存在或已被删除".to_owned());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn update_products_status(
+    ids: Vec<String>,
+    status: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    if status != "已上架" && status != "已下架" {
+        return Err("不支持的商品状态".to_owned());
+    }
+    let mut conn = state.db.lock().map_err(to_error)?;
+    let transaction = conn.transaction().map_err(to_error)?;
+    let now = Utc::now().to_rfc3339();
+    let mut changed = 0;
+    for id in ids {
+        changed += transaction
+            .execute(
+                "UPDATE products SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status, now, id],
+            )
+            .map_err(to_error)?;
+    }
+    transaction.commit().map_err(to_error)?;
+    Ok(changed)
+}
+
+#[tauri::command]
+fn delete_products(ids: Vec<String>, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let mut conn = state.db.lock().map_err(to_error)?;
+    let transaction = conn.transaction().map_err(to_error)?;
+    let mut changed = 0;
+    for id in ids {
+        changed += transaction
+            .execute("DELETE FROM products WHERE id = ?1", [id])
+            .map_err(to_error)?;
+    }
+    transaction.commit().map_err(to_error)?;
+    Ok(changed)
+}
+
+#[tauri::command]
+fn create_order(input: OrderInput, state: tauri::State<'_, AppState>) -> Result<Order, String> {
+    if input.product_title.trim().is_empty() || input.buyer_masked_name.trim().is_empty() {
+        return Err("商品和买家信息不能为空".to_owned());
+    }
+    if input.amount < 0.0 {
+        return Err("订单金额不能为负数".to_owned());
+    }
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &input.account_id)?;
+    let id = Uuid::new_v4().to_string();
+    let order_no = format!(
+        "LOCAL-{}",
+        &Uuid::new_v4().simple().to_string()[..12].to_uppercase()
+    );
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO orders (id, account_id, order_no, product_title, buyer_masked_name, amount, status, created_at, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![id, input.account_id, order_no, input.product_title.trim(), input.buyer_masked_name.trim(), input.amount, input.status, now, input.note.trim()],
+    ).map_err(to_error)?;
+    Ok(Order {
+        id,
+        account_id: input.account_id,
+        order_no,
+        product_title: input.product_title.trim().to_owned(),
+        buyer_masked_name: input.buyer_masked_name.trim().to_owned(),
+        amount: input.amount,
+        status: input.status,
+        created_at: now,
+        note: input.note.trim().to_owned(),
+    })
+}
+
+#[tauri::command]
+fn update_order(
+    id: String,
+    status: String,
+    note: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Order, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    let changed = conn
+        .execute(
+            "UPDATE orders SET status = ?1, note = ?2 WHERE id = ?3",
+            params![status, note.trim(), id],
+        )
+        .map_err(to_error)?;
+    if changed == 0 {
+        return Err("订单不存在或已被删除".to_owned());
+    }
+    conn.query_row(
+        "SELECT id, account_id, order_no, product_title, buyer_masked_name, amount, status, created_at, note FROM orders WHERE id = ?1", [id],
+        |row| Ok(Order { id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, product_title: row.get(3)?, buyer_masked_name: row.get(4)?, amount: row.get(5)?, status: row.get(6)?, created_at: row.get(7)?, note: row.get(8)? }),
+    ).map_err(to_error)
+}
+
+#[tauri::command]
+fn delete_order(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    let changed = conn
+        .execute("DELETE FROM orders WHERE id = ?1", [id])
+        .map_err(to_error)?;
+    if changed == 0 {
+        return Err("订单不存在或已被删除".to_owned());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn update_orders_status(
+    ids: Vec<String>,
+    status: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let allowed = ["待付款", "待发货", "待收货", "已完成", "退款中", "已关闭"];
+    if !allowed.contains(&status.as_str()) {
+        return Err("不支持的订单状态".to_owned());
+    }
+    let mut conn = state.db.lock().map_err(to_error)?;
+    let transaction = conn.transaction().map_err(to_error)?;
+    let mut changed = 0;
+    for id in ids {
+        changed += transaction
+            .execute(
+                "UPDATE orders SET status = ?1 WHERE id = ?2",
+                params![status, id],
+            )
+            .map_err(to_error)?;
+    }
+    transaction.commit().map_err(to_error)?;
+    Ok(changed)
+}
+
+#[tauri::command]
+fn export_backup(state: tauri::State<'_, AppState>) -> Result<BackupData, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    let mut account_statement = conn
+        .prepare("SELECT id FROM accounts ORDER BY last_sync_at DESC")
+        .map_err(to_error)?;
+    let account_ids = account_statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    let accounts = account_ids
+        .iter()
+        .map(|id| get_account(&conn, id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+
+    let mut product_statement = conn.prepare("SELECT id, account_id, title, price, stock, status, updated_at, tags FROM products ORDER BY updated_at DESC").map_err(to_error)?;
+    let products = product_statement
+        .query_map([], |row| {
+            let tags: String = row.get(7)?;
+            Ok(Product {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                title: row.get(2)?,
+                price: row.get(3)?,
+                stock: row.get(4)?,
+                status: row.get(5)?,
+                updated_at: row.get(6)?,
+                tags: tags
+                    .split(',')
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            })
+        })
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+
+    let mut order_statement = conn.prepare("SELECT id, account_id, order_no, product_title, buyer_masked_name, amount, status, created_at, note FROM orders ORDER BY created_at DESC").map_err(to_error)?;
+    let orders = order_statement
+        .query_map([], |row| {
+            Ok(Order {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                order_no: row.get(2)?,
+                product_title: row.get(3)?,
+                buyer_masked_name: row.get(4)?,
+                amount: row.get(5)?,
+                status: row.get(6)?,
+                created_at: row.get(7)?,
+                note: row.get(8)?,
+            })
+        })
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+
+    Ok(BackupData {
+        exported_at: Utc::now().to_rfc3339(),
+        accounts,
+        products,
+        orders,
+    })
+}
+
+#[tauri::command]
+async fn sync_account(
+    account_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<SyncResult, String> {
+    let now = Utc::now().to_rfc3339();
+    let local_cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        ensure_account_exists(&conn, &account_id)?;
+        local_session(&conn, &account_id, &state.secret_key).unwrap_or_default()
+    };
+
+    if local_cookie.trim().is_empty() {
+        let conn = state.db.lock().map_err(to_error)?;
+        record_sync_job(
+            &conn,
+            &account_id,
+            "未登录",
+            &now,
+            "当前账号没有本机会话，请先扫码登录。",
+        )
+        .map_err(to_error)?;
+        return Ok(SyncResult {
+            account: get_account(&conn, &account_id).map_err(to_error)?,
+            products_changed: 0,
+            orders_changed: 0,
+            source_connected: false,
+        });
+    }
+
+    let response = async {
+        // Product/order calls refresh a stale MTop token when needed. Query
+        // the profile afterwards so existing local sessions can be backfilled
+        // even if their saved token had expired.
+        let (items, renewed_cookie) = xianyu_local::fetch_products(&local_cookie).await?;
+        let (orders, renewed_cookie) = xianyu_local::fetch_orders(&renewed_cookie).await?;
+        let profile = fetch_account_profile(&renewed_cookie).await.ok();
+        let renewed_cookie = profile
+            .as_ref()
+            .filter(|profile| !profile.cookie.is_empty())
+            .map(|profile| profile.cookie.clone())
+            .unwrap_or(renewed_cookie);
+        Ok::<(Value, Value, String, Option<AccountProfile>), String>((
+            Value::Array(items),
+            Value::Array(orders),
+            renewed_cookie,
+            profile,
+        ))
+    }
+    .await;
+    let (items_payload, orders_payload, renewed_cookie, profile) = match response {
+        Ok(payload) => payload,
+        Err(error) => {
+            let conn = state.db.lock().map_err(to_error)?;
+            record_sync_job(&conn, &account_id, "失败", &now, &error).map_err(to_error)?;
+            return Err(format!("本机闲鱼同步失败：{error}"));
+        }
+    };
+
+    let conn = state.db.lock().map_err(to_error)?;
+    if let Some(profile) = profile.as_ref() {
+        save_account_profile(&conn, &account_id, profile)?;
+    }
+    let mut products_changed = 0;
+    for item in value_list(&items_payload) {
+        let remote_id = value_string(item, &["item_id", "itemId", "num_iid", "id"]);
+        let title = value_string(item, &["title", "item_title", "itemTitle", "name"]);
+        if remote_id.is_empty() || title.is_empty() {
+            continue;
+        }
+        let direct_stock = value_i64(
+            item,
+            &["item_quantity", "stock", "quantity", "num", "inventory"],
+        );
+        let stock = if direct_stock > 0 {
+            direct_stock
+        } else {
+            item.get("variants")
+                .and_then(Value::as_array)
+                .map(|variants| {
+                    variants
+                        .iter()
+                        .map(|variant| value_i64(variant, &["stock_count", "quantity", "stock"]))
+                        .sum()
+                })
+                .unwrap_or(0)
+        };
+        let status = normalize_product_status(
+            value_string(
+                item,
+                &["item_status_desc", "status", "item_status", "itemStatus"],
+            ),
+            stock,
+        );
+        let tags = item
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let id = format!("SRC-P-{}-{}", &account_id[..8], remote_id);
+        products_changed += conn.execute(
+            "INSERT INTO products (id, account_id, title, price, stock, status, updated_at, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(id) DO UPDATE SET account_id = excluded.account_id, title = excluded.title, price = excluded.price, stock = excluded.stock, status = excluded.status, updated_at = excluded.updated_at, tags = excluded.tags",
+            params![id, account_id, title, value_number(item, &["price", "item_price", "itemPrice", "sale_price"]), stock, status, now, tags],
+        ).map_err(to_error)?;
+    }
+    let mut orders_changed = 0;
+    for order in value_list(&orders_payload) {
+        let remote_id = value_string(order, &["order_id", "orderId", "order_no", "orderNo", "id"]);
+        if remote_id.is_empty() {
+            continue;
+        }
+        let order_no = value_string(order, &["order_no", "orderNo", "order_id", "id"]);
+        let id = format!("SRC-O-{}-{}", &account_id[..8], remote_id);
+        orders_changed += conn.execute(
+            "INSERT INTO orders (id, account_id, order_no, product_title, buyer_masked_name, amount, status, created_at, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO UPDATE SET order_no = excluded.order_no, product_title = excluded.product_title, buyer_masked_name = excluded.buyer_masked_name, amount = excluded.amount, status = excluded.status, created_at = excluded.created_at, note = excluded.note",
+            params![id, account_id, order_no, value_string(order, &["item_title", "product_title", "productTitle", "title"]), value_string(order, &["buyer_fish_nick", "buyer_nick", "buyer_nickname", "buyer_name", "buyer_id"]), value_number(order, &["actual_amount", "amount", "price", "payment"]), normalize_order_status(value_string(order, &["status", "order_status", "orderStatus"])), value_string(order, &["created_at", "createdAt", "create_time", "createTime"]), value_string(order, &["note", "remark", "message"])],
+        ).map_err(to_error)?;
+    }
+    conn.execute(
+        "UPDATE accounts SET last_sync_at = ?1 WHERE id = ?2",
+        params![now, account_id],
+    )
+    .map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    record_sync_job(&conn, &account_id, "已完成", &now, "").map_err(to_error)?;
+    Ok(SyncResult {
+        account: get_account(&conn, &account_id).map_err(to_error)?,
+        products_changed,
+        orders_changed,
+        source_connected: true,
+    })
 }
 
 pub fn run() {
@@ -232,14 +2054,163 @@ pub fn run() {
         .setup(|app| {
             let app_dir = app.path().app_data_dir()?;
             fs::create_dir_all(&app_dir)?;
+            let key_path = app_dir.join("local-secret.key");
+            let secret_key = if key_path.exists() {
+                let bytes = fs::read(&key_path)?;
+                <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| "本机密钥文件无效")?
+            } else {
+                let mut key = [0_u8; 32];
+                OsRng.fill_bytes(&mut key);
+                fs::write(&key_path, key)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+                }
+                key
+            };
             let conn = Connection::open(app_dir.join("shark-butler.sqlite3"))?;
             initialize_database(&conn)?;
-            app.manage(AppState { db: Mutex::new(conn) });
+            app.manage(AppState {
+                db: Mutex::new(conn),
+                secret_key,
+                chat_listeners: Mutex::new(HashMap::new()),
+                im_statuses: Mutex::new(HashMap::new()),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            list_accounts, list_products, list_orders, dashboard_stats, add_demo_account, sync_account
+            list_accounts,
+            update_conversation_name,
+            list_products,
+            list_orders,
+            dashboard_stats,
+            list_sync_jobs,
+            create_account,
+            update_account,
+            delete_account,
+            sync_account,
+            generate_qr_login,
+            check_qr_login_status,
+            list_chat_contacts,
+            chat_unread_totals,
+            get_im_statuses,
+            start_chat_listener,
+            stop_chat_listener,
+            sync_chat_contacts,
+            mark_chat_read,
+            list_chat_messages,
+            sync_chat_messages,
+            send_chat_message,
+            send_chat_image,
+            list_quick_replies,
+            create_quick_reply,
+            update_quick_reply,
+            delete_quick_reply,
+            create_product,
+            update_product,
+            delete_product,
+            update_products_status,
+            delete_products,
+            create_order,
+            update_order,
+            delete_order,
+            update_orders_status,
+            export_backup
         ])
         .run(tauri::generate_context!())
         .expect("启动鲨鱼管家失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decrypt_secret, delete_account_records, encrypt_secret, initialize_database,
+        normalize_order_status, normalize_product_status, remove_near_duplicate_messages,
+    };
+    use rusqlite::Connection;
+
+    #[test]
+    fn local_session_secret_round_trip() {
+        let key = [23_u8; 32];
+        let encrypted = encrypt_secret(&key, "cookie=value; unb=10001").expect("encrypt");
+        assert!(encrypted.starts_with("enc:v1:"));
+        assert_ne!(encrypted, "cookie=value; unb=10001");
+        assert_eq!(
+            decrypt_secret(&key, &encrypted).expect("decrypt"),
+            "cookie=value; unb=10001"
+        );
+    }
+
+    #[test]
+    fn platform_statuses_are_normalized_for_the_ui() {
+        assert_eq!(normalize_product_status("已上架".to_owned(), 1), "已上架");
+        assert_eq!(normalize_order_status("已发货".to_owned()), "待收货");
+        assert_eq!(normalize_order_status("退款成功".to_owned()), "已退款");
+        assert_eq!(normalize_order_status("交易关闭".to_owned()), "已关闭");
+    }
+
+    #[test]
+    fn deleting_account_removes_all_local_relations() {
+        let mut conn = Connection::open_in_memory().expect("open database");
+        initialize_database(&conn).expect("initialize database");
+        conn.execute_batch(
+            "
+            INSERT INTO accounts VALUES ('a1','测试账号','','闲鱼','授权有效','2026-01-01T00:00:00Z');
+            INSERT INTO products VALUES ('p1','a1','商品',1,1,'已上架','2026-01-01T00:00:00Z','');
+            INSERT INTO orders VALUES ('o1','a1','n1','商品','买家',1,'待付款','2026-01-01T00:00:00Z','');
+            INSERT INTO sync_jobs VALUES ('s1','a1','all','完成','2026-01-01T00:00:00Z',NULL,NULL);
+            INSERT INTO account_sources VALUES ('a1','','remote');
+            INSERT INTO account_credentials VALUES ('a1','secret','2026-01-01T00:00:00Z');
+            INSERT INTO chat_contacts (account_id,chat_id,other_user_id,other_user_name,avatar_url,item_id,item_title,item_image_url,order_status,buyer_tag,latest_message,latest_message_time,unread_count) VALUES ('a1','c1','u1','买家','','','','','','','消息','2026-01-01T00:00:00Z',1);
+            INSERT INTO chat_messages VALUES ('a1','m1','c1','u1','买家','incoming','text','消息','','2026-01-01T00:00:00Z','sent');
+            INSERT INTO chat_read_state VALUES ('a1','c1','2026-01-01T00:00:00Z');
+            INSERT INTO conversation_preferences VALUES ('a1','我的会话');
+            ",
+        )
+        .expect("seed account relations");
+        delete_account_records(&mut conn, "a1").expect("delete account");
+        for table in [
+            "accounts",
+            "products",
+            "orders",
+            "sync_jobs",
+            "account_sources",
+            "account_credentials",
+            "chat_contacts",
+            "chat_messages",
+            "chat_read_state",
+            "conversation_preferences",
+            "quick_replies",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count rows");
+            assert_eq!(count, 0, "{table} should be empty");
+        }
+    }
+
+    #[test]
+    fn local_echo_is_replaced_by_the_remote_message() {
+        let conn = Connection::open_in_memory().expect("open database");
+        initialize_database(&conn).expect("initialize database");
+        conn.execute_batch(
+            "
+            INSERT INTO chat_messages VALUES ('a1','local-uuid','c1','u1','我','outgoing','text','你好','','2026-01-01T00:00:00.100Z','sent');
+            INSERT INTO chat_messages VALUES ('a1','100.PNM','c1','u1','我','outgoing','text','你好','','2026-01-01T00:00:00.250Z','sent');
+            ",
+        )
+        .expect("seed duplicate messages");
+        remove_near_duplicate_messages(&conn, "a1", "c1").expect("remove duplicate");
+        let ids = conn
+            .prepare("SELECT id FROM chat_messages ORDER BY id")
+            .expect("prepare ids")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("read ids")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect ids");
+        assert_eq!(ids, vec!["100.PNM"]);
+    }
 }
