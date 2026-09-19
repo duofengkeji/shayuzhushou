@@ -19,6 +19,7 @@ export interface Product {
   id: string
   accountId: string
   title: string
+  imageUrl: string
   price: number
   stock: number
   status: string
@@ -106,12 +107,58 @@ export interface ChatMessage {
   mediaUrl: string
   sentAt: string
   sendStatus: string
+  /** Official IM receipt: readStatus=2 => read; any returned other value => unread. */
+  readStatus: 'read' | 'unread' | 'unsupported' | 'unknown' | string
+  cardTitle: string
+  cardSubtitle: string
+  cardPrice: string
+  targetUrl: string
+}
+
+export interface ChatEmoji {
+  iconAlias: string
+  iconUrl: string
 }
 
 export interface ChatContactsPage {
   items: ChatContact[]
   nextCursor: number | null
   hasMore: boolean
+}
+
+export interface CustomerItem {
+  itemId: string
+  title: string
+  imageUrl: string
+  price: string
+  fishCoin: string
+  status: string
+  exposureCount: string
+  viewCount: string
+  wantCount: string
+  visitedAt: string
+}
+
+export interface CustomerProfile {
+  accountId: string
+  chatId: string
+  userId: string
+  displayName: string
+  avatarUrl: string
+  remark: string
+  creditLevel: string
+  city: string
+  lastActiveText: string
+  goodReviewRate: string
+  dataUpdatedAt: string
+  purchaseCount: string
+  totalSpend: string
+  averageOrderValue: string
+  currentItems: CustomerItem[]
+  favoriteItems: CustomerItem[]
+  consultedItems: CustomerItem[]
+  officialSynced: boolean
+  syncNote: string
 }
 
 export interface ChatMessagesPage {
@@ -145,6 +192,15 @@ export interface BackupData {
   orders: Order[]
 }
 
+export interface AppLog {
+  id: number
+  createdAt: string
+  level: 'info' | 'warn' | 'error' | string
+  category: string
+  accountId: string
+  message: string
+}
+
 export interface AccountInput {
   displayName: string
   alias: string
@@ -157,6 +213,7 @@ export interface AccountInput {
 export interface ProductInput {
   accountId: string
   title: string
+  imageUrl: string
   price: number
   stock: number
   status: string

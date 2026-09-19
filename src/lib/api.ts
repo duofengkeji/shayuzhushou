@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { Account, AccountInput, BackupData, ChatContact, ChatContactsPage, ChatMessage, ChatMessagesPage, DashboardStats, Order, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, SyncJob, SyncResult } from './types'
+import type { Account, AccountInput, AppLog, BackupData, ChatContact, ChatContactsPage, ChatEmoji, ChatMessage, ChatMessagesPage, CustomerProfile, DashboardStats, Order, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, SyncJob, SyncResult } from './types'
 
 export const api = {
   dashboard: () => invoke<DashboardStats>('dashboard_stats'),
@@ -15,14 +15,20 @@ export const api = {
   generateQrLogin: () => invoke<QrLoginStart>('generate_qr_login'),
   checkQrLoginStatus: (sessionId: string) => invoke<QrLoginStatus>('check_qr_login_status', { sessionId }),
   chatContacts: (accountId: string) => invoke<ChatContact[]>('list_chat_contacts', { accountId }),
+  customerProfile: (accountId: string, chatId: string) => invoke<CustomerProfile>('customer_profile', { accountId, chatId }),
+  updateCustomerRemark: (accountId: string, chatId: string, remark: string) => invoke<string>('update_customer_remark', { accountId, chatId, remark }),
   chatUnreadTotals: () => invoke<Record<string, number>>('chat_unread_totals'),
   imStatuses: () => invoke<Record<string, string>>('get_im_statuses'),
+  appLogs: (limit = 300) => invoke<AppLog[]>('list_app_logs', { limit }),
   startChatListener: (accountId: string) => invoke<void>('start_chat_listener', { accountId }),
   stopChatListener: (accountId: string) => invoke<void>('stop_chat_listener', { accountId }),
   syncChatContacts: (accountId: string, cursor: number | null = null) => invoke<ChatContactsPage>('sync_chat_contacts', { accountId, cursor }),
   markChatRead: (accountId: string, chatId: string) => invoke<void>('mark_chat_read', { accountId, chatId }),
   chatMessages: (accountId: string, chatId: string) => invoke<ChatMessage[]>('list_chat_messages', { accountId, chatId }),
+  chatEmojis: (accountId: string) => invoke<ChatEmoji[]>('list_chat_emojis', { accountId }),
+  syncChatEmojis: (accountId: string) => invoke<ChatEmoji[]>('sync_chat_emojis', { accountId }),
   syncChatMessages: (accountId: string, chatId: string, cursor: number | null = null) => invoke<ChatMessagesPage>('sync_chat_messages', { accountId, chatId, cursor }),
+  openProductDetail: (accountId: string, url: string) => invoke<void>('open_product_detail', { accountId, url }),
   sendChatMessage: (accountId: string, chatId: string, receiverUserId: string, text: string) => invoke<ChatMessage>('send_chat_message', { accountId, chatId, receiverUserId, text }),
   sendChatImage: (accountId: string, chatId: string, receiverUserId: string, fileName: string, mimeType: string, imageData: string, width: number, height: number) => invoke<ChatMessage>('send_chat_image', { accountId, chatId, receiverUserId, fileName, mimeType, imageData, width, height }),
   quickReplies: (accountId: string) => invoke<QuickReply[]>('list_quick_replies', { accountId }),

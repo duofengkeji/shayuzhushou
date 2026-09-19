@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { listen } from '@tauri-apps/api/event'
+import { isTauri } from '@tauri-apps/api/core'
 import {
   Bell, CheckCircle2, ChevronDown, CircleHelp, ClipboardList, Download, ExternalLink,
   History, Image as ImageIcon, LayoutDashboard, LogIn, MessageCircle, Package, Pencil,
@@ -9,7 +10,7 @@ import {
 } from 'lucide-react'
 import logo from './assets/shark-butler-logo.png'
 import { api } from './lib/api'
-import type { Account, AccountInput, ChatContact, ChatMessage, DashboardStats, Order, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, SyncJob } from './lib/types'
+import type { Account, AccountInput, AppLog, ChatContact, ChatEmoji, ChatMessage, CustomerItem, CustomerProfile, DashboardStats, Order, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, SyncJob } from './lib/types'
 
 type Page = 'dashboard' | 'workbench' | 'accounts' | 'products' | 'orders' | 'settings'
 type Dialog =
@@ -33,6 +34,14 @@ const nav: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
 function formatDate(value: string) {
   if (!value) return '—'
   return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value))
+}
+
+function formatEventTime(value: string) {
+  if (!value) return ''
+  const date = new Date(value)
+  const parts = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(date)
+  const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? ''
+  return `${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`
 }
 
 function formatRelativeTime(value: string) {
@@ -119,6 +128,10 @@ function ImStatusBadge({ value }: { value?: string }) {
 }
 
 export default function App() {
+  return <MainApp />
+}
+
+function MainApp() {
   const [page, setPage] = useState<Page>('dashboard')
   const [accounts, setAccounts] = useState<Account[]>([])
   const [products, setProducts] = useState<Product[]>([])
@@ -131,12 +144,14 @@ export default function App() {
   const [dialog, setDialog] = useState<Dialog>(null)
   const [accountMenuOpen, setAccountMenuOpen] = useState(false)
   const [messageCenterOpen, setMessageCenterOpen] = useState(false)
+  const [logManagerOpen, setLogManagerOpen] = useState(false)
   const [globalMessages, setGlobalMessages] = useState<Array<{ account: Account; contact: ChatContact }>>([])
   const [accountMenuPosition, setAccountMenuPosition] = useState({ top: 0, left: 0, width: 310 })
   const accountMenuButtonRef = useRef<HTMLButtonElement>(null)
   const [unreadTotals, setUnreadTotals] = useState<Record<string, number>>({})
   const [imStatuses, setImStatuses] = useState<Record<string, string>>({})
   const [unreadJumpRequest, setUnreadJumpRequest] = useState({ accountId: '', chatId: '', nonce: 0 })
+  const [quickReplyAutoSuggest, setQuickReplyAutoSuggest] = useState(() => localStorage.getItem('shark-butler-quick-reply-auto-suggest') === 'true')
   const globalMessageSnapshotRef = useRef(new Map<string, { unreadCount: number; latestMessageTime: string }>())
   const globalPollInFlightRef = useRef(false)
   const globalPollPendingRef = useRef(false)
@@ -172,6 +187,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('shark-butler-conversation-tabs', JSON.stringify(conversationTabIds))
   }, [conversationTabIds])
+
+  useEffect(() => {
+    localStorage.setItem('shark-butler-quick-reply-auto-suggest', String(quickReplyAutoSuggest))
+  }, [quickReplyAutoSuggest])
 
   useEffect(() => { if (page !== 'workbench') setAccountMenuOpen(false) }, [page])
   useEffect(() => { pageRef.current = page }, [page])
@@ -279,9 +298,12 @@ export default function App() {
   const filteredProducts = useMemo(() => accountId ? products.filter((item) => item.accountId === accountId) : products, [products, accountId])
   const filteredOrders = useMemo(() => accountId ? orders.filter((item) => item.accountId === accountId) : orders, [orders, accountId])
   const globalUnreadCount = Object.values(unreadTotals).reduce((total, count) => total + Math.max(0, count), 0)
-  const handleChatRead = (readAccountId: string, readChatId: string) => {
+  const handleChatRead = (readAccountId: string, readChatId: string, readCount: number) => {
+    setUnreadTotals((current) => ({
+      ...current,
+      [readAccountId]: Math.max(0, (current[readAccountId] ?? 0) - Math.max(0, readCount)),
+    }))
     setGlobalMessages((current) => current.filter((item) => !(item.account.id === readAccountId && item.contact.chatId === readChatId)))
-    void refreshUnreadTotals()
   }
   const handleError = (error: unknown) => setNotice(error instanceof Error ? error.message : String(error))
   const refreshUnreadTotals = async () => {
@@ -374,7 +396,7 @@ export default function App() {
         </button>
         <nav>{nav.slice(0, 5).map(({ id, label, icon: Icon }) => (
           <button key={id} className={`rail-link ${page === id ? 'active' : ''}`} onClick={() => setPage(id)}>
-            <Icon size={21} /><span>{label}</span>
+            <span className="rail-link-icon"><Icon size={21} />{id === 'workbench' && globalUnreadCount > 0 && <em className="rail-unread-badge" aria-label={`${globalUnreadCount} 条未读消息`}>{globalUnreadCount > 99 ? '99+' : globalUnreadCount}</em>}</span><span>{label}</span>
           </button>
         ))}</nav>
         <div className="rail-bottom">
@@ -409,17 +431,18 @@ export default function App() {
 
         <div className={`content ${page === 'workbench' ? 'workbench-content' : ''}`}>
           {loading ? <Loading /> : page === 'dashboard' ? <Dashboard stats={stats} accounts={accounts} orders={orders} onGo={setPage} />
-            : page === 'workbench' ? <Workbench key={activeAccount?.id ?? 'empty'} account={activeAccount} products={products} onUnreadChanged={refreshUnreadTotals} onChatRead={handleChatRead} unreadJumpRequest={unreadJumpRequest} />
+            : page === 'workbench' ? <Workbench key={activeAccount?.id ?? 'empty'} account={activeAccount} products={products} imConnected={Boolean(activeAccount?.remoteAccountId)} quickReplyAutoSuggest={quickReplyAutoSuggest} onUnreadChanged={refreshUnreadTotals} onChatRead={handleChatRead} unreadJumpRequest={unreadJumpRequest} />
               : page === 'accounts' ? <Accounts accounts={accounts} syncJobs={syncJobs} imStatuses={imStatuses} onQrLogin={() => setDialog({ kind: 'qr' })} onEdit={(value) => setDialog({ kind: 'account', value })} onDelete={(value) => setDialog({ kind: 'delete-account', value })} onSync={(account) => void syncAccount(account)} onSetStatus={(ids, status) => void setAccountsStatus(ids, status)} />
                 : page === 'products' ? <Products items={filteredProducts} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, action) => void bulkProducts(ids, action)} onAdd={() => setDialog({ kind: 'product' })} onEdit={(value) => setDialog({ kind: 'product', value })} onDelete={(id) => void remove('product', id)} />
                   : page === 'orders' ? <Orders items={filteredOrders} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, status) => void bulkOrders(ids, status)} onAdd={() => setDialog({ kind: 'order' })} onEdit={(value) => setDialog({ kind: 'order', value })} onDelete={(id) => void remove('order', id)} />
-                    : <SettingsPage onExport={() => void exportBackup()} />}
+                    : <SettingsPage quickReplyAutoSuggest={quickReplyAutoSuggest} onQuickReplyAutoSuggestChange={setQuickReplyAutoSuggest} onExport={() => void exportBackup()} onOpenLogs={() => setLogManagerOpen(true)} />}
         </div>
         {dialog?.kind === 'account' && <AccountDialog value={dialog.value} onClose={() => setDialog(null)} onSave={saveAccount} />}
         {dialog?.kind === 'product' && <ProductDialog accounts={accounts} selectedAccountId={activeAccount?.id} value={dialog.value} onClose={() => setDialog(null)} onSave={saveProduct} />}
         {dialog?.kind === 'order' && <OrderDialog accounts={accounts} selectedAccountId={activeAccount?.id} value={dialog.value} onClose={() => setDialog(null)} onSave={saveOrder} />}
         {dialog?.kind === 'conversation-name' && <ConversationNameDialog account={dialog.value} onClose={() => setDialog(null)} onSave={saveConversationName} />}
         {dialog?.kind === 'delete-account' && <DeleteAccountDialog account={dialog.value} onClose={() => setDialog(null)} onDelete={deleteAccount} />}
+        {logManagerOpen && <LogManager onClose={() => setLogManagerOpen(false)} />}
         {dialog?.kind === 'qr' && <QrLoginDialog onClose={() => setDialog(null)} onConnected={finishQrLogin} />}
       </section>
     </main>
@@ -479,7 +502,7 @@ function Products({ items, account, onSync, onBulk, onAdd, onEdit, onDelete }: {
     <PageHead eyebrow="商品管理" title="商品一览" description={account?.remoteAccountId ? '当前账号已完成本机登录；同步会直接拉取闲鱼商品最新状态。编辑与状态标记仅作本地运营备注。' : '本地创建、编辑、状态和库存变更会立即保存到 SQLite。'} action={<div className="head-actions"><button className="secondary" disabled={!account} onClick={onSync}><RefreshCw size={17} />同步商品</button><button className="primary" onClick={onAdd}><Plus size={17} />新建本地商品</button></div>} />
     <div className="toolbar"><div className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索商品标题、标签或商品 ID" /></div><AccountPicker account={account} /><select className="filter-select" value={status} onChange={(event) => setStatus(event.target.value)}><option>全部状态</option><option>已上架</option><option>已下架</option></select></div>
     <div className="batch-bar"><span>已选择 {selected.length} 个商品</span><button disabled={!selected.length} onClick={() => onBulk(selected, '已上架')}>本地标记上架</button><button disabled={!selected.length} onClick={() => onBulk(selected, '已下架')}>本地标记下架</button><button className="danger-link" disabled={!selected.length} onClick={() => onBulk(selected, '删除')}><Trash2 size={14} />删除记录</button></div>
-    <section className="table-panel"><table><thead><tr><th><input aria-label="全选商品" type="checkbox" checked={Boolean(visible.length) && visible.every((item) => selected.includes(item.id))} onChange={toggleAll} /></th><th>商品</th><th>价格</th><th>库存</th><th>状态</th><th>本地标签</th><th>最后同步</th><th>操作</th></tr></thead><tbody>{visible.map((item) => <tr key={item.id}><td><input aria-label={`选择 ${item.title}`} type="checkbox" checked={selected.includes(item.id)} onChange={() => toggle(item.id)} /></td><td><div className="product-cell"><div className="product-image"><Package size={20} /></div><div><strong>{item.title}</strong><span>ID · {item.id}</span></div></div></td><td>¥{item.price.toFixed(2)}</td><td>{item.stock}</td><td><Status value={item.status} /></td><td><div className="tags">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></td><td>{formatDate(item.updatedAt)}</td><td><div className="row-actions"><button className="link-button" onClick={() => onEdit(item)}>编辑</button><button className="danger-link" onClick={() => onDelete(item.id)}>删除</button></div></td></tr>)}</tbody></table>{visible.length === 0 && <EmptyTable text="没有符合条件的商品" />}</section>
+    <section className="table-panel"><table><thead><tr><th><input aria-label="全选商品" type="checkbox" checked={Boolean(visible.length) && visible.every((item) => selected.includes(item.id))} onChange={toggleAll} /></th><th>商品</th><th>价格</th><th>库存</th><th>状态</th><th>本地标签</th><th>最后同步</th><th>操作</th></tr></thead><tbody>{visible.map((item) => <tr key={item.id}><td><input aria-label={`选择 ${item.title}`} type="checkbox" checked={selected.includes(item.id)} onChange={() => toggle(item.id)} /></td><td><div className="product-cell"><div className="product-image">{item.imageUrl ? <img src={displayImageUrl(item.imageUrl)} alt={item.title} loading="lazy" /> : <Package size={20} />}</div><div><strong>{item.title}</strong><span>ID · {item.id}</span></div></div></td><td>¥{item.price.toFixed(2)}</td><td>{item.stock}</td><td><Status value={item.status} /></td><td><div className="tags">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></td><td>{formatDate(item.updatedAt)}</td><td><div className="row-actions"><button className="link-button" onClick={() => onEdit(item)}>编辑</button><button className="danger-link" onClick={() => onDelete(item.id)}>删除</button></div></td></tr>)}</tbody></table>{visible.length === 0 && <EmptyTable text="没有符合条件的商品" />}</section>
   </div>
 }
 
@@ -560,8 +583,8 @@ function QrLoginDialog({ onClose, onConnected }: { onClose: () => void; onConnec
 }
 
 function ProductDialog({ accounts, selectedAccountId, value, onClose, onSave }: { accounts: Account[]; selectedAccountId?: string; value?: Product; onClose: () => void; onSave: (input: ProductInput, current?: Product) => void }) {
-  const [accountId, setAccountId] = useState(value?.accountId ?? selectedAccountId ?? accounts[0]?.id ?? ''); const [title, setTitle] = useState(value?.title ?? ''); const [price, setPrice] = useState(String(value?.price ?? '')); const [stock, setStock] = useState(String(value?.stock ?? '0')); const [status, setStatus] = useState(value?.status ?? '已上架'); const [tags, setTags] = useState(value?.tags.join(', ') ?? '')
-  return <Modal title={value ? '编辑商品' : '新建商品'} onClose={onClose}><form className="form-grid" onSubmit={(event) => { event.preventDefault(); onSave({ accountId, title, price: Number(price), stock: Number(stock), status, tags: tags.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean) }, value) }}><label>所属账号<select required value={accountId} onChange={(event) => setAccountId(event.target.value)}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.displayName}</option>)}</select></label><label>商品标题<input required autoFocus value={title} onChange={(event) => setTitle(event.target.value)} /></label><div className="form-row"><label>价格（元）<input required min="0" step="0.01" type="number" value={price} onChange={(event) => setPrice(event.target.value)} /></label><label>库存<input required min="0" step="1" type="number" value={stock} onChange={(event) => setStock(event.target.value)} /></label></div><div className="form-row"><label>状态<select value={status} onChange={(event) => setStatus(event.target.value)}><option>已上架</option><option>已下架</option></select></label><label>标签（逗号分隔）<input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="数码, 热销" /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存商品</button></div></form></Modal>
+  const [accountId, setAccountId] = useState(value?.accountId ?? selectedAccountId ?? accounts[0]?.id ?? ''); const [title, setTitle] = useState(value?.title ?? ''); const [imageUrl, setImageUrl] = useState(value?.imageUrl ?? ''); const [price, setPrice] = useState(String(value?.price ?? '')); const [stock, setStock] = useState(String(value?.stock ?? '0')); const [status, setStatus] = useState(value?.status ?? '已上架'); const [tags, setTags] = useState(value?.tags.join(', ') ?? '')
+  return <Modal title={value ? '编辑商品' : '新建商品'} onClose={onClose}><form className="form-grid" onSubmit={(event) => { event.preventDefault(); onSave({ accountId, title, imageUrl, price: Number(price), stock: Number(stock), status, tags: tags.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean) }, value) }}><label>所属账号<select required value={accountId} onChange={(event) => setAccountId(event.target.value)}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.displayName}</option>)}</select></label><label>商品标题<input required autoFocus value={title} onChange={(event) => setTitle(event.target.value)} /></label><label>商品图片地址<input type="url" value={imageUrl} onChange={(event) => setImageUrl(event.target.value)} placeholder="https://..." /></label><div className="form-row"><label>价格（元）<input required min="0" step="0.01" type="number" value={price} onChange={(event) => setPrice(event.target.value)} /></label><label>库存<input required min="0" step="1" type="number" value={stock} onChange={(event) => setStock(event.target.value)} /></label></div><div className="form-row"><label>状态<select value={status} onChange={(event) => setStatus(event.target.value)}><option>已上架</option><option>已下架</option></select></label><label>标签（逗号分隔）<input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="数码, 热销" /></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存商品</button></div></form></Modal>
 }
 
 function OrderDialog({ accounts, selectedAccountId, value, onClose, onSave }: { accounts: Account[]; selectedAccountId?: string; value?: Order; onClose: () => void; onSave: (input: OrderInput, current?: Order) => void }) {
@@ -569,7 +592,103 @@ function OrderDialog({ accounts, selectedAccountId, value, onClose, onSave }: { 
   return <Modal title={value ? `处理订单 ${value.orderNo}` : '录入订单'} onClose={onClose}><form className="form-grid" onSubmit={(event) => { event.preventDefault(); onSave({ accountId, productTitle, buyerMaskedName, amount: Number(amount), status, note }, value) }}><label>所属账号<select disabled={Boolean(value)} required value={accountId} onChange={(event) => setAccountId(event.target.value)}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.displayName}</option>)}</select></label><label>商品名称<input disabled={Boolean(value)} required autoFocus value={productTitle} onChange={(event) => setProductTitle(event.target.value)} /></label><div className="form-row"><label>买家标识<input disabled={Boolean(value)} required value={buyerMaskedName} onChange={(event) => setBuyerMaskedName(event.target.value)} placeholder="例如：张**" /></label><label>订单金额（元）<input disabled={Boolean(value)} required min="0" step="0.01" type="number" value={amount} onChange={(event) => setAmount(event.target.value)} /></label></div><label>订单状态<select value={status} onChange={(event) => setStatus(event.target.value)}><option>待付款</option><option>待发货</option><option>待收货</option><option>已完成</option><option>退款中</option><option>已退款</option><option>已关闭</option></select></label><label>内部备注<textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="仅保存在本机" rows={3} /></label><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存订单</button></div></form></Modal>
 }
 
-function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpRequest }: { account?: Account; products: Product[]; onUnreadChanged: () => Promise<void>; onChatRead: (accountId: string, chatId: string) => void; unreadJumpRequest: { accountId: string; chatId: string; nonce: number } }) {
+function MessageText({ text, emojis }: { text: string; emojis: ChatEmoji[] }) {
+  const emojiByAlias = useMemo(() => new Map(emojis.map((emoji) => [emoji.iconAlias, emoji.iconUrl])), [emojis])
+  const parts = text.split(/(\[[^\]\r\n]{1,40}\])/g)
+  return <p className="message-text">{parts.map((part, index) => {
+    const iconUrl = emojiByAlias.get(part)
+    return iconUrl
+      ? <img className="message-inline-emoji" src={displayImageUrl(iconUrl)} alt={part} title={part} key={`${part}-${index}`} loading="lazy" />
+      : <span key={`${part}-${index}`}>{part}</span>
+  })}</p>
+}
+
+type TradeCardMeta = { title: string; subtitle: string; action: string }
+
+function systemNoticeText(message: ChatMessage) {
+  const raw = (message.cardTitle || message.text).replace(/^\[|\]$/g, '').trim()
+  if (/^[你您]已发货$/.test(raw)) return '您已发货'
+  if (/^买家(?:已)?确认收货[，,、 ]*交易成功$/.test(raw)) return '买家确认收货，交易成功'
+  if (/^退款成功[，,、 ]*钱款已原路退返$/.test(raw)) return '退款成功，钱款已原路退返'
+  return ''
+}
+
+function tradeCardMeta(message: ChatMessage): TradeCardMeta | null {
+  if (message.contentKind !== 'product') return null
+  const raw = (message.cardTitle || message.text).replace(/^\[|\]$/g, '').trim()
+  if (!raw) return null
+  if (systemNoticeText(message)) return null
+  if (/快给\s*ta\s*一个评价吧/i.test(raw)) return { title: raw, subtitle: message.cardSubtitle || '说说这次的交易体验，帮助更多人', action: '去评价' }
+  if (/完成了评价|期待你的评价/.test(raw)) return { title: '我完成了评价', subtitle: message.cardSubtitle || '期待你的评价', action: '查看评价' }
+  if (/退款/.test(raw)) return { title: raw.includes('申请') ? raw : '我发起了退款申请', subtitle: message.cardSubtitle || '等待你处理，请确认操作', action: '去处理' }
+  if (/待发货|已付款|成功小刀/.test(raw)) return { title: raw, subtitle: message.cardSubtitle || '买家已付款，请包装好商品并按约定地址发货', action: '去发货' }
+  if (/修改价格|等待.*付款/.test(raw)) return { title: raw, subtitle: message.cardSubtitle || '请确认价格与协商一致，并在24小时内付款', action: '' }
+  if (/拍下|待付款|未付款/.test(raw)) return { title: raw, subtitle: message.cardSubtitle || '请双方沟通及时确认价格', action: '修改价格' }
+  if (/待完成|交易完成|已完成/.test(raw)) return { title: raw, subtitle: message.cardSubtitle || '交易正在按约定流程进行', action: '' }
+  return null
+}
+
+function productLinkTitle(message: ChatMessage) {
+  const match = message.text.trim().match(/^\[链接\]\s*(.+)$/)
+  return match?.[1]?.trim() || ''
+}
+
+function isProductShare(message: ChatMessage) {
+  return Boolean(productLinkTitle(message)) || ((message.contentKind === 'product' || Boolean(message.cardTitle)) && !tradeCardMeta(message))
+}
+
+function productTargetUrl(message: ChatMessage, contact: ChatContact) {
+  const explicit = message.targetUrl?.trim()
+    || message.text.match(/https?:\/\/[^\s\]]+/i)?.[0]
+    || ''
+  if (explicit.startsWith('//')) return `https:${explicit}`
+  if (/^https?:\/\//i.test(explicit)) return explicit
+  return contact.itemId ? `https://www.goofish.com/item?id=${encodeURIComponent(contact.itemId)}` : ''
+}
+
+type ProductCardFallback = { title: string; imageUrl: string; price: string }
+
+function MessageBody({ message, emojis, onProductPreview, onTradeAction, productFallback }: { message: ChatMessage; emojis: ChatEmoji[]; onProductPreview: (message: ChatMessage) => void; onTradeAction: (action: string) => void; productFallback?: ProductCardFallback }) {
+  const notice = systemNoticeText(message)
+  if (notice) return <span className="system-notice-text">{notice}</span>
+  if (message.contentKind === 'image' && message.mediaUrl) return <img className="message-image" src={displayImageUrl(message.mediaUrl)} alt="聊天图片" loading="lazy" />
+  if (message.contentKind === 'expression' && message.mediaUrl) return <img className="message-expression" src={displayImageUrl(message.mediaUrl)} alt={message.text || '闲鱼表情'} title={message.text} loading="lazy" />
+  const linkTitle = productLinkTitle(message)
+  if (linkTitle) {
+    const imageUrl = message.mediaUrl || productFallback?.imageUrl || ''
+    const price = message.cardPrice || productFallback?.price || ''
+    return <button type="button" className="message-card product-share-card link-share-card" onClick={() => onProductPreview(message)}><span className="product-share-media">{imageUrl ? <img src={displayImageUrl(imageUrl)} alt={linkTitle} loading="lazy" /> : <Package size={28} />}</span><span className="message-card-copy"><strong>{message.cardTitle || productFallback?.title || linkTitle}</strong>{price && <b>{price.startsWith('¥') ? price : `¥${price}`}</b>}</span></button>
+  }
+  const tradeCard = tradeCardMeta(message)
+  if (tradeCard && /快给\s*ta\s*一个评价吧/i.test(tradeCard.title)) return <article className="evaluation-message-card"><div><strong>{tradeCard.title}</strong><span>{tradeCard.subtitle}</span></div><button type="button" onClick={() => onTradeAction(tradeCard.action)}>{tradeCard.action}</button></article>
+  if (tradeCard) return <article className="trade-message-card"><strong>{tradeCard.title}</strong><div className="trade-message-card-detail"><span>{tradeCard.subtitle}</span>{tradeCard.action && <button type="button" onClick={() => onTradeAction(tradeCard.action)}>{tradeCard.action}</button>}</div></article>
+  if (message.contentKind === 'product' || message.cardTitle) return <button type="button" className="message-card product-share-card" onClick={() => onProductPreview(message)}><span className="product-share-media">{message.mediaUrl ? <img src={displayImageUrl(message.mediaUrl)} alt="商品图片" loading="lazy" /> : <Package size={25} />}</span><span className="message-card-copy"><strong>{message.cardTitle || message.text || '商品分享'}</strong>{message.cardSubtitle && <span>{message.cardSubtitle}</span>}{message.cardPrice && <b>{message.cardPrice.startsWith('¥') ? message.cardPrice : `¥${message.cardPrice}`}</b>}</span></button>
+  return <MessageText text={message.text || `[${message.contentKind}]`} emojis={emojis} />
+}
+
+function VirtualProductDetail({ url, onClose }: { url: string; onClose: () => void }) {
+  const [position, setPosition] = useState(() => ({ x: Math.max(20, window.innerWidth / 2 - 195), y: Math.max(20, window.innerHeight / 2 - 390) }))
+  const beginDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    if ((event.target as HTMLElement).closest('button')) return
+    event.preventDefault()
+    const startX = event.clientX
+    const startY = event.clientY
+    const origin = position
+    const move = (next: PointerEvent) => setPosition({
+      x: Math.max(8, Math.min(window.innerWidth - 370, origin.x + next.clientX - startX)),
+      y: Math.max(8, Math.min(window.innerHeight - 80, origin.y + next.clientY - startY)),
+    })
+    const stop = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop) }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop)
+  }
+  return <div className="virtual-product-window" style={{ left: position.x, top: position.y }} role="dialog" aria-label="闲鱼宝贝详情">
+    <div className="virtual-product-window-title" onPointerDown={beginDrag}><span>闲鱼宝贝详情</span><button type="button" onClick={onClose} aria-label="关闭"><X size={15} /></button></div>
+    <iframe className="virtual-product-window-frame" src={url} title="闲鱼宝贝详情" />
+  </div>
+}
+
+function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUnreadChanged, onChatRead, unreadJumpRequest }: { account?: Account; products: Product[]; imConnected: boolean; quickReplyAutoSuggest: boolean; onUnreadChanged: () => Promise<void>; onChatRead: (accountId: string, chatId: string, unreadCount: number) => void; unreadJumpRequest: { accountId: string; chatId: string; nonce: number } }) {
   const CONTACT_BATCH = 30
   const MESSAGE_BATCH = 50
   const [contacts, setContacts] = useState<ChatContact[]>([])
@@ -579,6 +698,7 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
   const [conversationStatus, setConversationStatus] = useState('全部')
   const [draft, setDraft] = useState('')
   const [emojiOpen, setEmojiOpen] = useState(false)
+  const [emojis, setEmojis] = useState<ChatEmoji[]>([])
   const [quickReplyOpen, setQuickReplyOpen] = useState(false)
   const [quickReplyCommandOpen, setQuickReplyCommandOpen] = useState(false)
   const [quickReplies, setQuickReplies] = useState<QuickReply[]>([])
@@ -587,6 +707,7 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
   const [queuedReplyImages, setQueuedReplyImages] = useState<QuickReplyImage[]>([])
   const [productPickerOpen, setProductPickerOpen] = useState(false)
   const [composerNotice, setComposerNotice] = useState('')
+  const [webProductPreviewUrl, setWebProductPreviewUrl] = useState('')
   const [busy, setBusy] = useState(false)
   const [contactLoading, setContactLoading] = useState(false)
   const [messageLoading, setMessageLoading] = useState(false)
@@ -596,6 +717,11 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
   const [messageCursor, setMessageCursor] = useState<number | null>(null)
   const [contactHasMore, setContactHasMore] = useState(true)
   const [messageHasMore, setMessageHasMore] = useState(true)
+  const [customerProfile, setCustomerProfile] = useState<CustomerProfile | undefined>()
+  const [customerProfileLoading, setCustomerProfileLoading] = useState(false)
+  const [customerProfileError, setCustomerProfileError] = useState('')
+  const [customerProductTab, setCustomerProductTab] = useState<'current' | 'favorite' | 'consulted'>('current')
+  const [customerRemarkOpen, setCustomerRemarkOpen] = useState(false)
   const [error, setError] = useState('')
   const messageListRef = useRef<HTMLDivElement>(null)
   const conversationListRef = useRef<HTMLDivElement>(null)
@@ -613,7 +739,45 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
   const processedUnreadJumpRef = useRef(0)
   const selected = contacts.find((item) => item.chatId === selectedId) ?? contacts[0]
   useEffect(() => { contactsRef.current = contacts }, [contacts])
+  useEffect(() => {
+    let active = true
+    setCustomerProductTab('current')
+    setCustomerProfile(undefined)
+    setCustomerProfileError('')
+    if (!account || !selected) return () => { active = false }
+    setCustomerProfileLoading(true)
+    void api.customerProfile(account.id, selected.chatId)
+      .then((profile) => { if (active) setCustomerProfile(profile) })
+      .catch((error) => { if (active) setCustomerProfileError(error instanceof Error ? error.message : String(error)) })
+      .finally(() => { if (active) setCustomerProfileLoading(false) })
+    return () => { active = false }
+  }, [account?.id, selected?.chatId])
+  const saveCustomerRemark = async (remark: string) => {
+    if (!account || !selected) return
+    await api.updateCustomerRemark(account.id, selected.chatId, remark)
+    setCustomerProfile((current) => current ? { ...current, remark } : current)
+    setCustomerRemarkOpen(false)
+    setComposerNotice('买家备注已同步到闲鱼')
+  }
   const accountProducts = products.filter((product) => product.accountId === account?.id && product.status === '已上架')
+  const openProductPreview = async (message: ChatMessage) => {
+    if (!selected) return
+    const targetUrl = productTargetUrl(message, selected)
+    if (!targetUrl) {
+      setComposerNotice('该商品消息没有返回可打开的链接')
+      return
+    }
+    if (!isTauri()) {
+      setWebProductPreviewUrl(targetUrl)
+      return
+    }
+    if (!account) return
+    try {
+      await api.openProductDetail(account.id, targetUrl)
+    } catch (nextError) {
+      setComposerNotice(`商品详情窗口打开失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
+    }
+  }
   const filteredContacts = contacts.filter((item) => {
     const upstreamStatus = `${item.orderStatus} ${item.latestMessage}`
     const matchesStatus = conversationStatus === '全部'
@@ -626,7 +790,7 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
     ? items.find((contact) => contact.chatId === unreadJumpRequest.chatId) ?? items.find((contact) => contact.unreadCount > 0) ?? items[0]
     : undefined
 
-  const refreshContacts = async (remote = true, cursor: number | null = null) => {
+  const refreshContacts = async (remote = !imConnected, cursor: number | null = null) => {
     if (!account) { setContacts([]); setSelectedId(''); return }
     if (contactLoadingRef.current) return
     contactLoadingRef.current = true
@@ -661,14 +825,23 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
   useEffect(() => {
     setContacts([]); setMessages([]); setSelectedId('')
     setContactLimit(CONTACT_BATCH); setContactCursor(null); setContactHasMore(true)
-    void refreshContacts(true)
-  }, [account?.id])
+    void refreshContacts(!imConnected)
+  }, [account?.id, imConnected])
 
   useEffect(() => {
     setQuickReplies([]); setEditingQuickReply(undefined); setQueuedReplyImages([]); setQuickReplyManaging(false)
     if (!account) return
     api.quickReplies(account.id).then(setQuickReplies).catch((nextError) => setError(nextError instanceof Error ? nextError.message : String(nextError)))
   }, [account?.id])
+
+  useEffect(() => {
+    setEmojis([])
+    if (!account?.remoteAccountId) return
+    let cancelled = false
+    api.chatEmojis(account.id).then((items) => { if (!cancelled) setEmojis(items) }).catch(() => undefined)
+    api.syncChatEmojis(account.id).then((items) => { if (!cancelled) setEmojis(items) }).catch(() => undefined)
+    return () => { cancelled = true }
+  }, [account?.id, account?.remoteAccountId])
 
   useEffect(() => { setContactLimit(CONTACT_BATCH) }, [query])
   useEffect(() => { setContactLimit(CONTACT_BATCH) }, [conversationStatus])
@@ -690,7 +863,7 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
   useEffect(() => {
     if (!account) return
     let cancelled = false
-    const refreshFromPush = async () => {
+    const refreshFromPush = async (requiresSync = false, pushChatId = '') => {
       if (contactLoadingRef.current) {
         pushRefreshPendingRef.current = true
         return
@@ -699,9 +872,21 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
       try {
         const localContacts = await api.chatContacts(account.id)
         if (!cancelled) {
-          setContacts(localContacts)
+          const activeContact = selectedChatId ? localContacts.find((contact) => contact.chatId === selectedChatId) : undefined
+          // Messages received while this conversation is open are read
+          // immediately. Do not let a later push repaint an active chat with
+          // a red point or add it back into account/global totals.
+          const displayContacts = activeContact
+            ? localContacts.map((contact) => contact.chatId === selectedChatId ? { ...contact, unreadCount: 0 } : contact)
+            : localContacts
+          setContacts(displayContacts)
           setSelectedId((current) => localContacts.some((contact) => contact.chatId === current) ? current : localContacts[0]?.chatId ?? '')
-          void onUnreadChanged()
+          if (activeContact && activeContact.unreadCount > 0) {
+            onChatRead(account.id, selectedChatId, activeContact.unreadCount)
+            void api.markChatRead(account.id, selectedChatId).then(() => onUnreadChanged()).catch(() => undefined)
+          } else {
+            void onUnreadChanged()
+          }
         }
       } catch {
         // Keep the current list usable when the local cache is unavailable.
@@ -710,14 +895,27 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
         try {
           const localMessages = await api.chatMessages(account.id, selectedChatId)
           if (!cancelled) {
+            const knownIds = knownMessageIdsRef.current
+            const hasNewMessage = knownIds.size > 0 && localMessages.some((message) => !knownIds.has(message.id))
             knownMessageIdsRef.current = new Set(localMessages.map((message) => message.id))
             setMessages(localMessages)
+            if (hasNewMessage) {
+              requestAnimationFrame(() => requestAnimationFrame(() => {
+                const list = messageListRef.current
+                if (!list) return
+                list.scrollTop = list.scrollHeight
+              }))
+            }
           }
         } catch {
           // The remote refresh below can still recover the conversation.
         }
       }
-      if (!selectedChatId) return
+      // Pushes are already persisted locally. Avoid issuing history RPCs for
+      // every event while the singleton IM socket is connected: the gateway
+      // rate-limits that pattern and can reject subsequent sends.
+      const syncChatId = pushChatId || selectedChatId
+      if (!syncChatId || (imConnected && !requiresSync)) return
       if (messageLoadingRef.current) {
         messageRefreshPendingRef.current = true
         return
@@ -733,13 +931,19 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
           if (hasNewUnread) playMessageNotification()
           void onUnreadChanged()
         }
-        const page = await api.syncChatMessages(account.id, selectedChatId, null)
+        const page = await api.syncChatMessages(account.id, syncChatId, null)
         if (cancelled) return
+        if (syncChatId !== selectedChatId) return
         const knownIds = knownMessageIdsRef.current
         const hasNewIncoming = knownIds.size > 0 && page.items.some((message) => message.direction === 'incoming' && !knownIds.has(message.id))
         knownMessageIdsRef.current = new Set(page.items.map((message) => message.id))
         setMessages((current) => {
-          if (current.length === page.items.length && current.every((message, index) => message.id === page.items[index]?.id)) return current
+          if (current.length === page.items.length && current.every((message, index) => {
+            const next = page.items[index]
+            return message.id === next?.id
+              && message.readStatus === next.readStatus
+              && message.sendStatus === next.sendStatus
+          })) return current
           return page.items
         })
         setMessageCursor(page.nextCursor)
@@ -758,14 +962,14 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
       }
     }
     let unlisten: (() => void) | undefined
-    void listen<{ accountId: string }>('chat-im-event', (event) => {
-      if (!cancelled && event.payload.accountId === account.id) void refreshFromPush()
+    void listen<{ accountId: string; requiresSync?: boolean; chatId?: string }>('chat-im-event', (event) => {
+      if (!cancelled && event.payload.accountId === account.id) void refreshFromPush(Boolean(event.payload.requiresSync), event.payload.chatId ?? '')
     }).then((stop) => {
       if (cancelled) stop()
       else unlisten = stop
     })
     return () => { cancelled = true; unlisten?.() }
-  }, [account?.id, selected?.chatId])
+  }, [account?.id, selected?.chatId, imConnected])
   useEffect(() => {
     if (!emojiOpen && !quickReplyOpen && !productPickerOpen && !quickReplyCommandOpen) return
     const closeOnOutsideClick = (event: MouseEvent) => {
@@ -801,9 +1005,11 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
 
   useEffect(() => {
     if (!account || !selected) return
+    const unreadCount = selected.unreadCount
     setContacts((current) => current.map((contact) => contact.chatId === selected.chatId ? { ...contact, unreadCount: 0 } : contact))
+    if (unreadCount > 0) onChatRead(account.id, selected.chatId, unreadCount)
     void api.markChatRead(account.id, selected.chatId)
-      .then(() => { onChatRead(account.id, selected.chatId); return onUnreadChanged() })
+      .then(() => onUnreadChanged())
       .catch((nextError) => { setError(nextError instanceof Error ? nextError.message : String(nextError)) })
   }, [account?.id, selected?.chatId])
 
@@ -822,21 +1028,25 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
           setMessageStart(Math.max(0, local.length - MESSAGE_BATCH))
           requestAnimationFrame(() => { const list = messageListRef.current; if (list) list.scrollTop = list.scrollHeight })
         }
-        const page = await api.syncChatMessages(account.id, selected.chatId, null)
-        if (active) {
-          setMessages(page.items)
-          knownMessageIdsRef.current = new Set(page.items.map((message) => message.id))
-          setMessageStart(Math.max(0, page.items.length - MESSAGE_BATCH))
-          setMessageCursor(page.nextCursor)
-          setMessageHasMore(page.hasMore)
-          requestAnimationFrame(() => { const list = messageListRef.current; if (list) list.scrollTop = list.scrollHeight })
+        if (!imConnected) {
+          const page = await api.syncChatMessages(account.id, selected.chatId, null)
+          if (active) {
+            setMessages(page.items)
+            knownMessageIdsRef.current = new Set(page.items.map((message) => message.id))
+            setMessageStart(Math.max(0, page.items.length - MESSAGE_BATCH))
+            setMessageCursor(page.nextCursor)
+            setMessageHasMore(page.hasMore)
+            requestAnimationFrame(() => { const list = messageListRef.current; if (list) list.scrollTop = list.scrollHeight })
+          }
+        } else if (active) {
+          setMessageHasMore(false)
         }
       } catch (nextError) {
         if (active) setError(nextError instanceof Error ? nextError.message : String(nextError))
       } finally {
         messageLoadingRef.current = false
         if (active) setMessageLoading(false)
-        if (active && messageRefreshPendingRef.current && account && selected) {
+        if (active && !imConnected && messageRefreshPendingRef.current && account && selected) {
           messageRefreshPendingRef.current = false
           void api.syncChatMessages(account.id, selected.chatId, null).then((page) => {
             if (!active) return
@@ -851,13 +1061,13 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
     setMessages([]); setMessageStart(0); setMessageCursor(null); setMessageHasMore(true)
     void load()
     return () => { active = false }
-  }, [account?.id, selected?.chatId])
+  }, [account?.id, selected?.chatId, imConnected])
 
   const loadMoreContacts = () => {
     if (contactLoadingRef.current) return
     if (contactLimit < filteredContacts.length) {
       setContactLimit((current) => Math.min(filteredContacts.length, current + CONTACT_BATCH))
-    } else if (contactHasMore && contactCursor !== null) {
+    } else if (!imConnected && contactHasMore && contactCursor !== null) {
       void refreshContacts(true, contactCursor)
     }
   }
@@ -876,7 +1086,7 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
       restorePosition()
       return
     }
-    if (!messageHasMore || messageCursor === null) return
+    if (imConnected || !messageHasMore || messageCursor === null) return
     messageLoadingRef.current = true
     setMessageLoading(true); setError('')
     try {
@@ -891,7 +1101,7 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
     } finally {
       messageLoadingRef.current = false
       setMessageLoading(false)
-      if (messageRefreshPendingRef.current && account && selected) {
+      if (!imConnected && messageRefreshPendingRef.current && account && selected) {
         messageRefreshPendingRef.current = false
         void api.syncChatMessages(account.id, selected.chatId, null).then((page) => {
           knownMessageIdsRef.current = new Set(page.items.map((message) => message.id))
@@ -975,11 +1185,13 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
     setComposerNotice('已插入商品，点击发送即可发送给客户')
   }
 
-  const insertQuickReply = (reply: QuickReply, replaceCommand = false) => {
+  const insertQuickReply = (reply: QuickReply, replaceCommand = false, replaceDraft = false) => {
     const command = draft.match(/(^|\s)\/([a-zA-Z0-9_-]*)$/)
-    const replyText = replaceCommand && command
-      ? `${draft.slice(0, command.index)}${command[1] || ''}${reply.content}`
-      : (draft ? `${draft}\n${reply.content}`.trim() : reply.content)
+    const replyText = replaceDraft
+      ? reply.content
+      : replaceCommand && command
+        ? `${draft.slice(0, command.index)}${command[1] || ''}${reply.content}`
+        : (draft ? `${draft}\n${reply.content}`.trim() : reply.content)
     setDraft(replyText)
     setQueuedReplyImages(reply.images)
     setQuickReplyOpen(false)
@@ -1004,10 +1216,18 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
     catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)) }
   }
 
-  const commandQuery = draft.match(/(?:^|\s)\/([a-zA-Z0-9_-]*)$/)?.[1]?.toLowerCase() ?? ''
-  const matchingQuickReplies = commandQuery !== '' || /(^|\s)\/$/.test(draft)
+  const commandMatch = draft.match(/(?:^|\s)\/([a-zA-Z0-9_-]*)$/)
+  const commandQuery = commandMatch?.[1]?.toLowerCase() ?? ''
+  const commandActive = Boolean(commandMatch)
+  const autoSuggestQuery = draft.trim().toLowerCase()
+  const matchingQuickReplies = commandActive
     ? quickReplies.filter((reply) => reply.shortCode.toLowerCase().includes(commandQuery) || reply.title.toLowerCase().includes(commandQuery))
-    : []
+    : quickReplyAutoSuggest && autoSuggestQuery.length >= 2
+      ? quickReplies.filter((reply) => {
+        const searchable = `${reply.title} ${reply.content}`.toLowerCase()
+        return searchable.includes(autoSuggestQuery) || autoSuggestQuery.includes(reply.title.toLowerCase())
+      })
+      : []
 
   return <div className="workbench">
     <section className="conversation-panel">
@@ -1019,28 +1239,37 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
       <header><div className="chat-identity">{selected && <ContactAvatar contact={selected} />}<div><p>{selected?.otherUserName ?? '请选择会话'}</p><span>{account?.displayName ?? '当前账号'} · 本机闲鱼 IM</span></div></div><AccountPicker account={account} /></header>
       {error && <div className="chat-error">{error}</div>}
       {selected ? <>
-        <div className="message-list" ref={messageListRef} onScroll={(event) => { if (event.currentTarget.scrollTop < 24) void loadOlderMessages() }}>{messageLoading && <div className="scroll-loader message-loader">正在加载更早消息…</div>}{!messageLoading && messageStart === 0 && !messageHasMore && messages.length > 0 && <div className="scroll-end">已到达最早消息</div>}{messages.length ? visibleMessages.map((message) => <div className={`message-row ${message.direction}`} key={message.id}><div className={`message-bubble ${message.contentKind === 'image' ? 'image-bubble' : ''}`}>{message.contentKind === 'image' && message.mediaUrl ? <img className="message-image" src={message.mediaUrl} alt="聊天图片" loading="lazy" /> : <p>{message.text || '[' + message.contentKind + ']'}</p>}<small>{formatDate(message.sentAt)} · {message.sendStatus}</small></div></div>) : <div className="chat-blank"><MessageCircle size={38} /><h2>暂无历史消息</h2><p>点击左侧“同步”后会从闲鱼拉取最新会话。</p></div>}</div>
+        <div className="message-list" ref={messageListRef} onScroll={(event) => { if (event.currentTarget.scrollTop < 24) void loadOlderMessages() }}>{messageLoading && <div className="scroll-loader message-loader">正在加载更早消息…</div>}{!messageLoading && messageStart === 0 && !messageHasMore && messages.length > 0 && <div className="scroll-end">已到达最早消息</div>}{messages.length ? visibleMessages.map((message) => {
+          // 回执仅使用闲鱼消息模型的 readStatus：2 为已读，其余返回值为未读。
+          // 服务端没有返回该字段或明确不支持时不臆造“已发送”状态。
+          const receipt = message.readStatus === 'read' ? '已读' : message.readStatus === 'unread' ? '未读' : null
+          const isOutgoing = message.direction === 'outgoing'
+          const systemNotice = systemNoticeText(message)
+          const tradeCard = tradeCardMeta(message)
+          const evaluationPrompt = Boolean(tradeCard && /快给\s*ta\s*一个评价吧/i.test(tradeCard.title))
+          const emphasizedTradeCard = Boolean(tradeCard && (/修改价格|等待.*付款|我完成了评价/.test(tradeCard.title)))
+          const senderAvatar = isOutgoing
+            ? account
+              ? <AccountAvatar account={account} className="message-avatar" />
+              : <span className="avatar account-avatar message-avatar"><span>{(message.senderUserName || '我').slice(0, 1)}</span></span>
+            : <ContactAvatar contact={selected} />
+          const senderName = isOutgoing ? account?.displayName || message.senderUserName || '我' : message.senderUserName || selected.otherUserName
+          if (systemNotice) return <div className="system-event-group" key={message.id}><time>{formatEventTime(message.sentAt)}</time><div className="message-row system-notice-row"><div className="message-bubble system-notice-bubble"><MessageBody message={message} emojis={emojis} onProductPreview={openProductPreview} onTradeAction={(action) => setComposerNotice(`${action}需要在闲鱼交易页面中完成`)} /></div></div></div>
+          if (evaluationPrompt) return <div className="system-event-group evaluation-event-group" key={message.id}><time>{formatEventTime(message.sentAt)}</time><div className="message-bubble trade-bubble evaluation-prompt"><MessageBody message={message} emojis={emojis} onProductPreview={openProductPreview} onTradeAction={(action) => setComposerNotice(`${action}需要在闲鱼交易页面中完成`)} /></div></div>
+          const productShare = isProductShare(message)
+          const linkTitle = productLinkTitle(message)
+          const linkedProduct = products.find((item) => item.id === selected.itemId || item.title === linkTitle || item.title === message.cardTitle)
+          const sameConversationProduct = Boolean(linkedProduct && selected.itemId && linkedProduct.id.endsWith(`-${selected.itemId}`))
+          const productFallback = { title: linkedProduct?.title || linkTitle || selected.itemTitle || '', imageUrl: linkedProduct?.imageUrl || (sameConversationProduct ? selected.itemImageUrl : ''), price: linkedProduct ? String(linkedProduct.price) : '' }
+          return <div className={`message-row ${message.direction}`} key={message.id}>{!isOutgoing && senderAvatar}<div className="message-stack"><div className="message-sender-line"><span>{senderName}</span><time>{formatDate(message.sentAt)}</time></div><div className={`message-bubble ${message.contentKind === 'image' ? 'image-bubble' : ''} ${message.contentKind === 'expression' ? 'expression-bubble' : ''} ${productShare ? 'card-bubble product-share-bubble' : ''} ${tradeCard ? 'trade-bubble' : ''} ${evaluationPrompt ? 'evaluation-prompt' : ''} ${emphasizedTradeCard ? 'emphasized' : ''}`}><MessageBody message={message} emojis={emojis} onProductPreview={openProductPreview} onTradeAction={(action) => setComposerNotice(`${action}需要在闲鱼交易页面中完成`)} productFallback={productFallback} /></div>{isOutgoing && receipt && <small className="message-receipt">{receipt}</small>}</div>{isOutgoing && senderAvatar}</div>
+        }) : <div className="chat-blank"><MessageCircle size={38} /><h2>暂无历史消息</h2><p>点击左侧“同步”后会从闲鱼拉取最新会话。</p></div>}</div>
         <footer className="chat-composer">
           <input ref={imageInputRef} className="composer-file-input" type="file" accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; if (file) void sendImage(file); event.currentTarget.value = '' }} />
           <div className="composer-toolbar">
             <div className="composer-tools-left">
               <div className="composer-tool-anchor" ref={emojiAnchorRef}>
                 <button className={`composer-tool-button ${emojiOpen ? 'active' : ''}`} type="button" aria-label="表情" title="表情" onClick={() => { setEmojiOpen((current) => !current); setQuickReplyOpen(false) }}><Smile size={19} /></button>
-                {emojiOpen && <div className="composer-popover emoji-picker">{[
-                  '😀', '😃', '😄', '😁', '😆', '😅', '🤣', '😂', '🙂', '🙃', '😉', '😊',
-                  '😇', '🥰', '😍', '🤩', '😘', '😗', '😚', '😋', '😛', '😜', '🤪', '🤗',
-                  '🤔', '🫡', '🤭', '🫢', '🤫', '🤐', '😐', '😑', '😶', '🫥', '🙄', '😏',
-                  '😣', '😥', '😮', '🤐', '😯', '😪', '😫', '🥱', '😴', '🤤', '😌', '😛',
-                  '😜', '😝', '🤤', '😒', '😓', '😔', '😕', '🙃', '🫠', '🙁', '☹️', '😖',
-                  '😞', '😟', '😤', '😢', '😭', '😦', '😧', '😨', '😩', '🤯', '😬', '😰',
-                  '😱', '🥵', '🥶', '😳', '🤪', '😵', '😡', '😠', '🤬', '😷', '🤒', '🤕',
-                  '👍', '👎', '👌', '✌️', '🤞', '🤟', '🤘', '🤙', '👋', '👏', '🙌', '👐',
-                  '🤲', '🙏', '💪', '🫶', '❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍',
-                  '💔', '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', '💟', '✨', '💫',
-                  '⭐', '🌟', '🔥', '🎉', '🎊', '🥳', '🎁', '✅', '❌', '⚠️', '❓', '❗',
-                  '💡', '💯', '💰', '🎯', '🚀', '☀️', '🌈', '☕', '🍵', '🍎', '🍉', '🍔',
-                  '🍕', '🍜', '🎂', '🍻', '⚽', '🏀', '🎮', '📱', '💻', '📦', '🛍️', '🧧',
-                ].map((emoji, index) => <button type="button" key={`${emoji}-${index}`} onClick={() => { setDraft((current) => current + emoji); setEmojiOpen(false) }}>{emoji}</button>)}</div>}
+                {emojiOpen && <div className="composer-popover emoji-picker">{emojis.length ? emojis.map((emoji) => <button type="button" key={emoji.iconAlias} title={emoji.iconAlias} onClick={() => { setDraft((current) => current + emoji.iconAlias); setEmojiOpen(false) }}><img src={displayImageUrl(emoji.iconUrl)} alt={emoji.iconAlias} loading="lazy" /></button>) : <p>正在加载闲鱼官方表情…</p>}</div>}
               </div>
               <button className="composer-tool-button" type="button" aria-label="发送图片" title="发送图片" onClick={() => imageInputRef.current?.click()}><ImageIcon size={19} /></button>
             </div>
@@ -1058,11 +1287,13 @@ function Workbench({ account, products, onUnreadChanged, onChatRead, unreadJumpR
           </div>
           {composerNotice && <div className="composer-tool-notice">{composerNotice}</div>}
           {queuedReplyImages.length > 0 && <div className="queued-reply-images">{queuedReplyImages.map((image, index) => <span key={`${image.name}-${index}`}><img src={image.dataUrl} alt="快捷回复图片" /><button type="button" aria-label="移除快捷回复图片" onClick={() => setQueuedReplyImages((current) => current.filter((_, imageIndex) => imageIndex !== index))}>×</button></span>)}</div>}
-          <div className="composer-input-row"><div className="composer-command-anchor" ref={quickReplyCommandRef}><textarea value={draft} onChange={(event) => { const next = event.target.value; setDraft(next); setQuickReplyCommandOpen(/(?:^|\s)\/[a-zA-Z0-9_-]*$/.test(next)) }} onKeyDown={(event) => { if (event.key === 'Escape') { setQuickReplyCommandOpen(false); return } if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} placeholder="输入消息，输入 /简码 可插入快捷回复" />{quickReplyCommandOpen && <div className="quick-command-menu"><header><strong>快捷指令</strong><small>输入 /{commandQuery} 筛选</small></header>{matchingQuickReplies.length ? matchingQuickReplies.map((reply) => <button type="button" key={reply.id} onClick={() => insertQuickReply(reply, true)}><span><strong>{reply.title}</strong><small>/{reply.shortCode}</small></span><em>{reply.images.length ? `${reply.images.length} 图` : '文字'}</em></button>) : <p>没有匹配的快捷回复</p>}</div>}</div><button className="primary" disabled={(!draft.trim() && !queuedReplyImages.length) || busy} onClick={() => void send()}><Send size={15} />{busy ? '处理中' : '发送'}</button></div>
+          <div className="composer-input-row"><div className="composer-command-anchor" ref={quickReplyCommandRef}><textarea value={draft} onChange={(event) => { const next = event.target.value; setDraft(next); setQuickReplyCommandOpen(/(?:^|\s)\/[a-zA-Z0-9_-]*$/.test(next) || (quickReplyAutoSuggest && next.trim().length >= 2)) }} onPaste={(event) => { const image = Array.from(event.clipboardData.items).find((item) => item.kind === 'file' && item.type.startsWith('image/'))?.getAsFile(); if (!image) return; event.preventDefault(); void sendImage(image) }} onKeyDown={(event) => { if (event.key === 'Escape') { setQuickReplyCommandOpen(false); return } if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} placeholder={'通过设置启用「自动联想」或输入“/”唤起快捷回复\n「Command + V」可直接发送截图或复制的图片\n「Shift + Enter」进行内容换行'} />{quickReplyCommandOpen && <div className="quick-command-menu"><header><strong>{commandActive ? '快捷指令' : '自动联想'}</strong><small>{commandActive ? `输入 /${commandQuery} 筛选` : '根据输入匹配快捷回复'}</small></header>{matchingQuickReplies.length ? matchingQuickReplies.map((reply) => <button type="button" key={reply.id} onClick={() => insertQuickReply(reply, commandActive, !commandActive)}><span><strong>{reply.title}</strong><small>/{reply.shortCode}</small></span><em>{reply.images.length ? `${reply.images.length} 图` : '文字'}</em></button>) : <p>{commandActive ? '没有匹配的快捷回复' : '暂无联想结果'}</p>}</div>}</div><button className="primary" disabled={(!draft.trim() && !queuedReplyImages.length) || busy} onClick={() => void send()}><Send size={15} />{busy ? '处理中' : '发送'}</button></div>
         </footer>
       </> : <div className="chat-blank"><MessageCircle size={42} /><h2>{account ? '暂无会话' : '请先添加账号'}</h2><p>{account ? '确保账号已扫码登录，然后点击左侧同步。' : '扫码登录后即可同步真实会话。'}</p></div>}
     </section>
-    <aside className={`context-panel ${quickReplyManaging ? 'quick-reply-manager-panel' : ''}`}>{quickReplyManaging ? <QuickReplyManager replies={quickReplies} value={editingQuickReply} onClose={() => { setQuickReplyManaging(false); setEditingQuickReply(undefined) }} onSave={saveQuickReply} onEdit={setEditingQuickReply} onDelete={(reply) => void deleteQuickReply(reply)} /> : <><div className="context-tabs"><b>客户</b><span>商品</span><span>账号</span></div>{selected ? <div className="context-order"><h3>会话上下文</h3><dl><dt>所属账号</dt><dd>{account?.displayName ?? '—'}</dd><dt>客户</dt><dd>{selected.otherUserName}</dd><dt>闲鱼用户 ID</dt><dd>{selected.otherUserId}</dd><dt>关联商品</dt><dd>{selected.itemTitle || selected.itemId || '未识别'}</dd><dt>未读</dt><dd>{selected.unreadCount}</dd></dl></div> : <div className="context-empty"><img src={logo} alt="" /><p>选择会话后查看上下文。</p></div>}</>}</aside>
+    <aside className={`context-panel ${quickReplyManaging ? 'quick-reply-manager-panel' : ''}`}>{quickReplyManaging ? <QuickReplyManager replies={quickReplies} value={editingQuickReply} onClose={() => { setQuickReplyManaging(false); setEditingQuickReply(undefined) }} onSave={saveQuickReply} onEdit={setEditingQuickReply} onDelete={(reply) => void deleteQuickReply(reply)} /> : selected ? <CustomerContextPanel contact={selected} profile={customerProfile} loading={customerProfileLoading} error={customerProfileError} activeTab={customerProductTab} onTabChange={setCustomerProductTab} onEditRemark={() => setCustomerRemarkOpen(true)} /> : <div className="context-empty"><img src={logo} alt="" /><p>选择会话后查看客户资料、交易统计和商品足迹。</p></div>}</aside>
+    {webProductPreviewUrl && <VirtualProductDetail url={webProductPreviewUrl} onClose={() => setWebProductPreviewUrl('')} />}
+    {customerRemarkOpen && selected && <CustomerRemarkDialog value={customerProfile?.remark ?? ''} onClose={() => setCustomerRemarkOpen(false)} onSave={saveCustomerRemark} />}
   </div>
 }
 
@@ -1071,6 +1302,75 @@ function ContactAvatar({ contact }: { contact: ChatContact }) {
   if (isNotice) return <div className="avatar contact-avatar system-avatar"><Bell size={22} /></div>
   const fallback = contact.otherUserName.trim().slice(0, 1) || '?'
   return <div className="avatar contact-avatar"><span>{fallback}</span>{contact.avatarUrl && <img src={displayImageUrl(contact.avatarUrl)} alt="" loading="lazy" onError={(event) => event.currentTarget.remove()} />}</div>
+}
+
+function customerItemDate(value: string) {
+  if (!value) return ''
+  const timestamp = Number(value)
+  if (Number.isFinite(timestamp) && timestamp > 0) return formatRelativeTime(new Date(timestamp).toISOString())
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : formatRelativeTime(date.toISOString())
+}
+
+function customerCreditTone(value: string) {
+  if (value.includes('极好')) return 'excellent'
+  if (value.includes('优秀')) return 'great'
+  if (value.includes('良好') || value.includes('较好')) return 'good'
+  if (value.includes('较差')) return 'poor'
+  return 'neutral'
+}
+
+function CustomerContextPanel({ contact, profile, loading, error, activeTab, onTabChange, onEditRemark }: { contact: ChatContact; profile?: CustomerProfile; loading: boolean; error: string; activeTab: 'current' | 'favorite' | 'consulted'; onTabChange: (tab: 'current' | 'favorite' | 'consulted') => void; onEditRemark: () => void }) {
+  const displayName = profile?.displayName || contact.otherUserName
+  const avatarUrl = profile?.avatarUrl || contact.avatarUrl
+  const rawCredit = profile?.creditLevel || contact.buyerTag
+  const credit = rawCredit ? (rawCredit.includes('买家信用') ? rawCredit : `买家信用${rawCredit}`) : ''
+  const details = [
+    profile?.city,
+    profile?.lastActiveText,
+    profile?.goodReviewRate && `好评率 ${profile.goodReviewRate}${profile.goodReviewRate.includes('%') ? '' : '%'}`,
+  ].filter(Boolean) as string[]
+  const products: CustomerItem[] = activeTab === 'current'
+    ? profile?.currentItems ?? [{ itemId: contact.itemId, title: contact.itemTitle, imageUrl: contact.itemImageUrl, price: '', fishCoin: '', status: '', exposureCount: '', viewCount: '', wantCount: '', visitedAt: contact.latestMessageTime }].filter((item) => item.itemId || item.title)
+    : activeTab === 'favorite' ? profile?.favoriteItems ?? [] : profile?.consultedItems ?? []
+  const tabEmptyCopy = activeTab === 'current' ? '当前会话没有关联商品。' : activeTab === 'favorite' ? '闲鱼暂未返回收藏/浏览商品。' : '闲鱼暂未返回咨询过的商品。'
+  return <div className="customer-context">
+    <div className="context-tabs customer-context-tabs"><b>买家信息</b><span>官方同步</span></div>
+    <section className="customer-identity">
+      <div className="customer-profile-avatar"><span>{displayName.trim().slice(0, 1) || '?'}</span>{avatarUrl && <img src={displayImageUrl(avatarUrl)} alt="" onError={(event) => event.currentTarget.remove()} />}</div>
+      <div><strong>{displayName}</strong><button type="button" className="customer-remark-button" onClick={onEditRemark}><span>{profile?.remark || '给买家添加备注'}</span><Pencil size={12} /></button></div>
+      {loading && <i className="customer-syncing">同步中</i>}
+    </section>
+    <div className="customer-detail-line">{credit && <span className={`customer-credit ${customerCreditTone(credit)}`}>{credit}</span>}{details.length ? details.map((detail, index) => <span key={`${detail}-${index}`}>{detail}</span>) : !credit && <span>闲鱼买家资料暂未返回</span>}</div>
+    <section className="customer-stats">
+      <small>{profile?.officialSynced ? `数据更新至 ${profile.dataUpdatedAt || '—'}` : '等待官方客户资料同步'}</small>
+      <div>
+        <article><strong>{profile?.purchaseCount || '—'}<em>{profile?.purchaseCount ? '次' : ''}</em></strong><span>本店购买</span></article>
+        <article><strong>{profile?.totalSpend ? `¥${profile.totalSpend.replace(/^¥/, '')}` : '—'}</strong><span>本店累计消费</span></article>
+        <article><strong>{profile?.averageOrderValue ? `¥${profile.averageOrderValue.replace(/^¥/, '')}` : '—'}</strong><span>本店平均笔单价</span></article>
+      </div>
+    </section>
+    <div className="customer-product-tabs" role="tablist">
+      <button type="button" className={activeTab === 'current' ? 'active' : ''} onClick={() => onTabChange('current')}>当前宝贝</button>
+      <button type="button" className={activeTab === 'favorite' ? 'active' : ''} onClick={() => onTabChange('favorite')}>收藏宝贝</button>
+      <button type="button" className={activeTab === 'consulted' ? 'active' : ''} onClick={() => onTabChange('consulted')}>咨询过的宝贝</button>
+    </div>
+    <div className="customer-product-list">{products.length ? products.slice(0, 10).map((item, index) => activeTab === 'current'
+      ? <article className="customer-current-item" key={`${item.itemId || item.title}-${index}`}><div className="customer-current-image">{item.imageUrl ? <img src={displayImageUrl(item.imageUrl)} alt="" loading="lazy" onError={(event) => event.currentTarget.parentElement?.classList.add('image-error')} /> : null}<Package size={21} />{item.status && <span>{item.status}</span>}</div><div className="customer-current-copy"><strong>{item.title || `商品 ${item.itemId}`}</strong><small>曝光：{item.exposureCount || '—'} <i>｜</i> 浏览：{item.viewCount || '—'} <i>｜</i> 想要：{item.wantCount || '—'}</small><b>{item.price && `¥${item.price.replace(/^¥/, '')}`}{item.fishCoin && <em>{item.price ? ' + ' : ''}{item.fishCoin}闲鱼币</em>}</b></div></article>
+      : <article className="customer-footprint-item" key={`${item.itemId || item.title}-${index}`}><div className="customer-footprint-image">{item.imageUrl ? <img src={displayImageUrl(item.imageUrl)} alt={item.title || '商品图片'} loading="lazy" onError={(event) => event.currentTarget.parentElement?.classList.add('image-error')} /> : <Package size={17} />}{item.visitedAt && <small>{customerItemDate(item.visitedAt)}</small>}</div>{item.price && <b>¥{item.price.replace(/^¥/, '')}</b>}</article>) : <p>{tabEmptyCopy}</p>}</div>
+    {(profile?.syncNote || error) && <p className="customer-sync-note">{profile?.syncNote || `客户资料同步失败：${error}`}</p>}
+  </div>
+}
+
+function CustomerRemarkDialog({ value, onClose, onSave }: { value: string; onClose: () => void; onSave: (remark: string) => Promise<void> }) {
+  const [remark, setRemark] = useState(value)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const save = async () => {
+    setSaving(true); setError('')
+    try { await onSave(remark); } catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); setSaving(false) }
+  }
+  return <Modal title="给买家添加备注" onClose={() => { if (!saving) onClose() }}><div className="customer-remark-dialog"><textarea autoFocus maxLength={50} rows={6} value={remark} onChange={(event) => setRemark(event.target.value)} placeholder="请输入用户备注信息，此备注信息不对用户展示" /><div className="customer-remark-count">{remark.length} / 50</div>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" disabled={saving} onClick={onClose}>取消</button><button type="button" className="primary" disabled={saving} onClick={() => void save()}>{saving ? '保存中…' : '确定'}</button></div></div></Modal>
 }
 
 function QuickReplyManager({ replies, value, onClose, onSave, onEdit, onDelete }: { replies: QuickReply[]; value?: QuickReply; onClose: () => void; onSave: (input: { title: string; content: string; shortCode: string; images: QuickReplyImage[] }) => void; onEdit: (reply: QuickReply | undefined) => void; onDelete: (reply: QuickReply) => void }) {
@@ -1095,10 +1395,39 @@ function QuickReplyManager({ replies, value, onClose, onSave, onEdit, onDelete }
   </div>
 }
 
-function SettingsPage({ onExport }: { onExport: () => void }) { return <div className="page settings-page"><PageHead eyebrow="应用设置" title="本地优先，安全可控" description="账号会话、商品、订单和同步记录都保存在当前电脑。" />
+function LogManager({ onClose }: { onClose: () => void }) {
+  const [logs, setLogs] = useState<AppLog[]>([])
+  const [failed, setFailed] = useState(false)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    let alive = true
+    const load = async () => {
+      try {
+        const entries = await api.appLogs(500)
+        if (!alive) return
+        setLogs(entries)
+        setFailed(false)
+      } catch {
+        if (alive) setFailed(true)
+      }
+    }
+    void load()
+    const timer = window.setInterval(() => void load(), 1_000)
+    return () => { alive = false; window.clearInterval(timer) }
+  }, [])
+  useEffect(() => {
+    const target = scrollRef.current
+    if (target) target.scrollTop = target.scrollHeight
+  }, [logs])
+  return <Modal title="日志管理" onClose={onClose}><div className="log-manager"><div className="log-manager-status"><span><i />自动刷新中 · 每秒更新</span><small>{logs.length} 条本地日志</small></div><div ref={scrollRef} className="log-list" aria-live="polite">{failed ? <p className="log-empty">日志暂时无法读取。</p> : logs.length ? logs.map((entry) => <article className={`log-entry ${entry.level}`} key={entry.id}><time>{formatDate(entry.createdAt)}</time><span className="log-level">{entry.level}</span><span className="log-category">{entry.category}</span><p>{entry.accountId ? `[${entry.accountId.slice(0, 8)}] ` : ''}{entry.message}</p></article>) : <p className="log-empty">暂无日志，连接 IM 后会在这里显示协议阶段与错误。</p>}</div></div></Modal>
+}
+
+function SettingsPage({ quickReplyAutoSuggest, onQuickReplyAutoSuggestChange, onExport, onOpenLogs }: { quickReplyAutoSuggest: boolean; onQuickReplyAutoSuggestChange: (value: boolean) => void; onExport: () => void; onOpenLogs: () => void }) { return <div className="page settings-page"><PageHead eyebrow="应用设置" title="本地优先，安全可控" description="账号会话、商品、订单和同步记录都保存在当前电脑。" />
+  <section className="settings-card"><div><h3>快捷回复自动联想</h3><p>在客服输入文字时，根据已有快捷回复的标题和内容显示匹配建议。</p></div><label className="settings-switch"><input type="checkbox" checked={quickReplyAutoSuggest} onChange={(event) => onQuickReplyAutoSuggestChange(event.target.checked)} /><span aria-hidden="true" /><b>{quickReplyAutoSuggest ? '已开启' : '已关闭'}</b></label></section>
   <section className="settings-card"><div><h3>导出本地备份</h3><p>导出账号资料、商品和订单为 JSON 文件，便于迁移与排查。</p></div><button className="secondary" onClick={onExport}><Download size={17} />导出备份</button></section>
   <section className="settings-card"><div><h3>本机闲鱼连接器</h3><p>扫码登录、商品和订单同步直接在鲨鱼管家中运行，不依赖 HLSRental 服务。</p></div><Store size={26} /></section>
-  <section className="settings-card"><div><h3>关于鲨鱼管家</h3><p>v0.1.0 · Tauri 跨平台桌面应用 · macOS / Windows / Linux</p></div><img src={logo} alt="鲨鱼管家" /></section>
+  <section className="settings-card"><div><h3>日志管理</h3><p>查看最近的 IM 连接、同步与错误日志，自动刷新并跟随最新记录。</p></div><button className="secondary" onClick={onOpenLogs}><History size={17} />查看日志</button></section>
+  <section className="settings-card"><div><h3>关于鲨鱼管家</h3><p>v0.1.2 · Tauri 跨平台桌面应用 · macOS / Windows / Linux</p></div><img src={logo} alt="鲨鱼管家" /></section>
 </div> }
 
 function PageHead({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: React.ReactNode }) { return <div className="page-head"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{description}</p></div>{action}</div> }

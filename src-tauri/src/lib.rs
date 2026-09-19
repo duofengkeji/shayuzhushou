@@ -16,6 +16,7 @@ struct AppState {
     db: Mutex<Connection>,
     secret_key: [u8; 32],
     chat_listeners: Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
+    im_request_senders: Mutex<HashMap<String, xianyu_im_local::ImRequestSender>>,
     im_statuses: Mutex<HashMap<String, String>>,
 }
 
@@ -23,6 +24,8 @@ struct AppState {
 #[serde(rename_all = "camelCase")]
 struct ChatImEvent {
     account_id: String,
+    requires_sync: bool,
+    chat_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,12 +36,58 @@ struct ImStatusEvent {
     message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppLog {
+    id: i64,
+    created_at: String,
+    level: String,
+    category: String,
+    account_id: String,
+    message: String,
+}
+
+fn append_app_log(app: &tauri::AppHandle, level: &str, category: &str, account_id: &str, message: &str) {
+    // Keep diagnostics local and bounded. Messages intentionally contain only
+    // protocol stage/error text; cookies, tokens and server payloads never
+    // enter the application log.
+    let entry = AppLog {
+        id: 0,
+        created_at: Utc::now().to_rfc3339(),
+        level: level.to_owned(),
+        category: category.to_owned(),
+        account_id: account_id.to_owned(),
+        message: message.chars().take(600).collect(),
+    };
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(conn) = state.db.lock() {
+            let _ = conn.execute(
+                "INSERT INTO app_logs (created_at, level, category, account_id, message) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![entry.created_at, entry.level, entry.category, entry.account_id, entry.message],
+            );
+            let _ = conn.execute(
+                "DELETE FROM app_logs WHERE id NOT IN (SELECT id FROM app_logs ORDER BY id DESC LIMIT 2000)",
+                [],
+            );
+        }
+    }
+    let _ = app.emit("app-log", entry);
+}
+
 fn update_im_status(app: &tauri::AppHandle, account_id: &str, status: &str, message: &str) {
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(mut statuses) = state.im_statuses.lock() {
             statuses.insert(account_id.to_owned(), status.to_owned());
         }
     }
+    let level = if message.contains("失败") || message.contains("断开") || message.contains("错误") || message.contains("拒绝") {
+        "error"
+    } else if status == "connecting" {
+        "warn"
+    } else {
+        "info"
+    };
+    append_app_log(app, level, "IM", account_id, message);
     let _ = app.emit(
         "im-status",
         ImStatusEvent {
@@ -79,6 +128,7 @@ struct Product {
     id: String,
     account_id: String,
     title: String,
+    image_url: String,
     price: f64,
     stock: i64,
     status: String,
@@ -118,6 +168,45 @@ struct Order {
     status: String,
     created_at: String,
     note: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CustomerItem {
+    item_id: String,
+    title: String,
+    image_url: String,
+    price: String,
+    fish_coin: String,
+    status: String,
+    exposure_count: String,
+    view_count: String,
+    want_count: String,
+    visited_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CustomerProfile {
+    account_id: String,
+    chat_id: String,
+    user_id: String,
+    display_name: String,
+    avatar_url: String,
+    remark: String,
+    credit_level: String,
+    city: String,
+    last_active_text: String,
+    good_review_rate: String,
+    data_updated_at: String,
+    purchase_count: String,
+    total_spend: String,
+    average_order_value: String,
+    current_items: Vec<CustomerItem>,
+    favorite_items: Vec<CustomerItem>,
+    consulted_items: Vec<CustomerItem>,
+    official_synced: bool,
+    sync_note: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +304,8 @@ struct AccountInput {
 struct ProductInput {
     account_id: String,
     title: String,
+    #[serde(default)]
+    image_url: String,
     price: f64,
     stock: i64,
     status: String,
@@ -280,6 +371,31 @@ fn value_string(value: &Value, names: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+fn nested_value_string(value: &Value, names: &[&str]) -> String {
+    match value {
+        Value::Object(map) => {
+            for name in names {
+                if let Some(Value::String(text)) = map.get(*name) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        return text.to_owned();
+                    }
+                }
+            }
+            map.values()
+                .map(|value| nested_value_string(value, names))
+                .find(|value| !value.is_empty())
+                .unwrap_or_default()
+        }
+        Value::Array(items) => items
+            .iter()
+            .map(|value| nested_value_string(value, names))
+            .find(|value| !value.is_empty())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 fn value_number(value: &Value, names: &[&str]) -> f64 {
     names
         .iter()
@@ -296,99 +412,32 @@ fn value_i64(value: &Value, names: &[&str]) -> i64 {
     value_number(value, names).max(0.0) as i64
 }
 
-fn cookie_value(cookie: &str, names: &[&str]) -> String {
-    cookie
-        .split(';')
-        .filter_map(|part| part.trim().split_once('='))
-        .find_map(|(name, value)| names.contains(&name.trim()).then(|| value.trim().to_owned()))
-        .unwrap_or_default()
-}
-
-fn decode_cookie_text(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let decode = |value: u8| match value {
-                b'0'..=b'9' => Some(value - b'0'),
-                b'a'..=b'f' => Some(value - b'a' + 10),
-                b'A'..=b'F' => Some(value - b'A' + 10),
-                _ => None,
-            };
-            if let (Some(high), Some(low)) = (decode(bytes[index + 1]), decode(bytes[index + 2])) {
-                output.push(high * 16 + low);
-                index += 3;
-                continue;
-            }
-        }
-        output.push(if bytes[index] == b'+' { b' ' } else { bytes[index] });
-        index += 1;
-    }
-    String::from_utf8(output).unwrap_or_else(|_| value.to_owned())
-}
-
 async fn fetch_account_profile(cookie: &str) -> Result<AccountProfile, String> {
-    let user_id = cookie_value(cookie, &["unb", "munb"]);
-    if user_id.is_empty() {
-        return Err("当前登录会话缺少闲鱼用户标识".to_owned());
-    }
-    // The platform accepts both an IM-style session id and a bare user id,
-    // depending on the account's current login route. Try both forms so QR
-    // logins and restored local sessions share the same profile flow.
-    let session_ids = if user_id.contains('@') {
-        vec![user_id]
-    } else {
-        vec![format!("{user_id}@goofish"), user_id]
+    // The seller workbench uses this member/navigation endpoint for the
+    // currently logged-in account. It returns `data.module.base.displayName`
+    // and `displayNick`; no conversation/session ID is involved.
+    let (body, renewed_cookie) = xianyu_local::mtop_call(
+        cookie,
+        "mtop.idle.web.user.page.nav",
+        "1.0",
+        "originaljson",
+        &serde_json::json!({}),
+    )
+    .await?;
+    let module = body.pointer("/data/module").unwrap_or(&body);
+    let base = module.pointer("/base").unwrap_or(module);
+    let profile = AccountProfile {
+        nickname: first_nonempty(
+            nested_value(base, &["displayName"]),
+            nested_value(base, &["displayNick", "nick", "nickname"]),
+        ),
+        avatar_url: nested_value(base, &["avatar", "avatarUrl", "logo"]).replace("http://", "https://"),
+        cookie: renewed_cookie,
     };
-    let mut current_cookie = cookie.to_owned();
-    // tracknick belongs to the account that completed the QR login. Unlike the
-    // IM profile query, it cannot resolve to the conversation peer, so use it
-    // as the display-name authority whenever the platform provided it.
-    let cookie_nickname = decode_cookie_text(&cookie_value(cookie, &["tracknick"]));
-    let mut last_error = String::new();
-    for session_id in session_ids {
-        match xianyu_local::mtop_call(
-            &current_cookie,
-            "mtop.taobao.idlemessage.pc.user.query",
-            "4.0",
-            "originaljson",
-            &serde_json::json!({
-                "type": 0,
-                "sessionType": 1,
-                "sessionId": session_id,
-                "isOwner": true,
-            }),
-        )
-        .await
-        {
-            Ok((_body, renewed_cookie)) => {
-                current_cookie = renewed_cookie;
-                let result = AccountProfile {
-                    // `user.query` sometimes returns the conversation peer's
-                    // nick even with isOwner=true. Only the login cookie's
-                    // tracknick may update the account title here; the IM
-                    // stream can later provide the verified seller name.
-                    nickname: cookie_nickname.clone(),
-                    // Do not use the generic profile avatar here: for some
-                    // IM sessions it belongs to the conversation peer. The
-                    // verified avatar is collected from outgoing IM messages.
-                    avatar_url: String::new(),
-                    cookie: current_cookie.clone(),
-                };
-                if !result.nickname.is_empty() || !result.avatar_url.is_empty() {
-                    return Ok(result);
-                }
-                last_error = "闲鱼账号资料返回为空".to_owned();
-            }
-            Err(error) => last_error = error,
-        }
+    if profile.nickname.is_empty() {
+        return Err("闲鱼会员资料未返回账号名称".to_owned());
     }
-    Err(if last_error.is_empty() {
-        "无法读取闲鱼账号资料".to_owned()
-    } else {
-        last_error
-    })
+    Ok(profile)
 }
 
 fn save_account_profile(
@@ -436,6 +485,147 @@ fn value_list(payload: &Value) -> Vec<&Value> {
         }
     }
     Vec::new()
+}
+
+fn nested_value(value: &Value, names: &[&str]) -> String {
+    match value {
+        Value::Object(map) => {
+            for name in names {
+                if let Some(value) = map.get(*name) {
+                    let text = match value {
+                        Value::String(text) => text.trim().to_owned(),
+                        Value::Number(number) => number.to_string(),
+                        _ => String::new(),
+                    };
+                    if !text.is_empty() {
+                        return text;
+                    }
+                }
+            }
+            map.values()
+                .map(|value| nested_value(value, names))
+                .find(|value| !value.is_empty())
+                .unwrap_or_default()
+        }
+        Value::Array(items) => items
+            .iter()
+            .map(|value| nested_value(value, names))
+            .find(|value| !value.is_empty())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn first_nonempty(primary: String, fallback: String) -> String {
+    if primary.is_empty() { fallback } else { primary }
+}
+
+fn customer_items(payload: &Value) -> Vec<CustomerItem> {
+    let items = payload
+        .pointer("/data/items")
+        .and_then(Value::as_array)
+        .or_else(|| payload.pointer("/data/data/items").and_then(Value::as_array))
+        .or_else(|| payload.pointer("/data/module/items").and_then(Value::as_array))
+        .cloned()
+        .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let item_id = nested_value(&item, &["itemId", "item_id", "id"]);
+            let title = nested_value(&item, &["title", "itemTitle", "item_title"]);
+            let key = if item_id.is_empty() { title.clone() } else { item_id.clone() };
+            (!key.is_empty() && seen.insert(key)).then(|| CustomerItem {
+                item_id,
+                title,
+                image_url: nested_value(
+                    &item,
+                    &[
+                        "absoluteMajorPicture",
+                        "imageUrl",
+                        "image_url",
+                        "itemPic",
+                        "item_pic",
+                    ],
+                )
+                .replace("http://", "https://"),
+                price: nested_value(&item, &["reservePrice", "price", "itemPrice", "item_price"]),
+                fish_coin: nested_value(&item, &["xybAmount", "fishCoin", "fish_coin"]),
+                status: nested_value(&item, &["itemStatusDesc", "statusDesc", "status"]),
+                exposure_count: String::new(),
+                view_count: String::new(),
+                want_count: String::new(),
+                visited_at: nested_value(&item, &["timestamp", "visitTime", "visitedAt", "createdAt"]),
+            })
+        })
+        .collect()
+}
+
+fn decoded_json_value(value: &Value) -> Value {
+    value
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_else(|| value.clone())
+}
+
+fn current_customer_item(head_info: &Value, item_stats: &Value, fallback: CustomerItem) -> CustomerItem {
+    // `message.headinfo.query` returns the exact model rendered by the
+    // official current-item card. Some accounts serialize it as a JSON string.
+    let item = decoded_json_value(
+        head_info
+            .pointer("/data/data")
+            .or_else(|| head_info.pointer("/data/module"))
+            .unwrap_or(head_info),
+    );
+    let stats = decoded_json_value(
+        item_stats
+            .pointer("/data/data")
+            .or_else(|| item_stats.pointer("/data/module"))
+            .unwrap_or(item_stats),
+    );
+    // The official response keeps the product title in `itemPreInfo`, while
+    // `middle.data.title` is sometimes the formatted price. Read those two
+    // fields separately so a price never overwrites the product title.
+    let item_pre_info = decoded_json_value(
+        item.pointer("/commonData/itemPreInfo")
+            .or_else(|| item.pointer("/itemPreInfo"))
+            .unwrap_or(&Value::Null),
+    );
+    let middle = item.pointer("/middle/data").unwrap_or(&item);
+    CustomerItem {
+        item_id: first_nonempty(nested_value(&item, &["itemId", "item_id", "id"]), fallback.item_id),
+        title: first_nonempty(
+            first_nonempty(
+                nested_value(&item_pre_info, &["title", "itemTitle", "item_title"]),
+                nested_value(&item, &["itemTitle", "item_title", "name"]),
+            ),
+            fallback.title,
+        ),
+        image_url: first_nonempty(
+            first_nonempty(
+                nested_value(middle, &["picUrl", "imageUrl", "image_url", "absoluteMajorPicture"]),
+                nested_value(&item, &["picUrl", "imageUrl", "image_url", "absoluteMajorPicture"]),
+            )
+            .replace("http://", "https://"),
+            fallback.image_url,
+        ),
+        price: first_nonempty(
+            nested_value(middle, &["skuPrice", "price", "reservePrice", "title"]),
+            fallback.price,
+        ),
+        fish_coin: first_nonempty(
+            nested_value(middle, &["xybAmount", "fishCoin", "fish_coin"]),
+            fallback.fish_coin,
+        ),
+        status: first_nonempty(
+            nested_value(middle, &["itemStatusDesc", "statusDesc", "status"]),
+            fallback.status,
+        ),
+        exposure_count: nested_value(&stats, &["exposureNum", "exposureCount"]),
+        view_count: nested_value(&stats, &["showNum", "viewNum", "viewCount"]),
+        want_count: nested_value(&stats, &["wantNum", "wantCount"]),
+        visited_at: fallback.visited_at,
+    }
 }
 
 fn normalize_product_status(raw: String, stock: i64) -> String {
@@ -531,6 +721,7 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE TABLE IF NOT EXISTS products (
           id TEXT PRIMARY KEY, account_id TEXT NOT NULL, title TEXT NOT NULL,
+          image_url TEXT NOT NULL DEFAULT '',
           price REAL NOT NULL, stock INTEGER NOT NULL, status TEXT NOT NULL,
           updated_at TEXT NOT NULL, tags TEXT NOT NULL
         );
@@ -563,11 +754,22 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
           latest_message TEXT NOT NULL, latest_message_time TEXT NOT NULL, unread_count INTEGER NOT NULL,
           PRIMARY KEY (account_id, chat_id)
         );
+        CREATE TABLE IF NOT EXISTS customer_remarks (
+          account_id TEXT NOT NULL, chat_id TEXT NOT NULL, remark TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL, PRIMARY KEY (account_id, chat_id)
+        );
         CREATE TABLE IF NOT EXISTS chat_messages (
           account_id TEXT NOT NULL, id TEXT NOT NULL, chat_id TEXT NOT NULL,
           sender_user_id TEXT NOT NULL, sender_user_name TEXT NOT NULL, direction TEXT NOT NULL,
           content_kind TEXT NOT NULL, text TEXT NOT NULL, media_url TEXT NOT NULL DEFAULT '', sent_at TEXT NOT NULL, send_status TEXT NOT NULL,
+          read_status TEXT NOT NULL DEFAULT 'unknown', card_title TEXT NOT NULL DEFAULT '',
+          card_subtitle TEXT NOT NULL DEFAULT '', card_price TEXT NOT NULL DEFAULT '',
+          target_url TEXT NOT NULL DEFAULT '',
           PRIMARY KEY (account_id, id)
+        );
+        CREATE TABLE IF NOT EXISTS chat_emojis (
+          account_id TEXT NOT NULL, icon_alias TEXT NOT NULL, icon_url TEXT NOT NULL,
+          updated_at TEXT NOT NULL, PRIMARY KEY (account_id, icon_alias)
         );
         CREATE TABLE IF NOT EXISTS quick_replies (
           id TEXT PRIMARY KEY, account_id TEXT NOT NULL, title TEXT NOT NULL,
@@ -581,7 +783,13 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS conversation_preferences (
           account_id TEXT PRIMARY KEY, conversation_name TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS app_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+          level TEXT NOT NULL, category TEXT NOT NULL, account_id TEXT NOT NULL DEFAULT '',
+          message TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(account_id, chat_id, sent_at);
+        CREATE INDEX IF NOT EXISTS idx_app_logs_created_at ON app_logs(id DESC);
         ",
     )?;
     let has_avatar_source = conn
@@ -593,6 +801,10 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
     if !has_avatar_source {
         conn.execute("ALTER TABLE account_profiles ADD COLUMN avatar_source TEXT NOT NULL DEFAULT ''", [])?;
     }
+    let _ = conn.execute(
+        "ALTER TABLE products ADD COLUMN image_url TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE chat_contacts ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''",
         [],
@@ -615,6 +827,26 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
     );
     let _ = conn.execute(
         "ALTER TABLE chat_messages ADD COLUMN media_url TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_messages ADD COLUMN read_status TEXT NOT NULL DEFAULT 'unknown'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_messages ADD COLUMN card_title TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_messages ADD COLUMN card_subtitle TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_messages ADD COLUMN card_price TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE chat_messages ADD COLUMN target_url TEXT NOT NULL DEFAULT ''",
         [],
     );
     conn.execute(
@@ -721,19 +953,20 @@ fn list_products(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<Product>, String> {
     let conn = state.db.lock().map_err(to_error)?;
-    let query = "SELECT id, account_id, title, price, stock, status, updated_at, tags FROM products WHERE (?1 IS NULL OR account_id = ?1) ORDER BY updated_at DESC";
+    let query = "SELECT id, account_id, title, image_url, price, stock, status, updated_at, tags FROM products WHERE (?1 IS NULL OR account_id = ?1) ORDER BY updated_at DESC";
     let mut statement = conn.prepare(query).map_err(to_error)?;
     let rows = statement
         .query_map([account_id], |row| {
-            let tag_string: String = row.get(7)?;
+            let tag_string: String = row.get(8)?;
             Ok(Product {
                 id: row.get(0)?,
                 account_id: row.get(1)?,
                 title: row.get(2)?,
-                price: row.get(3)?,
-                stock: row.get(4)?,
-                status: row.get(5)?,
-                updated_at: row.get(6)?,
+                image_url: row.get(3)?,
+                price: row.get(4)?,
+                stock: row.get(5)?,
+                status: row.get(6)?,
+                updated_at: row.get(7)?,
                 tags: tag_string.split(',').map(str::to_owned).collect(),
             })
         })
@@ -1010,6 +1243,12 @@ fn delete_account_records(conn: &mut Connection, id: &str) -> Result<(), String>
         .execute("DELETE FROM chat_messages WHERE account_id = ?1", [&id])
         .map_err(to_error)?;
     transaction
+        .execute("DELETE FROM customer_remarks WHERE account_id = ?1", [&id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM chat_emojis WHERE account_id = ?1", [&id])
+        .map_err(to_error)?;
+    transaction
         .execute("DELETE FROM chat_contacts WHERE account_id = ?1", [&id])
         .map_err(to_error)?;
     transaction
@@ -1071,6 +1310,66 @@ fn save_renewed_session(
         params![encrypted_cookie, Utc::now().to_rfc3339(), account_id],
     )
     .map_err(to_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_product_detail(
+    account_id: String,
+    url: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    let target = reqwest::Url::parse(url.trim()).map_err(|_| "商品详情地址无效".to_owned())?;
+    let host = target.host_str().unwrap_or_default().to_ascii_lowercase();
+    if target.scheme() != "https"
+        || !(host == "goofish.com"
+            || host.ends_with(".goofish.com")
+            || host == "taobao.com"
+            || host.ends_with(".taobao.com"))
+    {
+        return Err("只允许打开闲鱼官方商品地址".to_owned());
+    }
+    let cookie_values = cookie
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .filter(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
+        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+        .collect::<Vec<_>>();
+    let label = format!("product-preview-{}", Uuid::new_v4().simple());
+    let preview = tauri::WebviewWindowBuilder::new(
+        &app,
+        label,
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+        .title("闲鱼宝贝详情")
+        .inner_size(390.0, 780.0)
+        .min_inner_size(390.0, 780.0)
+        .max_inner_size(390.0, 780.0)
+        .center()
+        .resizable(false)
+        .maximizable(false)
+        .focused(true)
+        .user_agent("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1")
+        .build()
+        .map_err(to_error)?;
+    for (name, value) in cookie_values {
+        for domain in [".goofish.com", ".taobao.com"] {
+            let cookie = tauri::webview::Cookie::build((name.clone(), value.clone()))
+                .domain(domain)
+                .path("/")
+                .secure(true)
+                .http_only(true)
+                .same_site(tauri::webview::cookie::SameSite::None)
+                .build();
+            preview.set_cookie(cookie).map_err(to_error)?;
+        }
+    }
+    preview.navigate(target).map_err(to_error)?;
     Ok(())
 }
 
@@ -1145,6 +1444,271 @@ fn list_chat_contacts(
 }
 
 #[tauri::command]
+async fn customer_profile(
+    account_id: String,
+    chat_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<CustomerProfile, String> {
+    if chat_id.trim().is_empty() {
+        return Err("会话 ID 不能为空".to_owned());
+    }
+    let (contact, cookie, current_item, local_remark) = {
+        let conn = state.db.lock().map_err(to_error)?;
+        ensure_account_exists(&conn, &account_id)?;
+        let contact = conn
+            .query_row(
+                "SELECT c.other_user_id, c.other_user_name, c.avatar_url, c.item_id, c.item_title, c.item_image_url, c.latest_message_time, COALESCE(r.remark, '') FROM chat_contacts c LEFT JOIN customer_remarks r ON r.account_id = c.account_id AND r.chat_id = c.chat_id WHERE c.account_id = ?1 AND c.chat_id = ?2",
+                params![account_id, chat_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .map_err(|_| "会话不存在，请先同步会话列表".to_owned())?;
+        let price = if contact.3.is_empty() {
+            String::new()
+        } else {
+            conn.query_row(
+                "SELECT price FROM products WHERE account_id = ?1 AND id LIKE ?2 LIMIT 1",
+                params![account_id, format!("%-{}", contact.3)],
+                |row| row.get::<_, f64>(0),
+            )
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+        };
+        let current_item = (!contact.3.is_empty() || !contact.4.is_empty()).then(|| CustomerItem {
+            item_id: contact.3.clone(),
+            title: contact.4.clone(),
+            image_url: contact.5.clone(),
+            price,
+            fish_coin: String::new(),
+            status: String::new(),
+            exposure_count: String::new(),
+            view_count: String::new(),
+            want_count: String::new(),
+            visited_at: contact.6.clone(),
+        });
+        let local_remark = contact.7.clone();
+        (contact, local_session(&conn, &account_id, &state.secret_key)?, current_item, local_remark)
+    };
+
+    // These are the same read-only APIs used by the official IM right panel.
+    // Keep each call independent: a non-critical footprint failure must not
+    // hide the basic buyer profile or the currently associated item.
+    let mut renewed_cookie = cookie;
+    let mut sync_note = Vec::new();
+    let profile_response = match xianyu_local::mtop_call(
+        &renewed_cookie,
+        "mtop.idle.web.user.panel.customer",
+        "1.0",
+        "originaljson",
+        &serde_json::json!({ "sessionId": chat_id }),
+    )
+    .await
+    {
+        Ok((body, cookie)) => {
+            renewed_cookie = cookie;
+            Some(body)
+        }
+        Err(_) => {
+            sync_note.push("买家资料暂未返回");
+            None
+        }
+    };
+    let shop_stats_response = match xianyu_local::mtop_call(
+        &renewed_cookie,
+        "mtop.alibaba.idle.seller.pc.shop.stats.query",
+        "1.0",
+        "originaljson",
+        &serde_json::json!({ "sessionId": chat_id }),
+    )
+    .await
+    {
+        Ok((body, cookie)) => {
+            renewed_cookie = cookie;
+            Some(body)
+        }
+        Err(_) => None,
+    };
+    let fetch_footprint = |kind: &'static str, cookie: String, session_id: String| async move {
+        xianyu_local::mtop_call(
+            &cookie,
+            "mtop.taobao.idlemessage.tool.item.query",
+            "1.0",
+            "originaljson",
+            &serde_json::json!({
+                "sessionId": session_id,
+                "type": kind,
+                "currentPage": 1,
+                "pageSize": 100,
+            }),
+        )
+        .await
+    };
+    let favorite_response = fetch_footprint("collect", renewed_cookie.clone(), chat_id.clone()).await;
+    let (favorite_items, cookie_after_favorite) = match favorite_response {
+        Ok((body, cookie)) => (customer_items(&body), cookie),
+        Err(_) => {
+            sync_note.push("收藏商品暂未返回");
+            (Vec::new(), renewed_cookie.clone())
+        }
+    };
+    renewed_cookie = cookie_after_favorite;
+    // The official "TA 咨询过的" tab passes `type: consult` to this API.
+    let consulted_response = fetch_footprint("consult", renewed_cookie.clone(), chat_id.clone()).await;
+    let (consulted_items, cookie_after_consulted) = match consulted_response {
+        Ok((body, cookie)) => (customer_items(&body), cookie),
+        Err(_) => {
+            sync_note.push("咨询商品暂未返回");
+            (Vec::new(), renewed_cookie.clone())
+        }
+    };
+    renewed_cookie = cookie_after_consulted;
+
+    let current_item = if let Some(fallback) = current_item {
+        let head_info = xianyu_local::mtop_call(
+            &renewed_cookie,
+            "mtop.idle.trade.pc.message.headinfo.query",
+            "1.0",
+            "json",
+            &serde_json::json!({
+                "itemId": fallback.item_id,
+                "sessionId": chat_id,
+                "sessionType": 1,
+            }),
+        )
+        .await;
+        let (head_info, cookie_after_head) = match head_info {
+            Ok((body, cookie)) => (body, cookie),
+            Err(_) => (serde_json::json!({}), renewed_cookie.clone()),
+        };
+        renewed_cookie = cookie_after_head;
+        let item_stats = xianyu_local::mtop_call(
+            &renewed_cookie,
+            "mtop.alibaba.idle.seller.pc.item.stats.query",
+            "1.0",
+            "originaljson",
+            &serde_json::json!({ "itemId": fallback.item_id }),
+        )
+        .await;
+        let (item_stats, cookie_after_stats) = match item_stats {
+            Ok((body, cookie)) => (body, cookie),
+            Err(_) => (serde_json::json!({}), renewed_cookie.clone()),
+        };
+        renewed_cookie = cookie_after_stats;
+        Some(current_customer_item(&head_info, &item_stats, fallback))
+    } else {
+        None
+    };
+
+    let profile = profile_response
+        .as_ref()
+        .and_then(|body| body.pointer("/data/module"))
+        .unwrap_or(&Value::Null);
+    let buyer = profile.pointer("/base/buyer").unwrap_or(profile);
+    let stats = shop_stats_response
+        .as_ref()
+        .and_then(|body| body.pointer("/data/data"))
+        .unwrap_or(buyer);
+    // `shop.stats.query` is the source rendered by the official buyer panel:
+    // payOrderCount / payAmount / payAvgAmount, with its own update tip.
+    let data_updated_at = first_nonempty(
+        nested_value(stats, &["dataUpdateTips"]),
+        nested_value(profile, &["dataUpdateTime", "dataUpdatedAt", "updateTime", "updateDate"]),
+    );
+    let result = CustomerProfile {
+        account_id: account_id.clone(),
+        chat_id: chat_id.clone(),
+        user_id: contact.0,
+        display_name: first_nonempty(nested_value(profile, &["displayName", "nick", "nickname"]), contact.1),
+        avatar_url: first_nonempty(nested_value(profile, &["avatar", "avatarUrl", "logo"]), contact.2),
+        remark: first_nonempty(nested_value(profile_response.as_ref().unwrap_or(&Value::Null), &["remark", "userRemark", "extUserRemark"]), local_remark),
+        credit_level: nested_value(buyer, &["levelName", "creditLevel", "creditName"]),
+        city: nested_value(profile, &["cityName", "city", "location", "locationName"]),
+        last_active_text: nested_value(profile, &["lastActiveText", "lastVisitText", "activeText", "lastActiveTime"]),
+        good_review_rate: nested_value(buyer, &["buyerGoodRatio", "goodReviewRate", "goodRate"]),
+        data_updated_at: if profile_response.is_some() {
+            if data_updated_at.is_empty() { chrono::Local::now().format("%Y-%m-%d").to_string() } else { data_updated_at }
+        } else {
+            String::new()
+        },
+        purchase_count: first_nonempty(
+            nested_value(stats, &["payOrderCount", "orderCnt", "orderCount"]),
+            nested_value(buyer, &["payOrderCount", "orderCnt", "orderCount"]),
+        ),
+        total_spend: first_nonempty(
+            nested_value(stats, &["payAmount", "totalPayAmount", "totalSpend"]),
+            nested_value(buyer, &["payAmount", "totalPayAmount", "totalSpend"]),
+        ),
+        average_order_value: first_nonempty(
+            nested_value(stats, &["payAvgAmount", "payAvg", "averageOrderValue", "avgPayAmount"]),
+            nested_value(buyer, &["payAvgAmount", "payAvg", "averageOrderValue", "avgPayAmount"]),
+        ),
+        current_items: current_item.into_iter().collect(),
+        favorite_items,
+        consulted_items,
+        official_synced: profile_response.is_some() || shop_stats_response.is_some(),
+        sync_note: sync_note.join("；"),
+    };
+    let conn = state.db.lock().map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(result)
+}
+
+#[tauri::command]
+async fn update_customer_remark(
+    account_id: String,
+    chat_id: String,
+    remark: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    if chat_id.trim().is_empty() {
+        return Err("会话 ID 不能为空".to_owned());
+    }
+    let remark = remark.trim().to_owned();
+    if remark.chars().count() > 50 {
+        return Err("备注最多 50 个字".to_owned());
+    }
+    let (cookie, secret_key) = {
+        let conn = state.db.lock().map_err(to_error)?;
+        ensure_account_exists(&conn, &account_id)?;
+        (local_session(&conn, &account_id, &state.secret_key)?, state.secret_key)
+    };
+    let (body, renewed_cookie) = xianyu_local::mtop_call(
+        &cookie,
+        "mtop.taobao.idlemessage.pc.tool.remark",
+        "1.0",
+        "json",
+        &serde_json::json!({
+            "sessionType": 1,
+            "sessionId": chat_id.clone(),
+            "oprType": true,
+            "remark": remark.clone(),
+        }),
+    )
+    .await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    conn.execute(
+        "INSERT INTO customer_remarks (account_id, chat_id, remark, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(account_id, chat_id) DO UPDATE SET remark = excluded.remark, updated_at = excluded.updated_at",
+        params![account_id, chat_id, remark, Utc::now().to_rfc3339()],
+    )
+    .map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &secret_key)?;
+    if body.get("ret").and_then(Value::as_array).is_some_and(|ret| ret.iter().any(|item| item.as_str().is_some_and(|text| text.contains("FAIL")))) {
+        return Err("闲鱼备注保存失败".to_owned());
+    }
+    Ok(remark)
+}
+
+#[tauri::command]
 fn chat_unread_totals(
     state: tauri::State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, i64>, String> {
@@ -1187,37 +1751,65 @@ async fn start_chat_listener(
     if listeners.contains_key(&account_id) {
         return Ok(());
     }
+    let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel(64);
+    state
+        .im_request_senders
+        .lock()
+        .map_err(to_error)?
+        .insert(account_id.clone(), request_sender);
     update_im_status(&app, &account_id, "connecting", "正在连接闲鱼 IM");
     let listener_account_id = account_id.clone();
     let handle = tauri::async_runtime::spawn(async move {
         let mut cookie = cookie;
+        let mut reconnect_attempt = 0_u32;
         loop {
-            update_im_status(&app, &listener_account_id, "connecting", "正在连接闲鱼 IM");
+            let connecting_message = if reconnect_attempt == 0 {
+                "正在连接闲鱼 IM".to_owned()
+            } else {
+                format!("闲鱼 IM 重连中（第 {reconnect_attempt} 次）")
+            };
+            update_im_status(&app, &listener_account_id, "connecting", &connecting_message);
             let connected_app = app.clone();
             let connected_account_id = listener_account_id.clone();
             let push_app = app.clone();
             let push_account_id = listener_account_id.clone();
             let push_cookie = cookie.clone();
+            let trace_app = app.clone();
+            let trace_account_id = listener_account_id.clone();
+            let connection_started_at = std::time::Instant::now();
             match xianyu_im_local::listen_for_push(&cookie, move || {
                 update_im_status(&connected_app, &connected_account_id, "connected", "闲鱼 IM 已连接");
             }, move |value| {
+                let message_refs = xianyu_im_local::push_message_refs(value);
+                let requires_sync = !message_refs.is_empty();
+                let chat_id = message_refs.first().map(|(chat_id, _)| chat_id.clone()).unwrap_or_default();
                 let _ = ingest_im_push(&push_app, &push_account_id, &push_cookie, value);
                 let _ = push_app.emit(
                     "chat-im-event",
-                    ChatImEvent { account_id: push_account_id.clone() },
+                    ChatImEvent { account_id: push_account_id.clone(), requires_sync, chat_id },
                 );
-            }).await {
+            }, move |message| {
+                append_app_log(&trace_app, "info", "IM 协议", &trace_account_id, message);
+            }, &mut request_receiver).await {
                 Ok(renewed_cookie) => {
                     cookie = renewed_cookie;
-                    update_im_status(&app, &listener_account_id, "disconnected", "闲鱼 IM 连接已结束");
+                    reconnect_attempt = if connection_started_at.elapsed() >= std::time::Duration::from_secs(60) { 1 } else { reconnect_attempt.saturating_add(1) };
+                    update_im_status(&app, &listener_account_id, "connecting", "闲鱼 IM 连接已结束，正在重连");
                 }
                 Err(error) => {
                     #[cfg(debug_assertions)]
                     eprintln!("[im] account={} disconnected: {}", listener_account_id, error);
-                    update_im_status(&app, &listener_account_id, "disconnected", &error);
+                    reconnect_attempt = if connection_started_at.elapsed() >= std::time::Duration::from_secs(60) { 1 } else { reconnect_attempt.saturating_add(1) };
+                    update_im_status(&app, &listener_account_id, "connecting", &format!("{error}；正在重连"));
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            // This mirrors the official web client's capped exponential
+            // reconnect backoff (100 ms, 200 ms, … up to 5 s) and prevents a
+            // transient gateway reset from leaving the account "offline" for
+            // a fixed 15-second interval.
+            let exponent = reconnect_attempt.saturating_sub(1).min(6);
+            let delay_ms = (100_u64.saturating_mul(1_u64 << exponent)).min(5_000);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
     });
     listeners.insert(account_id, handle);
@@ -1229,6 +1821,7 @@ fn stop_chat_listener(account_id: String, state: tauri::State<'_, AppState>) -> 
     if let Some(handle) = state.chat_listeners.lock().map_err(to_error)?.remove(&account_id) {
         handle.abort();
     }
+    state.im_request_senders.lock().map_err(to_error)?.remove(&account_id);
     if let Ok(mut statuses) = state.im_statuses.lock() {
         statuses.insert(account_id, "stopped".to_owned());
     }
@@ -1238,6 +1831,41 @@ fn stop_chat_listener(account_id: String, state: tauri::State<'_, AppState>) -> 
 #[tauri::command]
 fn get_im_statuses(state: tauri::State<'_, AppState>) -> Result<HashMap<String, String>, String> {
     state.im_statuses.lock().map(|statuses| statuses.clone()).map_err(to_error)
+}
+
+fn account_im_sender(
+    state: &AppState,
+    account_id: &str,
+) -> Result<Option<xianyu_im_local::ImRequestSender>, String> {
+    state
+        .im_request_senders
+        .lock()
+        .map(|senders| senders.get(account_id).cloned())
+        .map_err(to_error)
+}
+
+#[tauri::command]
+fn list_app_logs(limit: Option<usize>, state: tauri::State<'_, AppState>) -> Result<Vec<AppLog>, String> {
+    let limit = limit.unwrap_or(300).clamp(1, 1_000) as i64;
+    let conn = state.db.lock().map_err(to_error)?;
+    let mut statement = conn
+        .prepare("SELECT id, created_at, level, category, account_id, message FROM app_logs ORDER BY id ASC LIMIT ?1")
+        .map_err(to_error)?;
+    let logs = statement
+        .query_map(params![limit], |row| {
+            Ok(AppLog {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                level: row.get(2)?,
+                category: row.get(3)?,
+                account_id: row.get(4)?,
+                message: row.get(5)?,
+            })
+        })
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    Ok(logs)
 }
 
 fn set_chat_read(conn: &Connection, account_id: &str, chat_id: &str) -> Result<(), String> {
@@ -1285,7 +1913,8 @@ async fn mark_chat_read(
     };
 
     if !message_id.trim().is_empty() {
-        if let Ok((_, renewed_cookie)) = xianyu_im_local::clear_red_point(&cookie, &chat_id, &message_id).await {
+        let sender = account_im_sender(&state, &account_id)?;
+        if let Ok((_, renewed_cookie)) = xianyu_im_local::clear_red_point(&cookie, &chat_id, &message_id, sender.as_ref()).await {
             let conn = state.db.lock().map_err(to_error)?;
             let _ = save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key);
         }
@@ -1331,8 +1960,8 @@ async fn sync_chat_contacts(
             });
         (cookie, profiles)
     };
-    let page =
-        xianyu_im_local::fetch_contacts(&account_id, &cookie, &cached_profiles, cursor).await?;
+    let sender = account_im_sender(&state, &account_id)?;
+    let page = xianyu_im_local::fetch_contacts(&account_id, &cookie, &cached_profiles, cursor, sender.as_ref()).await?;
     let conn = state.db.lock().map_err(to_error)?;
     for contact in &page.items {
         conn.execute(
@@ -1353,7 +1982,7 @@ fn read_chat_messages(
     account_id: &str,
     chat_id: &str,
 ) -> Result<Vec<xianyu_im_local::ChatMessage>, String> {
-    let mut statement = conn.prepare("SELECT id, account_id, chat_id, sender_user_id, sender_user_name, direction, content_kind, text, media_url, sent_at, send_status FROM chat_messages WHERE account_id = ?1 AND chat_id = ?2 ORDER BY sent_at ASC").map_err(to_error)?;
+    let mut statement = conn.prepare("SELECT id, account_id, chat_id, sender_user_id, sender_user_name, direction, content_kind, text, media_url, sent_at, send_status, read_status, card_title, card_subtitle, card_price, target_url FROM chat_messages WHERE account_id = ?1 AND chat_id = ?2 ORDER BY sent_at ASC").map_err(to_error)?;
     let messages = statement
         .query_map(params![account_id, chat_id], |row| {
             Ok(xianyu_im_local::ChatMessage {
@@ -1368,6 +1997,11 @@ fn read_chat_messages(
                 media_url: row.get(8)?,
                 sent_at: row.get(9)?,
                 send_status: row.get(10)?,
+                read_status: row.get(11)?,
+                card_title: row.get(12)?,
+                card_subtitle: row.get(13)?,
+                card_price: row.get(14)?,
+                target_url: row.get(15)?,
             })
         })
         .map_err(to_error)?
@@ -1399,6 +2033,67 @@ fn read_chat_messages(
         latest_by_content.insert(key, (sent_millis, index));
     }
     Ok(deduplicated)
+}
+
+fn read_chat_emojis(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<Vec<xianyu_im_local::ChatEmoji>, String> {
+    let mut statement = conn
+        .prepare("SELECT icon_alias, icon_url FROM chat_emojis WHERE account_id = ?1 ORDER BY icon_alias ASC")
+        .map_err(to_error)?;
+    let emojis = statement
+        .query_map([account_id], |row| {
+            Ok(xianyu_im_local::ChatEmoji {
+                icon_alias: row.get(0)?,
+                icon_url: row.get(1)?,
+            })
+        })
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    Ok(emojis)
+}
+
+#[tauri::command]
+fn list_chat_emojis(
+    account_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<xianyu_im_local::ChatEmoji>, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &account_id)?;
+    read_chat_emojis(&conn, &account_id)
+}
+
+#[tauri::command]
+async fn sync_chat_emojis(
+    account_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<xianyu_im_local::ChatEmoji>, String> {
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    let (emojis, renewed_cookie) = xianyu_im_local::fetch_chat_emojis(&cookie).await?;
+    if emojis.is_empty() {
+        return Err("闲鱼未返回表情资源".to_owned());
+    }
+    let conn = state.db.lock().map_err(to_error)?;
+    let transaction = conn.unchecked_transaction().map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM chat_emojis WHERE account_id = ?1", [&account_id])
+        .map_err(to_error)?;
+    for emoji in &emojis {
+        transaction
+            .execute(
+                "INSERT INTO chat_emojis (account_id, icon_alias, icon_url, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![account_id, emoji.icon_alias, emoji.icon_url, Utc::now().to_rfc3339()],
+            )
+            .map_err(to_error)?;
+    }
+    transaction.commit().map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(emojis)
 }
 
 fn remove_near_duplicate_messages(
@@ -1446,8 +2141,8 @@ fn upsert_chat_message(
     message: &xianyu_im_local::ChatMessage,
 ) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO chat_messages (account_id, id, chat_id, sender_user_id, sender_user_name, direction, content_kind, text, media_url, sent_at, send_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(account_id, id) DO UPDATE SET sender_user_name = excluded.sender_user_name, direction = excluded.direction, content_kind = excluded.content_kind, text = excluded.text, media_url = excluded.media_url, sent_at = excluded.sent_at, send_status = excluded.send_status",
-        params![message.account_id, message.id, message.chat_id, message.sender_user_id, message.sender_user_name, message.direction, message.content_kind, message.text, message.media_url, message.sent_at, message.send_status],
+        "INSERT INTO chat_messages (account_id, id, chat_id, sender_user_id, sender_user_name, direction, content_kind, text, media_url, sent_at, send_status, read_status, card_title, card_subtitle, card_price, target_url) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) ON CONFLICT(account_id, id) DO UPDATE SET sender_user_name = excluded.sender_user_name, direction = excluded.direction, content_kind = excluded.content_kind, text = excluded.text, media_url = excluded.media_url, sent_at = excluded.sent_at, send_status = excluded.send_status, read_status = CASE WHEN chat_messages.read_status = 'read' THEN 'read' WHEN excluded.read_status = 'unknown' THEN chat_messages.read_status ELSE excluded.read_status END, card_title = excluded.card_title, card_subtitle = excluded.card_subtitle, card_price = excluded.card_price, target_url = excluded.target_url",
+        params![message.account_id, message.id, message.chat_id, message.sender_user_id, message.sender_user_name, message.direction, message.content_kind, message.text, message.media_url, message.sent_at, message.send_status, message.read_status, message.card_title, message.card_subtitle, message.card_price, message.target_url],
     ).map_err(to_error)?;
     Ok(())
 }
@@ -1458,14 +2153,42 @@ fn ingest_im_push(
     cookie: &str,
     value: &Value,
 ) -> Result<usize, String> {
+    let receipts = xianyu_im_local::parse_push_read_receipts(value);
     let messages = xianyu_im_local::parse_push_messages(value, account_id, cookie);
-    if messages.is_empty() {
+    if messages.is_empty() && receipts.is_empty() {
         return Ok(0);
     }
     let state = app
         .try_state::<AppState>()
         .ok_or_else(|| "应用状态尚未初始化".to_owned())?;
     let conn = state.db.lock().map_err(to_error)?;
+    let mut receipt_ids = 0_usize;
+    let mut receipt_updates = 0_usize;
+    for receipt in receipts {
+        // The official /s/sync receipt uses status=1 for messages read by the
+        // peer. Ignore unknown future statuses instead of accidentally
+        // downgrading an already-read message.
+        if receipt.status != 1 {
+            continue;
+        }
+        for message_id in receipt.message_ids {
+            receipt_ids += 1;
+            receipt_updates += conn.execute(
+                "UPDATE chat_messages SET read_status = 'read' WHERE account_id = ?1 AND chat_id = ?2 AND id = ?3 AND direction = 'outgoing'",
+                params![account_id, receipt.chat_id, message_id],
+            )
+            .map_err(to_error)?;
+        }
+    }
+    if receipt_ids > 0 {
+        append_app_log(
+            app,
+            if receipt_updates > 0 { "info" } else { "warn" },
+            "IM 回执",
+            account_id,
+            &format!("收到已读回执 {receipt_ids} 条，匹配本地消息 {receipt_updates} 条"),
+        );
+    }
     let mut inserted = 0;
     for message in &messages {
         let exists = conn
@@ -1514,27 +2237,18 @@ async fn sync_chat_messages(
         let conn = state.db.lock().map_err(to_error)?;
         local_session(&conn, &account_id, &state.secret_key)?
     };
-    let page = xianyu_im_local::fetch_messages(&account_id, &chat_id, &cookie, cursor).await?;
+    let sender = account_im_sender(&state, &account_id)?;
+    let page = xianyu_im_local::fetch_messages(&account_id, &chat_id, &cookie, cursor, sender.as_ref()).await?;
     // The official client clears the remote red point using the last message
     // currently loaded. This also covers the first open, when the local cache
     // did not yet contain a message id for the conversation.
     let mut renewed_cookie = page.cookie.clone();
     if let Some(last_message) = page.items.last().filter(|message| !message.id.trim().is_empty()) {
-        if let Ok((_, remote_cookie)) = xianyu_im_local::clear_red_point(&page.cookie, &chat_id, &last_message.id).await {
+        if let Ok((_, remote_cookie)) = xianyu_im_local::clear_red_point(&page.cookie, &chat_id, &last_message.id, sender.as_ref()).await {
             renewed_cookie = remote_cookie;
         }
     }
     let conn = state.db.lock().map_err(to_error)?;
-    if let Some(owner_name) = page.items.iter().find_map(|message| {
-        let value = message.sender_user_name.trim();
-        (message.direction == "outgoing" && !value.is_empty() && value != "我").then(|| value.to_owned())
-    }) {
-        // Message-level sender titles identify the actual seller, while the
-        // conversation-level title can be a member/login name. Prefer this
-        // value when it is available from an outgoing message.
-        conn.execute("UPDATE accounts SET display_name = ?1 WHERE id = ?2", params![owner_name, account_id]).map_err(to_error)?;
-        conn.execute("UPDATE account_profiles SET nickname = ?1, updated_at = ?2 WHERE account_id = ?3", params![owner_name, Utc::now().to_rfc3339(), account_id]).map_err(to_error)?;
-    }
     if !page.own_avatar_url.is_empty() {
         conn.execute("UPDATE account_profiles SET avatar_url = ?1, avatar_source = 'im_message', updated_at = ?2 WHERE account_id = ?3", params![page.own_avatar_url, Utc::now().to_rfc3339(), account_id]).map_err(to_error)?;
     }
@@ -1566,8 +2280,9 @@ async fn send_chat_message(
         let conn = state.db.lock().map_err(to_error)?;
         local_session(&conn, &account_id, &state.secret_key)?
     };
+    let sender = account_im_sender(&state, &account_id)?;
     let (message, renewed_cookie) =
-        xianyu_im_local::send_text(&account_id, &chat_id, &receiver_user_id, &cookie, &text)
+        xianyu_im_local::send_text(&account_id, &chat_id, &receiver_user_id, &cookie, &text, sender.as_ref())
             .await?;
     let conn = state.db.lock().map_err(to_error)?;
     upsert_chat_message(&conn, &message)?;
@@ -1602,6 +2317,7 @@ async fn send_chat_image(
         let conn = state.db.lock().map_err(to_error)?;
         local_session(&conn, &account_id, &state.secret_key)?
     };
+    let sender = account_im_sender(&state, &account_id)?;
     let (message, renewed_cookie) = xianyu_im_local::send_image(
         &account_id,
         &chat_id,
@@ -1612,6 +2328,7 @@ async fn send_chat_image(
         bytes,
         width,
         height,
+        sender.as_ref(),
     )
     .await?;
     let conn = state.db.lock().map_err(to_error)?;
@@ -1644,13 +2361,14 @@ fn create_product(
         .collect::<Vec<_>>()
         .join(",");
     conn.execute(
-        "INSERT INTO products (id, account_id, title, price, stock, status, updated_at, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![id, input.account_id, input.title.trim(), input.price, input.stock, input.status, now, tags],
+        "INSERT INTO products (id, account_id, title, image_url, price, stock, status, updated_at, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![id, input.account_id, input.title.trim(), input.image_url.trim(), input.price, input.stock, input.status, now, tags],
     ).map_err(to_error)?;
     Ok(Product {
         id,
         account_id: input.account_id,
         title: input.title.trim().to_owned(),
+        image_url: input.image_url.trim().to_owned(),
         price: input.price,
         stock: input.stock,
         status: input.status,
@@ -1682,8 +2400,8 @@ fn update_product(
         .collect::<Vec<_>>()
         .join(",");
     let changed = conn.execute(
-        "UPDATE products SET account_id = ?1, title = ?2, price = ?3, stock = ?4, status = ?5, updated_at = ?6, tags = ?7 WHERE id = ?8",
-        params![input.account_id, input.title.trim(), input.price, input.stock, input.status, now, tags, id],
+        "UPDATE products SET account_id = ?1, title = ?2, image_url = ?3, price = ?4, stock = ?5, status = ?6, updated_at = ?7, tags = ?8 WHERE id = ?9",
+        params![input.account_id, input.title.trim(), input.image_url.trim(), input.price, input.stock, input.status, now, tags, id],
     ).map_err(to_error)?;
     if changed == 0 {
         return Err("商品不存在或已被删除".to_owned());
@@ -1692,6 +2410,7 @@ fn update_product(
         id,
         account_id: input.account_id,
         title: input.title.trim().to_owned(),
+        image_url: input.image_url.trim().to_owned(),
         price: input.price,
         stock: input.stock,
         status: input.status,
@@ -1861,18 +2580,19 @@ fn export_backup(state: tauri::State<'_, AppState>) -> Result<BackupData, String
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_error)?;
 
-    let mut product_statement = conn.prepare("SELECT id, account_id, title, price, stock, status, updated_at, tags FROM products ORDER BY updated_at DESC").map_err(to_error)?;
+    let mut product_statement = conn.prepare("SELECT id, account_id, title, image_url, price, stock, status, updated_at, tags FROM products ORDER BY updated_at DESC").map_err(to_error)?;
     let products = product_statement
         .query_map([], |row| {
-            let tags: String = row.get(7)?;
+            let tags: String = row.get(8)?;
             Ok(Product {
                 id: row.get(0)?,
                 account_id: row.get(1)?,
                 title: row.get(2)?,
-                price: row.get(3)?,
-                stock: row.get(4)?,
-                status: row.get(5)?,
-                updated_at: row.get(6)?,
+                image_url: row.get(3)?,
+                price: row.get(4)?,
+                stock: row.get(5)?,
+                status: row.get(6)?,
+                updated_at: row.get(7)?,
                 tags: tags
                     .split(',')
                     .filter(|tag| !tag.is_empty())
@@ -2016,9 +2736,10 @@ async fn sync_account(
             })
             .unwrap_or_default();
         let id = format!("SRC-P-{}-{}", &account_id[..8], remote_id);
+        let image_url = nested_value_string(item, &["image_url", "imageUrl", "item_pic", "itemPic", "pic_url", "picUrl", "main_pic", "mainPic", "cover_url", "coverUrl"]);
         products_changed += conn.execute(
-            "INSERT INTO products (id, account_id, title, price, stock, status, updated_at, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(id) DO UPDATE SET account_id = excluded.account_id, title = excluded.title, price = excluded.price, stock = excluded.stock, status = excluded.status, updated_at = excluded.updated_at, tags = excluded.tags",
-            params![id, account_id, title, value_number(item, &["price", "item_price", "itemPrice", "sale_price"]), stock, status, now, tags],
+            "INSERT INTO products (id, account_id, title, image_url, price, stock, status, updated_at, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO UPDATE SET account_id = excluded.account_id, title = excluded.title, image_url = CASE WHEN excluded.image_url <> '' THEN excluded.image_url ELSE products.image_url END, price = excluded.price, stock = excluded.stock, status = excluded.status, updated_at = excluded.updated_at, tags = excluded.tags",
+            params![id, account_id, title, image_url, value_number(item, &["price", "item_price", "itemPrice", "sale_price"]), stock, status, now, tags],
         ).map_err(to_error)?;
     }
     let mut orders_changed = 0;
@@ -2075,6 +2796,7 @@ pub fn run() {
                 db: Mutex::new(conn),
                 secret_key,
                 chat_listeners: Mutex::new(HashMap::new()),
+                im_request_senders: Mutex::new(HashMap::new()),
                 im_statuses: Mutex::new(HashMap::new()),
             });
             Ok(())
@@ -2093,14 +2815,20 @@ pub fn run() {
             generate_qr_login,
             check_qr_login_status,
             list_chat_contacts,
+            customer_profile,
+            update_customer_remark,
             chat_unread_totals,
             get_im_statuses,
+            list_app_logs,
             start_chat_listener,
             stop_chat_listener,
             sync_chat_contacts,
             mark_chat_read,
             list_chat_messages,
+            list_chat_emojis,
+            sync_chat_emojis,
             sync_chat_messages,
+            open_product_detail,
             send_chat_message,
             send_chat_image,
             list_quick_replies,
@@ -2157,13 +2885,14 @@ mod tests {
         conn.execute_batch(
             "
             INSERT INTO accounts VALUES ('a1','测试账号','','闲鱼','授权有效','2026-01-01T00:00:00Z');
-            INSERT INTO products VALUES ('p1','a1','商品',1,1,'已上架','2026-01-01T00:00:00Z','');
+            INSERT INTO products VALUES ('p1','a1','商品','',1,1,'已上架','2026-01-01T00:00:00Z','');
             INSERT INTO orders VALUES ('o1','a1','n1','商品','买家',1,'待付款','2026-01-01T00:00:00Z','');
             INSERT INTO sync_jobs VALUES ('s1','a1','all','完成','2026-01-01T00:00:00Z',NULL,NULL);
             INSERT INTO account_sources VALUES ('a1','','remote');
             INSERT INTO account_credentials VALUES ('a1','secret','2026-01-01T00:00:00Z');
             INSERT INTO chat_contacts (account_id,chat_id,other_user_id,other_user_name,avatar_url,item_id,item_title,item_image_url,order_status,buyer_tag,latest_message,latest_message_time,unread_count) VALUES ('a1','c1','u1','买家','','','','','','','消息','2026-01-01T00:00:00Z',1);
-            INSERT INTO chat_messages VALUES ('a1','m1','c1','u1','买家','incoming','text','消息','','2026-01-01T00:00:00Z','sent');
+            INSERT INTO chat_messages VALUES ('a1','m1','c1','u1','买家','incoming','text','消息','','2026-01-01T00:00:00Z','sent','unknown','','','','');
+            INSERT INTO chat_emojis VALUES ('a1','[笑脸]','https://img.alicdn.com/emoji.png','2026-01-01T00:00:00Z');
             INSERT INTO chat_read_state VALUES ('a1','c1','2026-01-01T00:00:00Z');
             INSERT INTO conversation_preferences VALUES ('a1','我的会话');
             ",
@@ -2179,6 +2908,7 @@ mod tests {
             "account_credentials",
             "chat_contacts",
             "chat_messages",
+            "chat_emojis",
             "chat_read_state",
             "conversation_preferences",
             "quick_replies",
@@ -2198,8 +2928,8 @@ mod tests {
         initialize_database(&conn).expect("initialize database");
         conn.execute_batch(
             "
-            INSERT INTO chat_messages VALUES ('a1','local-uuid','c1','u1','我','outgoing','text','你好','','2026-01-01T00:00:00.100Z','sent');
-            INSERT INTO chat_messages VALUES ('a1','100.PNM','c1','u1','我','outgoing','text','你好','','2026-01-01T00:00:00.250Z','sent');
+            INSERT INTO chat_messages VALUES ('a1','local-uuid','c1','u1','我','outgoing','text','你好','','2026-01-01T00:00:00.100Z','sent','unknown','','','','');
+            INSERT INTO chat_messages VALUES ('a1','100.PNM','c1','u1','我','outgoing','text','你好','','2026-01-01T00:00:00.250Z','sent','unread','','','','');
             ",
         )
         .expect("seed duplicate messages");

@@ -812,6 +812,14 @@ pub async fn fetch_products(cookie: &str) -> Result<(Vec<Value>, String), String
             }
             let title = json_string(item.get("title"));
             let price = json_string(item.pointer("/priceInfo/price"));
+            let mut image_url = [
+                "/picInfo/picUrl", "/picInfo/url", "/imageInfo/imageUrl",
+                "/imageUrl", "/picUrl", "/mainPic", "/itemPic",
+            ]
+            .iter()
+            .map(|path| json_string(item.pointer(path)))
+            .find(|value| !value.is_empty())
+            .unwrap_or_default();
             let mut stock = 0_i64;
             let mut description = String::new();
             if let Ok((detail, updated_cookie)) = mtop_call(
@@ -825,6 +833,16 @@ pub async fn fetch_products(cookie: &str) -> Result<(Vec<Value>, String), String
             {
                 current_cookie = updated_cookie;
                 description = json_string(detail.pointer("/data/itemDO/desc"));
+                if image_url.is_empty() {
+                    image_url = [
+                        "/data/itemDO/imageInfos/0/url", "/data/itemDO/images/0/url",
+                        "/data/itemDO/picUrl", "/data/itemDO/itemPic", "/data/itemDO/mainPic",
+                    ]
+                    .iter()
+                    .map(|path| json_string(detail.pointer(path)))
+                    .find(|value| !value.is_empty())
+                    .unwrap_or_default();
+                }
                 stock = detail
                     .pointer("/data/itemDO/skuList")
                     .and_then(Value::as_array)
@@ -834,7 +852,7 @@ pub async fn fetch_products(cookie: &str) -> Result<(Vec<Value>, String), String
             if stock == 0 {
                 stock = json_i64(item.get("quantity")).max(1);
             }
-            result.push(serde_json::json!({ "item_id": item_id, "title": title, "price": price, "stock": stock, "status": "已上架", "description": description }));
+            result.push(serde_json::json!({ "item_id": item_id, "title": title, "image_url": image_url, "price": price, "stock": stock, "status": "已上架", "description": description }));
         }
         if cards.len() < 20 {
             break;
