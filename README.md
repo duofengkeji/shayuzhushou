@@ -23,7 +23,7 @@ rustup run stable cargo check --manifest-path src-tauri/Cargo.toml
 
 ## 发布
 
-推送 `v0.1.1` 形式的 Git 标签会触发 GitHub Actions，生成 macOS（Intel/Apple Silicon）、Windows（MSI/NSIS）和 Linux（AppImage/DEB）安装包，并创建草稿 Release。未配置 Apple/Windows 代码签名凭据时，安装包会以未签名状态发布。
+推送 `v0.1.1` 形式的 Git 标签会触发 GitHub Actions，生成 macOS（Intel/Apple Silicon）和 Windows NSIS 安装包；Linux 仅构建 Web 版并上传 `dist` 压缩制品，不执行 Tauri 打包。未配置 Apple/Windows 代码签名凭据时，安装包会以未签名状态发布。
 
 ## 许可证与参考
 

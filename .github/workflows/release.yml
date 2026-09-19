@@ -1,15 +1,14 @@
-name: Release desktop apps
+name: Release desktop and web apps
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  release:
+  desktop-release:
     strategy:
       fail-fast: false
       matrix:
@@ -19,9 +18,9 @@ jobs:
           - platform: macos-14
             args: --target aarch64-apple-darwin
           - platform: windows-latest
-            args: ""
-          - platform: ubuntu-22.04
-            args: ""
+            # Avoid the WiX/MSI light.exe step; NSIS is the supported Windows
+            # installer for this unsigned desktop release.
+            args: --bundles nsis
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -41,3 +40,22 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  web-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Package web build
+        run: tar -czf "shark-butler-web-${GITHUB_REF_NAME}.tar.gz" -C dist .
+      - name: Upload web build
+        uses: actions/upload-artifact@v4
+        with:
+          name: shark-butler-web-${{ github.ref_name }}
+          path: shark-butler-web-${{ github.ref_name }}.tar.gz
+          if-no-files-found: error
