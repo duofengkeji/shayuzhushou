@@ -90,7 +90,7 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
-  web-release:
+  linux-release:
     needs: prepare-release
     runs-on: ubuntu-22.04
     steps:
@@ -99,11 +99,18 @@ jobs:
         with:
           node-version: 20
           cache: npm
+      - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
-      - run: npm run build
-      - name: Package web build
-        run: tar -czf "shark-butler-web-${GITHUB_REF_NAME}.tar.gz" -C dist .
-      - name: Upload web build to release
+      - name: Install Linux Tauri dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Build Linux application bundle
+        uses: tauri-apps/tauri-action@v1
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF_NAME}" "shark-butler-web-${GITHUB_REF_NAME}.tar.gz" --repo "${GITHUB_REPOSITORY}" --clobber
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 鲨鱼管家 ${{ github.ref_name }}
+          releaseBody: 请查看本次版本说明与已知限制。
+          releaseDraft: true
+          prerelease: false
+          args: --bundles appimage
