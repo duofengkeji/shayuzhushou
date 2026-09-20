@@ -690,6 +690,25 @@ fn json_bool(value: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
+fn merchant_order_status(item: &Value) -> String {
+    let Some(columns) = item.get("columnVOList").and_then(Value::as_array) else {
+        return String::new();
+    };
+    columns
+        .iter()
+        .find(|column| {
+            matches!(column.get("name").and_then(Value::as_str), Some("发货/退款状态"))
+                || matches!(column.get("num").and_then(Value::as_str), Some("2"))
+        })
+        .and_then(|column| column.get("contentVOList").and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .flat_map(|content| [content.get("value"), content.get("key")])
+        .map(|value| json_string(value.and_then(|value| value.get("text")).or(value)))
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+}
+
 pub(crate) async fn mtop_call(
     cookie: &str,
     api_name: &str,
@@ -904,15 +923,17 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
                 "退款中".to_owned()
             } else {
                 [
-                    common.get("orderStatus"),
-                    common.get("orderStatusDesc"),
-                    common.get("status"),
-                    item.get("orderStatus"),
-                    item.get("orderStatusDesc"),
-                    item.get("status"),
+                    json_string(common.get("orderStatusDesc")),
+                    json_string(common.get("statusDesc")),
+                    json_string(item.get("orderStatusDesc")),
+                    json_string(item.get("statusDesc")),
+                    merchant_order_status(item),
+                    json_string(common.get("orderStatus")),
+                    json_string(common.get("status")),
+                    json_string(item.get("orderStatus")),
+                    json_string(item.get("status")),
                 ]
-                .iter()
-                .map(|value| json_string(*value))
+                .into_iter()
                 .find(|value| !value.is_empty())
                 .unwrap_or_default()
             };

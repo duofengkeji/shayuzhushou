@@ -644,11 +644,11 @@ fn normalize_order_status(raw: String) -> String {
     match raw.as_str() {
         "待付款" | "待支付" | "unpaid" | "pending_payment" => "待付款".to_owned(),
         "待发货" | "待寄件" | "已付款" | "paid" | "pending_shipment" | "TO_DELIVER" | "WAIT_SELLER_SEND_GOODS" | "WAIT_SEND_GOODS" | "WAIT_DELIVERY" => "待发货".to_owned(),
-        "已发货" | "shipped" | "pending_receipt" => "待收货".to_owned(),
-        "已完成" | "交易成功" | "completed" | "success" => "已完成".to_owned(),
-        "退款成功" | "已退款" | "refunded" => "已退款".to_owned(),
-        "退款中" | "refunding" | "refund" => "退款中".to_owned(),
-        "交易关闭" | "已关闭" | "退款关闭" | "cancelled" | "closed" => {
+        "已发货" | "已寄件" | "shipped" | "pending_receipt" | "WAIT_BUYER_CONFIRM_GOODS" | "WAIT_BUYER_CONFIRM_RECEIVE" => "待收货".to_owned(),
+        "已完成" | "交易成功" | "completed" | "success" | "TRADE_SUCCESS" | "WAIT_SELLER_RATE" => "已完成".to_owned(),
+        "退款成功" | "已退款" | "refunded" | "REFUND_SUCCESS" => "已退款".to_owned(),
+        "退款中" | "refunding" | "refund" | "REFUNDING" => "退款中".to_owned(),
+        "交易关闭" | "已关闭" | "退款关闭" | "cancelled" | "closed" | "TRADE_CLOSED" | "REFUND_CLOSED" => {
             "已关闭".to_owned()
         }
         _ if raw.trim().is_empty() => "待处理".to_owned(),
