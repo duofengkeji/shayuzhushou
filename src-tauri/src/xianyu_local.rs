@@ -888,6 +888,11 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
             let common = item.get("commonData").unwrap_or(&Value::Null);
             let buyer = item.get("buyerInfoVO").unwrap_or(&Value::Null);
             let price = item.get("priceVO").unwrap_or(&Value::Null);
+            let product = item
+                .get("itemInfoVO")
+                .or_else(|| item.get("itemInfo"))
+                .or_else(|| item.get("itemVO"))
+                .unwrap_or(&Value::Null);
             let order_id = json_string(common.get("orderId"));
             if order_id.is_empty() {
                 continue;
@@ -908,8 +913,22 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
                 .find(|value| !value.is_empty())
                 .unwrap_or_default()
             };
-            let item_id = json_string(common.get("itemId"));
-            let item_title = json_string(common.get("itemTitle"));
+            let item_id = [common.get("itemId"), product.get("itemId"), item.get("itemId")]
+                .iter()
+                .map(|value| json_string(*value))
+                .find(|value| !value.is_empty())
+                .unwrap_or_default();
+            let item_title = [
+                common.get("itemTitle"),
+                product.get("itemTitle"),
+                product.get("title"),
+                product.get("name"),
+                item.get("itemTitle"),
+            ]
+            .iter()
+            .map(|value| json_string(*value))
+            .find(|value| !value.is_empty())
+            .unwrap_or_default();
             result.push(serde_json::json!({
                 "order_id": order_id, "item_id": item_id, "item_title": if item_title.is_empty() { format!("商品 {item_id}") } else { item_title },
                 "buyer_nick": json_string(buyer.get("userNick")), "buyer_id": json_string(buyer.get("buyerId")),

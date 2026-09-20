@@ -1584,8 +1584,17 @@ function CustomerContextPanel({ contact, profile, inventory, orders, onOrderUpda
   const tabEmptyCopy = activeTab === 'current' ? '当前会话没有关联商品。' : activeTab === 'favorite' ? '闲鱼暂未返回收藏/浏览商品。' : '闲鱼暂未返回咨询过的商品。'
   useEffect(() => {
     let active = true
-    void api.relatedOrders(contact.accountId, contact.chatId, orderFilter)
-      .then((items) => { if (active) setRelatedOrders(items.slice(0, 8)) })
+    void (async () => {
+      let items = await api.relatedOrders(contact.accountId, contact.chatId, orderFilter)
+      // IM 会话能比订单列表更早到达。本地还没有关联单时，补拉一次
+      // 官方订单，避免刚付款的“待发货”订单在右侧被误判为不存在。
+      if (!items.length && orderFilter === '全部') {
+        await api.syncAccount(contact.accountId)
+        onOrderUpdated()
+        items = await api.relatedOrders(contact.accountId, contact.chatId, orderFilter)
+      }
+      if (active) setRelatedOrders(items.slice(0, 8))
+    })()
       .catch(() => { if (active) setRelatedOrders([]) })
     return () => { active = false }
   }, [contact.accountId, contact.chatId, orderFilter, orders])
