@@ -44,6 +44,7 @@ export const api = {
   openProductDetail: (accountId: string, url: string) => invoke<void>('open_product_detail', { accountId, url }),
   shipOrderWithoutParcel: (accountId: string, orderNo: string, tradeText: string) => invoke<void>('ship_order_without_parcel', { accountId, orderNo, tradeText }),
   shipOrderWithLogistics: (accountId: string, orderNo: string, mailNo: string) => invoke<void>('ship_order_with_logistics', { accountId, orderNo, mailNo }),
+  remindOrderReceipt: (accountId: string, orderNo: string) => invoke<void>('remind_order_receipt', { accountId, orderNo }),
   cancelOrderBySeller: (accountId: string, orderNo: string, reason: string) => invoke<void>('cancel_order_by_seller', { accountId, orderNo, reason }),
   sendChatMessage: (accountId: string, chatId: string, receiverUserId: string, text: string) => invoke<ChatMessage>('send_chat_message', { accountId, chatId, receiverUserId, text }),
   sendChatImage: (accountId: string, chatId: string, receiverUserId: string, fileName: string, mimeType: string, imageData: string, width: number, height: number) => invoke<ChatMessage>('send_chat_image', { accountId, chatId, receiverUserId, fileName, mimeType, imageData, width, height }),

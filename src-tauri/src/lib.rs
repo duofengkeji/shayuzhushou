@@ -1608,6 +1608,37 @@ async fn ship_order_with_logistics(
 }
 
 #[tauri::command]
+async fn remind_order_receipt(
+    account_id: String,
+    order_no: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let order_no = order_no.trim();
+    if order_no.len() < 8 || !order_no.chars().all(|value| value.is_ascii_digit()) {
+        return Err("订单编号无效".to_owned());
+    }
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    // Same request used by the official seller order list's “提醒收货”.
+    let (_, renewed_cookie) = xianyu_local::mtop_call(
+        &cookie,
+        "mtop.taobao.idle.trade.merchant.batch.remind.confirm",
+        "1.0",
+        "originaljson",
+        &serde_json::json!({
+            "orderIdList": [order_no],
+            "remindAllOrder": false,
+        }),
+    )
+    .await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn cancel_order_by_seller(
     account_id: String,
     order_no: String,
@@ -3262,6 +3293,7 @@ pub fn run() {
             open_product_detail,
             ship_order_without_parcel,
             ship_order_with_logistics,
+            remind_order_receipt,
             cancel_order_by_seller,
             send_chat_message,
             send_chat_image,
