@@ -1598,6 +1598,10 @@ function CustomerContextPanel({ contact, profile, inventory, orders, onOrderUpda
   const tabEmptyCopy = activeTab === 'current' ? '当前会话没有关联商品。' : activeTab === 'favorite' ? '闲鱼暂未返回收藏/浏览商品。' : '闲鱼暂未返回咨询过的商品。'
   useEffect(() => {
     let active = true
+    // Never leave the previous conversation's orders visible while the new
+    // buyer-specific query is in flight.
+    setRelatedOrders([])
+    setDetailOrder(null)
     setRelatedOrdersSyncing(true)
     // Related-order cards must not be a stale SQLite snapshot: when the
     // conversation changes, refresh the official seller order list first.

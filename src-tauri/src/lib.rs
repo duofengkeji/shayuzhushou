@@ -1116,18 +1116,15 @@ fn list_related_orders(
         params![account_id, chat_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).map_err(|_| "会话不存在，请先同步会话列表".to_owned())?;
-    let mut statement = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE account_id = ?1 AND (buyer_masked_name = ?2 OR (?3 <> '' AND buyer_id = ?3) OR (?4 <> '' AND item_id = ?4)) ORDER BY created_at DESC").map_err(to_error)?;
+    // Buyer identity is authoritative. Matching only by item_id can attach a
+    // different buyer's order when several people purchased the same item.
+    // Item matching is retained only for old contacts that have no buyer ID
+    // or name at all.
+    let mut statement = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE account_id = ?1 AND ((?3 <> '' AND buyer_id = ?3) OR (?3 = '' AND ?2 <> '' AND buyer_masked_name = ?2) OR (?3 = '' AND ?2 = '' AND ?4 <> '' AND item_id = ?4)) ORDER BY created_at DESC").map_err(to_error)?;
     let rows = statement.query_map(params![account_id, buyer_name, buyer_id, item_id], |row| Ok(Order {
         id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?, status_code: row.get(7)?, status: row.get(8)?, created_at: row.get(9)?, note: row.get(10)?,
     })).map_err(to_error)?;
-    let mut orders = rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?;
-    if orders.is_empty() && !item_id.trim().is_empty() {
-        let mut fallback = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE account_id = ?1 AND product_title LIKE ?2 ORDER BY created_at DESC").map_err(to_error)?;
-        let rows = fallback.query_map(params![account_id, format!("%{}%", item_id)], |row| Ok(Order {
-            id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?, status_code: row.get(7)?, status: row.get(8)?, created_at: row.get(9)?, note: row.get(10)?,
-        })).map_err(to_error)?;
-        orders = rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?;
-    }
+    let orders = rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?;
     let filtered = orders.into_iter().filter(|order| {
         let code = order.status_code.trim().to_ascii_uppercase();
         match status.as_str() {
