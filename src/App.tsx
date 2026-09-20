@@ -22,6 +22,11 @@ type Dialog =
   | { kind: 'qr' }
   | null
 
+type TradeDrawer =
+  | { kind: 'ship'; order: Order }
+  | { kind: 'cancel'; order: Order }
+  | null
+
 const nav: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'dashboard', label: '首页', icon: LayoutDashboard },
   { id: 'workbench', label: '客服', icon: MessageCircle },
@@ -833,6 +838,7 @@ function Workbench({ account, products, orders, onOrderUpdated, imConnected, qui
   const [customerProfileError, setCustomerProfileError] = useState('')
   const [customerProductTab, setCustomerProductTab] = useState<'current' | 'favorite' | 'consulted'>('current')
   const [customerRemarkOpen, setCustomerRemarkOpen] = useState(false)
+  const [tradeDrawer, setTradeDrawer] = useState<TradeDrawer>(null)
   const [error, setError] = useState('')
   const messageListRef = useRef<HTMLDivElement>(null)
   const conversationListRef = useRef<HTMLDivElement>(null)
@@ -919,16 +925,12 @@ function Workbench({ account, products, orders, onOrderUpdated, imConnected, qui
       setComposerNotice(`商品详情窗口打开失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
     }
   }
-  const openOfficialOrder = async (order: Order, action = '处理订单') => {
-    if (!account) return
-    const targetUrl = `https://seller.goofish.com/?site=COMMONPRO#/seller-trade/order-manage/order-detail?orderId=${encodeURIComponent(order.orderNo)}`
-    try {
-      if (isTauri()) await api.openOrderDetail(account.id, order.orderNo)
-      else window.open(targetUrl, '_blank', 'noopener,noreferrer')
-      setComposerNotice(`已打开官方订单页面，可${action}`)
-    } catch (nextError) {
-      setComposerNotice(`订单页面打开失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
+  const openOrderAction = async (order: Order, action: string) => {
+    if (!isTauri()) {
+      setComposerNotice('订单发货需要在已扫码登录的桌面端完成')
+      return
     }
+    setTradeDrawer({ kind: action === '取消订单' ? 'cancel' : 'ship', order })
   }
   const openTradeAction = async (action: string) => {
     if (!account || !selected) return
@@ -940,7 +942,7 @@ function Workbench({ account, products, orders, onOrderUpdated, imConnected, qui
         setComposerNotice('暂未找到关联的待发货订单，请先同步订单后重试')
         return
       }
-      await openOfficialOrder(order, action)
+      await openOrderAction(order, action)
     } catch (nextError) {
       setComposerNotice(`读取关联订单失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
     }
@@ -1519,10 +1521,12 @@ function Workbench({ account, products, orders, onOrderUpdated, imConnected, qui
         </footer>
       </> : <div className="chat-blank"><MessageCircle size={42} /><h2>{account ? '暂无会话' : '请先添加账号'}</h2><p>{account ? '确保账号已扫码登录，然后点击左侧同步。' : '扫码登录后即可同步真实会话。'}</p></div>}
     </section>
-    <aside className={`context-panel ${quickReplyManaging ? 'quick-reply-manager-panel' : ''}`}>{quickReplyManaging ? <QuickReplyManager replies={quickReplies} value={editingQuickReply} onClose={() => { setQuickReplyManaging(false); setEditingQuickReply(undefined) }} onSave={saveQuickReply} onEdit={setEditingQuickReply} onDelete={(reply) => void deleteQuickReply(reply)} /> : selected ? <CustomerContextPanel contact={selected} profile={customerProfile} inventory={products} orders={orders} onOrderUpdated={onOrderUpdated} onOrderAction={openOfficialOrder} loading={customerProfileLoading} error={customerProfileError} activeTab={customerProductTab} onTabChange={setCustomerProductTab} onEditRemark={() => setCustomerRemarkOpen(true)} /> : <div className="context-empty"><img src={logo} alt="" /><p>选择会话后查看客户资料、交易统计和商品足迹。</p></div>}</aside>
+    <aside className={`context-panel ${quickReplyManaging ? 'quick-reply-manager-panel' : ''}`}>{quickReplyManaging ? <QuickReplyManager replies={quickReplies} value={editingQuickReply} onClose={() => { setQuickReplyManaging(false); setEditingQuickReply(undefined) }} onSave={saveQuickReply} onEdit={setEditingQuickReply} onDelete={(reply) => void deleteQuickReply(reply)} /> : selected ? <CustomerContextPanel contact={selected} profile={customerProfile} inventory={products} orders={orders} onOrderUpdated={onOrderUpdated} onOrderAction={openOrderAction} loading={customerProfileLoading} error={customerProfileError} activeTab={customerProductTab} onTabChange={setCustomerProductTab} onEditRemark={() => setCustomerRemarkOpen(true)} /> : <div className="context-empty"><img src={logo} alt="" /><p>选择会话后查看客户资料、交易统计和商品足迹。</p></div>}</aside>
     {conversationMenu && createPortal(<div className="conversation-context-menu" style={{ left: Math.min(conversationMenu.x, window.innerWidth - 176), top: Math.min(conversationMenu.y, window.innerHeight - 104) }} onMouseDown={(event) => event.stopPropagation()}><button type="button" onClick={() => void toggleConversationPin(conversationMenu.contact)}><Pin size={15} />{pinnedChatIds.includes(conversationMenu.contact.chatId) ? '取消置顶' : '置顶'}</button><button type="button" className="danger" onClick={() => void deleteConversation(conversationMenu.contact)}><Trash2 size={15} />删除</button></div>, document.body)}
     {webProductPreviewUrl && <VirtualProductDetail url={webProductPreviewUrl} onClose={() => setWebProductPreviewUrl('')} />}
     {customerRemarkOpen && selected && <CustomerRemarkDialog value={customerProfile?.remark ?? ''} onClose={() => setCustomerRemarkOpen(false)} onSave={saveCustomerRemark} />}
+    {tradeDrawer?.kind === 'ship' && <ShipOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); setComposerNotice('已发货，订单状态已同步') }} />}
+    {tradeDrawer?.kind === 'cancel' && <CancelOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); setComposerNotice('订单已取消，状态已同步') }} />}
   </div>
 }
 
@@ -1645,6 +1649,45 @@ function CustomerRemarkDialog({ value, onClose, onSave }: { value: string; onClo
     try { await onSave(remark); } catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); setSaving(false) }
   }
   return <Modal title="给买家添加备注" onClose={() => { if (!saving) onClose() }}><div className="customer-remark-dialog"><textarea autoFocus maxLength={50} rows={6} value={remark} onChange={(event) => setRemark(event.target.value)} placeholder="请输入用户备注信息，此备注信息不对用户展示" /><div className="customer-remark-count">{remark.length} / 50</div>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" disabled={saving} onClick={onClose}>取消</button><button type="button" className="primary" disabled={saving} onClick={() => void save()}>{saving ? '保存中…' : '确定'}</button></div></div></Modal>
+}
+
+function ShipOrderDrawer({ accountId, order, onClose, onDone }: { accountId: string; order: Order; onClose: () => void; onDone: () => void }) {
+  const [mode, setMode] = useState<'dummy' | 'offline'>('dummy')
+  const [description, setDescription] = useState('')
+  const [mailNo, setMailNo] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+  const submit = async () => {
+    setSubmitting(true); setError('')
+    try {
+      if (mode === 'offline') await api.shipOrderWithLogistics(accountId, order.orderNo, mailNo)
+      else await api.shipOrderWithoutParcel(accountId, order.orderNo, description)
+      onDone()
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+      setSubmitting(false)
+    }
+  }
+  return <div className="trade-drawer-backdrop" role="presentation" onMouseDown={() => { if (!submitting) onClose() }}><aside className="trade-drawer" role="dialog" aria-modal="true" aria-label="去发货" onMouseDown={(event) => event.stopPropagation()}><header><div><h2>去发货</h2><small>订单号 {order.orderNo}</small></div><button type="button" className="icon-button" disabled={submitting} onClick={onClose}><X size={19} /></button></header><div className="trade-drawer-tabs"><button className={mode === 'dummy' ? 'active' : ''} type="button" disabled={submitting} onClick={() => { setMode('dummy'); setError('') }}>无需寄件</button><button className={mode === 'offline' ? 'active' : ''} type="button" disabled={submitting} onClick={() => { setMode('offline'); setError('') }}>我已寄出</button></div><main>{mode === 'dummy' ? <><p className="trade-drawer-intro">无需填写物流单号。确认后，闲鱼会将此订单更新为已发货，等待买家确认收货。</p><label className="trade-text-label">相关描述 <span>选填</span><textarea maxLength={200} rows={6} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="可填写发货说明、服务使用说明等" /><small>{description.length} / 200</small></label></> : <><p className="trade-drawer-intro">填写快递单号后，系统会调用闲鱼官方接口识别快递公司，并使用账号在闲鱼设置的默认寄件地址发货。</p><label className="trade-text-label">快递单号 <input autoFocus value={mailNo} maxLength={80} onChange={(event) => setMailNo(event.target.value)} placeholder="请输入快递单号" /></label><small className="trade-shipping-hint">快递公司将由闲鱼根据单号自动识别。</small></>}{error && <div className="form-error">{error}</div>}</main><footer><button type="button" className="secondary" disabled={submitting} onClick={onClose}>取消</button><button type="button" className="primary" disabled={submitting || (mode === 'offline' && !mailNo.trim())} onClick={() => void submit()}>{submitting ? '发货中…' : '确认发货'}</button></footer></aside></div>
+}
+
+function CancelOrderDrawer({ accountId, order, onClose, onDone }: { accountId: string; order: Order; onClose: () => void; onDone: () => void }) {
+  const reasons = ['不想卖了', '宝贝已出售', '买家联系不上', '与买家协商一致', '其他原因']
+  const [reason, setReason] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+  const submit = async () => {
+    if (!reason) { setError('请选择关闭交易原因'); return }
+    setSubmitting(true); setError('')
+    try {
+      await api.cancelOrderBySeller(accountId, order.orderNo, reason)
+      onDone()
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+      setSubmitting(false)
+    }
+  }
+  return <div className="trade-drawer-backdrop" role="presentation" onMouseDown={() => { if (!submitting) onClose() }}><aside className="trade-drawer cancel-order-drawer" role="dialog" aria-modal="true" aria-label="取消订单" onMouseDown={(event) => event.stopPropagation()}><header><div><h2>关闭交易</h2><small>订单号 {order.orderNo}</small></div><button type="button" className="icon-button" disabled={submitting} onClick={onClose}><X size={19} /></button></header><main><p className="trade-drawer-warning">关闭后订单不可恢复，请确认已与买家沟通。</p><fieldset className="cancel-reason-list"><legend>请选择关闭原因</legend>{reasons.map((item) => <label key={item}><input type="radio" name="cancel-reason" value={item} checked={reason === item} onChange={() => setReason(item)} />{item}</label>)}</fieldset>{error && <div className="form-error">{error}</div>}</main><footer><button type="button" className="secondary" disabled={submitting} onClick={onClose}>暂不关闭</button><button type="button" className="danger-button" disabled={submitting || !reason} onClick={() => void submit()}>{submitting ? '关闭中…' : '确认关闭交易'}</button></footer></aside></div>
 }
 
 function QuickReplyManager({ replies, value, onClose, onSave, onEdit, onDelete }: { replies: QuickReply[]; value?: QuickReply; onClose: () => void; onSave: (input: { title: string; content: string; shortCode: string; images: QuickReplyImage[] }) => void; onEdit: (reply: QuickReply | undefined) => void; onDelete: (reply: QuickReply) => void }) {

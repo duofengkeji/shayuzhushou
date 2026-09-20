@@ -1421,52 +1421,203 @@ async fn open_product_detail(
 }
 
 #[tauri::command]
-async fn open_order_detail(
+async fn ship_order_without_parcel(
     account_id: String,
     order_no: String,
-    app: tauri::AppHandle,
+    trade_text: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let order_no = order_no.trim();
     if order_no.len() < 8 || !order_no.chars().all(|value| value.is_ascii_digit()) {
-        return Err("订单编号无效，无法打开官方订单页面".to_owned());
+        return Err("订单编号无效".to_owned());
+    }
+    let trade_text = trade_text.trim().to_owned();
+    if trade_text.chars().count() > 200 {
+        return Err("相关描述最多 200 个字".to_owned());
     }
     let cookie = {
         let conn = state.db.lock().map_err(to_error)?;
         local_session(&conn, &account_id, &state.secret_key)?
     };
-    let target = reqwest::Url::parse(&format!(
-        "https://seller.goofish.com/?site=COMMONPRO#/seller-trade/order-manage/order-detail?orderId={order_no}"
-    ))
+    // Official seller workbench request: mtop.taobao.idle.logistics.merchant.consign.dummy.
+    // This is the "无需寄件" path and does not open a browser window.
+    let (_, renewed_cookie) = xianyu_local::mtop_call(
+        &cookie,
+        "mtop.taobao.idle.logistics.merchant.consign.dummy",
+        "1.0",
+        "originaljson",
+        &serde_json::json!({
+            "orderId": order_no,
+            "tradeText": trade_text,
+            "picList": "[]",
+            "newUnconsign": true,
+        }),
+    )
+    .await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    conn.execute(
+        "UPDATE orders SET status = '待收货' WHERE account_id = ?1 AND order_no = ?2",
+        params![account_id, order_no],
+    )
     .map_err(to_error)?;
-    let cookie_values = cookie
-        .split(';')
-        .filter_map(|part| part.trim().split_once('='))
-        .filter(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
-        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(())
+}
+
+fn offline_order_infos(page: &Value) -> Result<Vec<Value>, String> {
+    let orders = page
+        .pointer("/data/bizOrderInfoList")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "未获取到可发货的订单信息，请刷新后重试".to_owned())?;
+    let order_infos = orders
+        .iter()
+        .filter_map(|order| {
+            let common = order.get("commonData").unwrap_or(&Value::Null);
+            let item = order.get("itemVO").unwrap_or(&Value::Null);
+            let price = order.get("priceVO").unwrap_or(&Value::Null);
+            let order_id = value_string(common, &["orderId"]);
+            (!order_id.is_empty()).then(|| serde_json::json!({
+                "id": order_id,
+                "orderId": value_string(common, &["orderId"]),
+                "itemInfo": {
+                    "itemImage": value_string(item, &["itemPicUrl"]),
+                    "itemTitle": value_string(item, &["title"]),
+                    "itemId": value_string(common, &["itemId"]),
+                    "itemInfoLines": item.get("itemInfoLines").cloned().unwrap_or(Value::Null),
+                    "tags": item.get("serviceTags").cloned().unwrap_or(Value::Null),
+                },
+                "extraInfo": { "orderId": value_string(common, &["orderId"]) },
+                "priceAndNum": {
+                    "price": value_string(price, &["auctionPrice"]),
+                    "num": value_string(price, &["buyNum"]),
+                    "unit": "¥",
+                },
+                "shipTime": common.get("consignTimeInfo").cloned().unwrap_or_else(|| serde_json::json!([{ "text": "-", "textColor": "#111" }])),
+                "reportUrl": value_string(common, &["reportUrl"]),
+                "needUploadReport": common.get("needUploadReport").is_some_and(|value| value.as_bool() == Some(true) || value.as_str() == Some("true")),
+                "needUploadTips": value_string(common, &["needUploadTips"]),
+                "categoryMsg": {
+                    "selectedCategory": { "categoryId": value_string(item, &["channelCategoryId"]) },
+                    "brand": { "brand": { "value": value_string(item, &["brandValueId"]), "valueName": "" } },
+                    "model": { "value": value_string(item, &["modelValueId"]), "valueName": "" },
+                    "stkType": "1",
+                    "skuType": "",
+                },
+            }))
+        })
         .collect::<Vec<_>>();
-    let label = format!("order-detail-{}", Uuid::new_v4().simple());
-    let window = tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::App("index.html".into()))
-        .title("闲鱼订单详情")
-        .inner_size(1180.0, 820.0)
-        .min_inner_size(980.0, 680.0)
-        .center()
-        .focused(true)
-        .build()
-        .map_err(to_error)?;
-    for (name, value) in cookie_values {
-        for domain in [".goofish.com", ".taobao.com"] {
-            let cookie = tauri::webview::Cookie::build((name.clone(), value.clone()))
-                .domain(domain)
-                .path("/")
-                .secure(true)
-                .http_only(true)
-                .same_site(tauri::webview::cookie::SameSite::None)
-                .build();
-            window.set_cookie(cookie).map_err(to_error)?;
-        }
+    if order_infos.is_empty() {
+        return Err("未获取到可发货的订单信息，请刷新后重试".to_owned());
     }
-    window.navigate(target).map_err(to_error)?;
+    Ok(order_infos)
+}
+
+#[tauri::command]
+async fn ship_order_with_logistics(
+    account_id: String,
+    order_no: String,
+    mail_no: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let order_no = order_no.trim();
+    let mail_no = mail_no.trim();
+    if order_no.len() < 8 || !order_no.chars().all(|value| value.is_ascii_digit()) {
+        return Err("订单编号无效".to_owned());
+    }
+    if mail_no.len() < 5 || mail_no.chars().count() > 80 {
+        return Err("请输入正确的快递单号".to_owned());
+    }
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    // First use the official page-render endpoint to obtain the seller's
+    // default address and the exact orderInfos structure for this trade.
+    let (page, cookie) = xianyu_local::mtop_call(
+        &cookie,
+        "mtop.taobao.idle.logistics.merchant.consign.page.render",
+        "1.0",
+        "originaljson",
+        &serde_json::json!({ "tradeId": order_no }),
+    )
+    .await?;
+    let address_id = page
+        .pointer("/data/commonData/addressId")
+        .and_then(|value| value.as_i64().or_else(|| value.as_str().and_then(|text| text.parse().ok())))
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "未获取到默认寄件地址，请先在闲鱼卖家工作台设置寄件地址".to_owned())?;
+    let order_infos = offline_order_infos(&page)?;
+    let (guess, cookie) = xianyu_local::mtop_call(
+        &cookie,
+        "mtop.taobao.idle.logistics.guess.mailno",
+        "1.0",
+        "originaljson",
+        &serde_json::json!({ "mailNo": mail_no }),
+    )
+    .await?;
+    let cp_code = guess
+        .pointer("/data/unionCode")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "未能识别快递单号，请确认单号后重试".to_owned())?;
+    let (_, renewed_cookie) = xianyu_local::mtop_call(
+        &cookie,
+        "mtop.taobao.idle.logistics.merchant.consign.offline",
+        "1.0",
+        "originaljson",
+        &serde_json::json!({
+            "orderInfos": order_infos,
+            "mailNo": mail_no,
+            "cpCode": cp_code,
+            "addressId": address_id,
+        }),
+    )
+    .await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    conn.execute(
+        "UPDATE orders SET status = '待收货' WHERE account_id = ?1 AND order_no = ?2",
+        params![account_id, order_no],
+    )
+    .map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_order_by_seller(
+    account_id: String,
+    order_no: String,
+    reason: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let order_no = order_no.trim();
+    if order_no.len() < 8 || !order_no.chars().all(|value| value.is_ascii_digit()) {
+        return Err("订单编号无效".to_owned());
+    }
+    let reason = reason.trim().to_owned();
+    if reason.is_empty() || reason.chars().count() > 50 {
+        return Err("请选择关闭订单原因".to_owned());
+    }
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    // Official seller workbench request: mtop.taobao.idle.trade.merchant.close.by.seller.
+    let (_, renewed_cookie) = xianyu_local::mtop_call(
+        &cookie,
+        "mtop.taobao.idle.trade.merchant.close.by.seller",
+        "2.0",
+        "originaljson",
+        &serde_json::json!({ "tid": order_no, "bizOrderId": order_no, "closeReason": reason }),
+    )
+    .await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    conn.execute(
+        "UPDATE orders SET status = '交易关闭' WHERE account_id = ?1 AND order_no = ?2",
+        params![account_id, order_no],
+    )
+    .map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
     Ok(())
 }
 
@@ -3083,7 +3234,9 @@ pub fn run() {
             sync_chat_emojis,
             sync_chat_messages,
             open_product_detail,
-            open_order_detail,
+            ship_order_without_parcel,
+            ship_order_with_logistics,
+            cancel_order_by_seller,
             send_chat_message,
             send_chat_image,
             send_chat_product,

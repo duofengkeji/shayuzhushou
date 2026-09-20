@@ -740,6 +740,9 @@ pub(crate) async fn mtop_call(
             .header(COOKIE, &current_cookie)
             .header(ORIGIN, "https://www.goofish.com")
             .header(REFERER, "https://www.goofish.com/")
+            // Seller trade actions require the same site context that the
+            // official COMMONPRO workbench sends with its MTop requests.
+            .header("idle_site_biz_code", "COMMONPRO")
             .header(USER_AGENT, USER_AGENT_VALUE)
             .form(&[("data", data_value.as_str())])
             .send()
