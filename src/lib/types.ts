@@ -57,6 +57,15 @@ export interface Order {
   note: string
 }
 
+export interface OrderDetail {
+  order: Order
+  paidAt: string
+  shippedAt: string
+  completedAt: string
+  closedAt: string
+  serviceFee?: number
+}
+
 export interface DashboardStats {
   totalAccounts: number
   healthyAccounts: number
@@ -229,4 +238,31 @@ export interface OrderInput {
   amount: number
   status: string
   note: string
+}
+
+export interface RefundDetail {
+  orderNo: string
+  refundId: string
+  status: string
+  statusCode: string
+  reason: string
+  description: string
+  amount: number
+  createTime: string
+  timeoutText: string
+  deadlineAt: string
+  receivedStatus: string
+  returnGoodsStatus: string
+  buyerEvidence: string
+  freightStatus: string
+  customerService: string
+  buyerName: string
+  productTitle: string
+}
+
+export interface RefundVerification {
+  required: boolean
+  verificationUrl: string
+  authToken: string
+  message: string
 }

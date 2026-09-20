@@ -770,6 +770,8 @@ pub(crate) async fn mtop_call(
             ("sessionOption", "AutoLoginOnly".to_owned()),
         ];
         let url = format!("https://h5api.m.goofish.com/h5/{api_name}/{version}/");
+        let seller_api = api_name.starts_with("mtop.taobao.idle.merchant.refund.")
+            || api_name == "mtop.idle.alipay.verify.url.query";
         let response = client
             .post(url)
             .query(&params)
@@ -779,8 +781,8 @@ pub(crate) async fn mtop_call(
                 "application/x-www-form-urlencoded",
             )
             .header(COOKIE, &current_cookie)
-            .header(ORIGIN, "https://www.goofish.com")
-            .header(REFERER, "https://www.goofish.com/")
+            .header(ORIGIN, if seller_api { "https://seller.goofish.com" } else { "https://www.goofish.com" })
+            .header(REFERER, if seller_api { "https://seller.goofish.com/?site=COMMONPRO" } else { "https://www.goofish.com/" })
             // Seller trade actions require the same site context that the
             // official COMMONPRO workbench sends with its MTop requests.
             .header("idle_site_biz_code", "COMMONPRO")
@@ -992,4 +994,109 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
         }
     }
     Ok((result, current_cookie))
+}
+
+/// Fetch one seller order from the same official seller order endpoint used by
+/// the order synchronizer. The detail drawer calls this once when it opens so
+/// timestamps and fee fields are not fabricated from the local order row.
+pub async fn fetch_order_detail(cookie: &str, order_no: &str) -> Result<(Value, String), String> {
+    let data = serde_json::json!({
+        "pageNumber": 1,
+        "rowsPerPage": 1,
+        "orderIds": order_no,
+        "queryCode": "ALL",
+        "orderSearchParam": "{}"
+    });
+    let (body, renewed_cookie) = mtop_call(
+        cookie,
+        "mtop.taobao.idle.trade.merchant.sold.get",
+        "1.0",
+        "json",
+        &data,
+    )
+    .await?;
+    let items = body
+        .pointer("/data/module/items")
+        .and_then(Value::as_array)
+        .ok_or("官方订单详情响应缺少订单数据".to_owned())?;
+    let item = items
+        .iter()
+        .find(|item| {
+            [
+                item.pointer("/commonData/orderId"),
+                item.pointer("/commonData/orderIdStr"),
+                item.get("orderId"),
+                item.get("orderNo"),
+            ]
+            .iter()
+            .flatten()
+            .any(|value| json_string(Some(value)) == order_no)
+        })
+        .cloned()
+        .ok_or("官方未返回该订单详情".to_owned())?;
+    Ok((item, renewed_cookie))
+}
+
+/// Fetch the seller-side refund record for an order.  The workbench uses the
+/// same refund list endpoint as the official refund-management page; keeping
+/// this in the local session layer means the drawer and the future refund
+/// management page share cookies, signing and renewal behavior.
+pub async fn fetch_refund_detail(cookie: &str, order_no: &str) -> Result<(Value, String), String> {
+    let mut current_cookie = cookie.to_owned();
+    for dispute_status in ["1", "2", "3", "5"] {
+        let data = serde_json::json!({
+            "pageNumber": 1,
+            "rowsPerPage": 50,
+            "queryType": "refund",
+            "refundSearchParam": { "disputeStatus": dispute_status, "queryCode": "ALL" }
+        });
+        let (body, renewed_cookie) = mtop_call(
+            &current_cookie,
+            "mtop.taobao.idle.merchant.refund.list",
+            "1.0",
+            "originaljson",
+            &data,
+        ).await?;
+        current_cookie = renewed_cookie;
+        let items = body
+            .pointer("/data/data/items")
+            .or_else(|| body.pointer("/data/module/items"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(item) = items.into_iter().find(|item| {
+            [
+                item.pointer("/commonData/orderId"),
+                item.pointer("/commonData/orderIdStr"),
+                item.get("orderId"),
+                item.get("orderNo"),
+            ].iter().flatten().any(|value| json_string(Some(value)) == order_no)
+        }) {
+            let refund_id = [
+                item.pointer("/refundInfoVO/refundId"),
+                item.pointer("/refundInfo/refundId"),
+                item.get("refundId"),
+                item.get("disputeId"),
+            ].iter().flatten().map(|value| json_string(Some(value))).find(|value| !value.trim().is_empty()).unwrap_or_default();
+            if refund_id.is_empty() {
+                return Ok((item, current_cookie));
+            }
+            let (detail, detail_cookie) = mtop_call(
+                &current_cookie,
+                "mtop.taobao.idle.merchant.refund.detail",
+                "1.0",
+                "originaljson",
+                &serde_json::json!({ "orderId": order_no, "refundId": refund_id }),
+            ).await?;
+            let (service_record, service_cookie) = mtop_call(
+                &detail_cookie,
+                "mtop.taobao.idle.merchant.refund.service.record",
+                "1.0",
+                "originaljson",
+                &serde_json::json!({ "orderId": order_no }),
+            ).await.unwrap_or((serde_json::Value::Null, detail_cookie));
+            return Ok((serde_json::json!({ "detail": detail, "service_record": service_record, "list": item }), service_cookie));
+        }
+    }
+    Err("官方未返回该订单的退款详情".to_owned())
 }

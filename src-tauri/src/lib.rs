@@ -172,6 +172,48 @@ struct Order {
     note: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrderDetail {
+    order: Order,
+    paid_at: String,
+    shipped_at: String,
+    completed_at: String,
+    closed_at: String,
+    service_fee: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RefundDetail {
+    order_no: String,
+    refund_id: String,
+    status: String,
+    status_code: String,
+    reason: String,
+    description: String,
+    amount: f64,
+    create_time: String,
+    timeout_text: String,
+    deadline_at: String,
+    received_status: String,
+    return_goods_status: String,
+    buyer_evidence: String,
+    freight_status: String,
+    customer_service: String,
+    buyer_name: String,
+    product_title: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RefundVerification {
+    required: bool,
+    verification_url: String,
+    auth_token: String,
+    message: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CustomerItem {
@@ -1100,6 +1142,161 @@ fn list_orders(
         })
         .map_err(to_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
+}
+
+#[tauri::command]
+async fn order_detail(
+    account_id: String,
+    order_no: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<OrderDetail, String> {
+    let order_no = order_no.trim().to_owned();
+    if order_no.is_empty() {
+        return Err("订单编号不能为空".to_owned());
+    }
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    let (raw, renewed_cookie) = xianyu_local::fetch_order_detail(&cookie, &order_no).await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    let order = conn.query_row(
+        "SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE account_id = ?1 AND order_no = ?2",
+        params![account_id, order_no],
+        |row| Ok(Order {
+            id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?,
+            product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?,
+            status_code: row.get(7)?, status: row.get(8)?, created_at: row.get(9)?, note: row.get(10)?,
+        }),
+    ).map_err(|_| "本地没有找到该订单，请先同步订单".to_owned())?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+
+    let parse_number = |names: &[&str]| {
+        let value = nested_value(&raw, names);
+        if value.trim().is_empty() { None } else { value.trim().parse::<f64>().ok() }
+    };
+    let time = |names: &[&str]| nested_value(&raw, names);
+    Ok(OrderDetail {
+        order,
+        paid_at: time(&["payTime", "paidTime", "paymentTime", "payDate"]),
+        shipped_at: time(&["sendTime", "shippingTime", "deliveryTime", "deliverTime", "consignTime"]),
+        completed_at: time(&["successTime", "completeTime", "completedTime", "finishTime", "dealTime"]),
+        closed_at: time(&["closeTime", "closedTime", "交易关闭时间"]),
+        service_fee: parse_number(&["softwareServiceFee", "serviceFee", "sellerServiceFee", "platformServiceFee", "platformFee", "idleServiceFee", "commissionFee", "serviceCharge"]),
+    })
+}
+
+#[tauri::command]
+async fn refund_detail(
+    account_id: String,
+    order_no: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<RefundDetail, String> {
+    let order_no = order_no.trim().to_owned();
+    if order_no.is_empty() { return Err("订单编号不能为空".to_owned()); }
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    let (raw, renewed_cookie) = xianyu_local::fetch_refund_detail(&cookie, &order_no).await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    let status_code = nested_value(&raw, &["disputeStatus", "refundStatus", "status", "statusCode"]);
+    let status = match status_code.as_str() {
+        "1" | "2" | "3" => "等待卖家处理",
+        "5" => "退款成功",
+        _ if status_code.to_ascii_lowercase().contains("success") => "退款成功",
+        _ => "退款申请",
+    };
+    let amount = nested_value(&raw, &["applyMoney", "refundAmount", "applyRefundFee", "refundFee", "amount", "auctionPrice"])
+        .parse::<f64>().unwrap_or(0.0);
+    let returned_order_no = nested_value(&raw, &["orderId", "orderNo"]);
+    let buyer_evidence = {
+        let value = nested_value(&raw, &["buyerEvidence", "buyerProof", "evidence", "proof"]);
+        if !value.is_empty() { value } else {
+            let count = raw.pointer("/detail/data/data/components").and_then(Value::as_array).and_then(|components| components.iter().find(|component| component.get("render").and_then(Value::as_str) == Some("basicRefundInfo"))).and_then(|component| component.pointer("/data/refundProof/proofMultiMediaList")).and_then(Value::as_array).map(|items| items.len()).unwrap_or(0);
+            if count > 0 { format!("有凭证（{count}项）") } else { String::new() }
+        }
+    };
+    Ok(RefundDetail {
+        order_no: if returned_order_no.is_empty() { order_no.clone() } else { returned_order_no },
+        refund_id: nested_value(&raw, &["refundId", "refundNo", "disputeId", "refundOrderId"]),
+        status: status.to_owned(), status_code, reason: nested_value(&raw, &["refundReason", "reason", "afterSaleReason"]),
+        description: nested_value(&raw, &["refundDesc", "description", "buyerDescription", "refundProofDesc", "desc"]),
+        amount, create_time: nested_value(&raw, &["gmtCreatedTime", "createTime", "applyTime", "refundCreateTime"]),
+        timeout_text: nested_value(&raw, &["timeoutText", "deadlineText", "sellerHandleTimeout"]),
+        deadline_at: nested_value(&raw, &["sellerHandleDeadline", "deadlineTime", "refundDeadline", "timeoutTime", "autoRefundTime", "deadline"]),
+        received_status: nested_value(&raw, &["goodsStatusDesc", "receiveStatus", "goodsStatus", "receivedStatus"]),
+        return_goods_status: nested_value(&raw, &["returnGoodStatus", "returnGoodsStatus", "returnStatus"]),
+        buyer_evidence,
+        freight_status: nested_value(&raw, &["postFeeBear", "freightStatus", "postageStatus", "freightHandling", "shippingFeeStatus"]),
+        customer_service: nested_value(&raw, &["csStatusDesc", "customerService", "csIntervention", "serviceStatus", "platformIntervention"]),
+        buyer_name: nested_value(&raw, &["buyerNick", "buyerName", "userNick"]),
+        product_title: nested_value(&raw, &["itemTitle", "title", "productTitle"]),
+    })
+}
+
+#[tauri::command]
+async fn refund_verification(
+    account_id: String,
+    refund_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<RefundVerification, String> {
+    let refund_id = refund_id.trim().to_owned();
+    if refund_id.is_empty() { return Err("退款申请缺少退款编号，请先刷新退款详情".to_owned()); }
+    let cookie = { let conn = state.db.lock().map_err(to_error)?; local_session(&conn, &account_id, &state.secret_key)? };
+    let (body, renewed_cookie) = xianyu_local::mtop_call(
+        &cookie,
+        "mtop.idle.alipay.verify.url.query",
+        "1.0",
+        "originaljson",
+        &serde_json::json!({
+            "bizId": refund_id,
+            "scene": "REFUND_PC",
+            "callBackUrl": "https://seller.goofish.com/?site=COMMONPRO#/seller-trade/refund-manage"
+        }),
+    ).await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    let verification_url = nested_value(&body, &["verifyUrl", "verificationUrl"]);
+    let auth_token = nested_value(&body, &["token", "authToken"]);
+    if verification_url.is_empty() && auth_token.is_empty() {
+        return Ok(RefundVerification { required: false, verification_url, auth_token, message: "当前账号无需额外身份核验".to_owned() });
+    }
+    if verification_url.is_empty() || auth_token.is_empty() {
+        return Err("闲鱼核身接口返回参数不完整".to_owned());
+    }
+    Ok(RefundVerification { required: true, verification_url, auth_token, message: "请完成支付宝身份核验，完成后点击确认提交退款".to_owned() })
+}
+
+#[tauri::command]
+async fn refund_action(
+    account_id: String,
+    order_no: String,
+    refund_id: String,
+    action: String,
+    auth_token: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let api_name = match action.as_str() {
+        "agree" => "mtop.taobao.idle.merchant.refund.agree.refund",
+        "refuse" => "mtop.taobao.idle.merchant.refund.refuse.refund",
+        _ => return Err("退款操作无效".to_owned()),
+    };
+    let cookie = { let conn = state.db.lock().map_err(to_error)?; local_session(&conn, &account_id, &state.secret_key)? };
+    let (_, renewed_cookie) = xianyu_local::mtop_call(
+        &cookie,
+        api_name,
+        "1.0",
+        "originaljson",
+        &serde_json::json!({ "refundId": refund_id, "authToken": auth_token }),
+    ).await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    if action == "agree" {
+        conn.execute("UPDATE orders SET status_code = 'REFUNDED', status = '退款成功' WHERE account_id = ?1 AND order_no = ?2", params![account_id, order_no]).map_err(to_error)?;
+    }
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -3265,6 +3462,10 @@ pub fn run() {
             update_conversation_name,
             list_products,
             list_orders,
+            order_detail,
+            refund_detail,
+            refund_verification,
+            refund_action,
             list_related_orders,
             dashboard_stats,
             list_sync_jobs,

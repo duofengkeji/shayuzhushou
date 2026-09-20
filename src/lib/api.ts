@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { Account, AccountInput, AppLog, BackupData, ChatContact, ChatContactsPage, ChatEmoji, ChatMessage, ChatMessagesPage, CustomerProfile, DashboardStats, Order, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, SyncJob, SyncResult } from './types'
+import type { Account, AccountInput, AppLog, BackupData, ChatContact, ChatContactsPage, ChatEmoji, ChatMessage, ChatMessagesPage, CustomerProfile, DashboardStats, Order, OrderDetail, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, RefundDetail, RefundVerification, SyncJob, SyncResult } from './types'
 
 const relatedOrderStatusIds: Record<string, string> = {
   '全部': 'ALL',
@@ -16,6 +16,10 @@ export const api = {
   accounts: () => invoke<Account[]>('list_accounts'),
   products: (accountId?: string) => invoke<Product[]>('list_products', { accountId }),
   orders: (accountId?: string) => invoke<Order[]>('list_orders', { accountId }),
+  orderDetail: (accountId: string, orderNo: string) => invoke<OrderDetail>('order_detail', { accountId, orderNo }),
+  refundDetail: (accountId: string, orderNo: string) => invoke<RefundDetail>('refund_detail', { accountId, orderNo }),
+  refundVerification: (accountId: string, refundId: string) => invoke<RefundVerification>('refund_verification', { accountId, refundId }),
+  refundAction: (accountId: string, orderNo: string, refundId: string, action: 'agree' | 'refuse', authToken = '') => invoke<void>('refund_action', { accountId, orderNo, refundId, action, authToken }),
   relatedOrders: (accountId: string, chatId: string, status = '全部') => invoke<Order[]>('list_related_orders', { accountId, chatId, status: relatedOrderStatusIds[status] ?? status }),
   createAccount: (input: AccountInput) => invoke<Account>('create_account', { input }),
   updateAccount: (id: string, input: AccountInput) => invoke<Account>('update_account', { id, input }),

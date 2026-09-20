@@ -10,7 +10,7 @@ import {
 } from 'lucide-react'
 import logo from './assets/shark-butler-logo.png'
 import { api } from './lib/api'
-import type { Account, AccountInput, AppLog, ChatContact, ChatEmoji, ChatMessage, CustomerItem, CustomerProfile, DashboardStats, Order, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, SyncJob } from './lib/types'
+import type { Account, AccountInput, AppLog, ChatContact, ChatEmoji, ChatMessage, CustomerItem, CustomerProfile, DashboardStats, Order, OrderDetail, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, RefundDetail, RefundVerification, SyncJob } from './lib/types'
 
 type Page = 'dashboard' | 'workbench' | 'accounts' | 'products' | 'orders' | 'settings'
 type Dialog =
@@ -25,6 +25,7 @@ type Dialog =
 type TradeDrawer =
   | { kind: 'ship'; order: Order }
   | { kind: 'cancel'; order: Order }
+  | { kind: 'refund'; order: Order }
   | null
 
 const nav: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
@@ -533,7 +534,7 @@ function MainApp() {
 
         <div className={`content ${page === 'workbench' ? 'workbench-content' : ''} ${page === 'settings' ? 'settings-content' : ''}`}>
           {loading ? <Loading /> : page === 'dashboard' ? <Dashboard stats={stats} accounts={accounts} orders={orders} onGo={setPage} />
-            : page === 'workbench' ? <Workbench key={activeAccount?.id ?? 'empty'} account={activeAccount} products={products} orders={orders} onOrderUpdated={() => void refreshWorkbenchOrders()} imConnected={Boolean(activeAccount?.remoteAccountId)} quickReplyAutoSuggest={quickReplyAutoSuggest} onUnreadChanged={refreshUnreadTotals} onChatRead={handleChatRead} unreadJumpRequest={unreadJumpRequest} />
+            : page === 'workbench' ? <Workbench key={activeAccount?.id ?? 'empty'} account={activeAccount} products={products} orders={orders} onOrderUpdated={() => void refreshWorkbenchOrders()} onNotice={setNotice} imConnected={Boolean(activeAccount?.remoteAccountId)} quickReplyAutoSuggest={quickReplyAutoSuggest} onUnreadChanged={refreshUnreadTotals} onChatRead={handleChatRead} unreadJumpRequest={unreadJumpRequest} />
               : page === 'accounts' ? <Accounts accounts={accounts} syncJobs={syncJobs} imStatuses={imStatuses} onQrLogin={() => setDialog({ kind: 'qr' })} onEdit={(value) => setDialog({ kind: 'account', value })} onDelete={(value) => setDialog({ kind: 'delete-account', value })} onSync={(account) => void syncAccount(account)} onSetStatus={(ids, status) => void setAccountsStatus(ids, status)} />
                 : page === 'products' ? <Products items={filteredProducts} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, action) => void bulkProducts(ids, action)} onAdd={() => setDialog({ kind: 'product' })} onEdit={(value) => setDialog({ kind: 'product', value })} onDelete={(id) => void remove('product', id)} />
                   : page === 'orders' ? <Orders items={filteredOrders} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, status) => void bulkOrders(ids, status)} onAdd={() => setDialog({ kind: 'order' })} onEdit={(value) => setDialog({ kind: 'order', value })} onDelete={(id) => void remove('order', id)} />
@@ -694,21 +695,47 @@ function OrderDialog({ accounts, selectedAccountId, value, onClose, onSave }: { 
   return <Modal title={value ? `处理订单 ${value.orderNo}` : '录入订单'} onClose={onClose}><form className="form-grid" onSubmit={(event) => { event.preventDefault(); onSave({ accountId, productTitle, buyerMaskedName, amount: Number(amount), status, note }, value) }}><label>所属账号<select disabled={Boolean(value)} required value={accountId} onChange={(event) => setAccountId(event.target.value)}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.displayName}</option>)}</select></label><label>商品名称<input disabled={Boolean(value)} required autoFocus value={productTitle} onChange={(event) => setProductTitle(event.target.value)} /></label><div className="form-row"><label>买家标识<input disabled={Boolean(value)} required value={buyerMaskedName} onChange={(event) => setBuyerMaskedName(event.target.value)} placeholder="例如：张**" /></label><label>订单金额（元）<input disabled={Boolean(value)} required min="0" step="0.01" type="number" value={amount} onChange={(event) => setAmount(event.target.value)} /></label></div><label>订单状态<select value={status} onChange={(event) => setStatus(event.target.value)}><option>待付款</option><option>待发货</option><option>待收货</option><option>已完成</option><option>退款中</option><option>已退款</option><option>已关闭</option></select></label><label>内部备注<textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="仅保存在本机" rows={3} /></label><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存订单</button></div></form></Modal>
 }
 
-function OrderDetailModal({ order, product, onClose }: { order: Order; product?: Product; onClose: () => void }) {
-  const meta = orderStatusMeta(order.status)
-  const detailDate = order.createdAt ? new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(order.createdAt)) : '—'
+function OrderDetailModal({ order, product, onClose, onRefundAction }: { order: Order; product?: Product; onClose: () => void; onRefundAction?: () => Promise<void> }) {
+  const [detail, setDetail] = useState<OrderDetail>()
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let active = true
+    setLoading(true); setError(''); setDetail(undefined)
+    void api.orderDetail(order.accountId, order.orderNo)
+      .then((value) => { if (active) setDetail(value) })
+      .catch((value) => { if (active) setError(value instanceof Error ? value.message : String(value)) })
+      .finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [order.accountId, order.orderNo])
+  const currentOrder = detail?.order ?? order
+  const meta = orderStatusMeta(currentOrder.status)
+  const formatDetailDate = (value: string) => {
+    if (!value) return '—'
+    const numeric = /^\d+$/.test(value.trim()) ? Number(value) : NaN
+    const date = Number.isFinite(numeric) ? new Date(numeric < 1e12 ? numeric * 1000 : numeric) : new Date(value)
+    return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(date)
+  }
+  const detailDate = formatDetailDate(currentOrder.createdAt)
+  const paidDate = formatDetailDate(detail?.paidAt ?? '')
+  const shippedDate = formatDetailDate(detail?.shippedAt ?? '')
+  const completedDate = formatDetailDate(detail?.completedAt ?? '')
+  const closedDate = formatDetailDate(detail?.closedAt ?? '')
   const timeline = [
-    { label: '已拍下', done: true },
-    { label: '已付款', done: meta.success || meta.refunded || /待发货|待收货|已完成/.test(order.status) },
-    { label: '已发货', done: meta.success || meta.refunded || /待收货/.test(order.status) },
-    { label: meta.success ? '交易成功' : meta.refunded ? '交易关闭' : '交易完成', done: meta.success || meta.refunded },
-    { label: '已评价', done: false },
+    { label: '已拍下', done: true, date: detailDate },
+    { label: '已付款', done: meta.success || meta.refunded || /待发货|待收货|已完成/.test(currentOrder.status), date: paidDate },
+    { label: '已发货', done: meta.success || meta.refunded || /待收货/.test(currentOrder.status), date: shippedDate },
+    { label: meta.success ? '交易成功' : meta.refunded ? '交易关闭' : '交易完成', done: meta.success || meta.refunded, date: meta.refunded ? closedDate : completedDate },
+    { label: '已评价', done: false, date: '—' },
   ]
-  return <div className="order-detail-drawer-backdrop" role="presentation" onMouseDown={onClose}><aside className="order-detail-drawer" role="dialog" aria-modal="true" aria-label="订单详情" onMouseDown={(event) => event.stopPropagation()}><header><div><span>订单详情</span><small>订单编号 {order.orderNo}</small></div><button className="icon-button" onClick={onClose}>×</button></header><div className="order-detail-modal">
-    {!meta.closed && <div className="order-detail-progress" aria-label="订单进度">{timeline.map((step, index) => <div className={`order-detail-step ${step.done ? 'done' : ''}`} key={step.label}><span className="order-detail-step-dot">{step.done ? '✓' : index + 1}</span><strong>{step.label}</strong><small>{step.done ? detailDate : '—'}</small>{index < timeline.length - 1 && <i />}</div>)}</div>}
-    <section className={`order-detail-summary ${meta.closed ? 'closed' : ''}`}><h3>{meta.label}</h3>{meta.closed && <p className="order-detail-status-desc">{meta.refunded ? '退款成功' : '买家取消了订单'}</p>}{meta.success && <div className="order-detail-actions"><button type="button" className="primary">查看评价</button><button type="button" className="secondary">查看钱款</button></div>}<div className="order-detail-note"><span>备注：{order.note || '暂无'}</span><button type="button" onClick={() => void copyOrderNumber(order.orderNo)}><Clipboard size={13} />复制订单号</button></div></section>
-    <section className="order-detail-section"><h4>订单信息</h4><div className="order-detail-info-grid"><div><h5>交易信息</h5><dl><div><dt>订单编号</dt><dd>{order.orderNo} <button type="button" onClick={() => void copyOrderNumber(order.orderNo)} title="复制订单编号"><Clipboard size={12} /></button></dd></div>{meta.closed ? <><div><dt>支付宝交易号</dt><dd>—</dd></div><div><dt>下单时间</dt><dd>{detailDate}</dd></div><div><dt>交易关闭时间</dt><dd>{detailDate}</dd></div></> : <><div><dt>下单时间</dt><dd>{detailDate}</dd></div><div><dt>付款时间</dt><dd>{meta.success || meta.refunded ? detailDate : '—'}</dd></div><div><dt>发货时间</dt><dd>{meta.success || meta.refunded ? detailDate : '—'}</dd></div><div><dt>成交时间</dt><dd>{meta.success ? detailDate : '—'}</dd></div></>}</dl></div><div><h5>买家信息</h5><dl><div><dt>买家昵称</dt><dd>{order.buyerMaskedName || '—'}</dd></div><div><dt>收货信息</dt><dd>已隐藏</dd></div></dl></div></div></section>
-    <section className="order-detail-section"><h4>商品信息</h4><div className="order-detail-product-table"><div className="order-detail-product-head"><span>商品信息</span><span>单价/数量</span><span>优惠</span></div><div className="order-detail-product-row"><span className="related-order-image">{product?.imageUrl ? <img src={displayImageUrl(product.imageUrl)} alt="" /> : <Package size={22} />}</span><div className="order-detail-product-name"><strong>{product?.title || order.productTitle || '未命名商品'}</strong><small>规格：一天</small></div><div className="order-detail-product-price"><b>¥{(product?.price ?? order.amount).toFixed(2)}</b><span>×1</span></div><span>—</span></div><div className="order-detail-totals"><div><span>成交价</span><b>¥{order.amount.toFixed(2)}</b></div><div><span>软件服务费</span><b>-¥0.03</b></div><div><span>预计到手</span><b className="price">¥{Math.max(0, order.amount - 0.03).toFixed(2)}</b></div></div></div></section>
+  const serviceFee = detail?.serviceFee
+  return <div className="order-detail-drawer-backdrop" role="presentation" onMouseDown={onClose}><aside className="order-detail-drawer" role="dialog" aria-modal="true" aria-label="订单详情" onMouseDown={(event) => event.stopPropagation()}><header><div><span>订单详情</span><small>订单编号 {currentOrder.orderNo}</small></div><button className="icon-button" onClick={onClose}>×</button></header><div className="order-detail-modal">
+    {loading && <p className="order-detail-loading">正在从闲鱼官方获取订单详情…</p>}
+    {error && <p className="order-detail-loading">官方详情暂时不可用：{error}</p>}
+    {!meta.closed && <div className="order-detail-progress" aria-label="订单进度">{timeline.map((step, index) => <div className={`order-detail-step ${step.done ? 'done' : ''}`} key={step.label}><span className="order-detail-step-dot">{step.done ? '✓' : index + 1}</span><strong>{step.label}</strong><small>{step.done ? step.date : '—'}</small>{index < timeline.length - 1 && <i />}</div>)}</div>}
+    <section className={`order-detail-summary ${meta.closed ? 'closed' : ''} ${meta.refunding ? 'refunding' : ''}`}><h3>{meta.refunding ? '买家申请退款，请尽快处理' : meta.label}</h3>{meta.refunding && onRefundAction && <div className="order-detail-actions"><button type="button" className="secondary" onClick={() => void onRefundAction()}>处理退款</button></div>}{meta.closed && <p className="order-detail-status-desc">{meta.refunded ? '退款成功' : '买家取消了订单'}</p>}{meta.success && <div className="order-detail-actions"><button type="button" className="primary">查看评价</button><button type="button" className="secondary">查看钱款</button></div>}<div className="order-detail-note"><span>备注：{currentOrder.note || '暂无'}</span><button type="button" onClick={() => void copyOrderNumber(currentOrder.orderNo)}><Clipboard size={13} />复制订单号</button></div></section>
+    <section className="order-detail-section"><h4>订单信息</h4><div className="order-detail-info-grid"><div><h5>交易信息</h5><dl><div><dt>订单编号</dt><dd>{currentOrder.orderNo} <button type="button" onClick={() => void copyOrderNumber(currentOrder.orderNo)} title="复制订单编号"><Clipboard size={12} /></button></dd></div>{meta.closed ? <><div><dt>支付宝交易号</dt><dd>—</dd></div><div><dt>下单时间</dt><dd>{detailDate}</dd></div><div><dt>交易关闭时间</dt><dd>{closedDate}</dd></div></> : <><div><dt>下单时间</dt><dd>{detailDate}</dd></div><div><dt>付款时间</dt><dd>{paidDate}</dd></div><div><dt>发货时间</dt><dd>{shippedDate}</dd></div><div><dt>成交时间</dt><dd>{completedDate}</dd></div></>}</dl></div><div><h5>买家信息</h5><dl><div><dt>买家昵称</dt><dd>{currentOrder.buyerMaskedName || '—'}</dd></div><div><dt>收货信息</dt><dd>已隐藏</dd></div></dl></div></div></section>
+    <section className="order-detail-section"><h4>商品信息</h4><div className="order-detail-product-table"><div className="order-detail-product-head"><span>商品信息</span><span>单价/数量</span><span>优惠</span></div><div className="order-detail-product-row"><span className="related-order-image">{product?.imageUrl ? <img src={displayImageUrl(product.imageUrl)} alt="" /> : <Package size={22} />}</span><div className="order-detail-product-name"><strong>{product?.title || currentOrder.productTitle || '未命名商品'}</strong><small>规格：一天</small></div><div className="order-detail-product-price"><b>¥{(product?.price ?? currentOrder.amount).toFixed(2)}</b><span>×1</span></div><span>—</span></div><div className="order-detail-totals"><div><span>成交价</span><b>¥{currentOrder.amount.toFixed(2)}</b></div><div><span>软件服务费</span><b>{serviceFee == null ? '—' : `-¥${serviceFee.toFixed(2)}`}</b></div><div><span>预计到手</span><b className="price">{serviceFee == null ? '—' : `¥${Math.max(0, currentOrder.amount - serviceFee).toFixed(2)}`}</b></div></div></div></section>
     <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>关闭</button></div>
   </div></aside></div>
 }
@@ -810,7 +837,7 @@ function VirtualProductDetail({ url, onClose }: { url: string; onClose: () => vo
   </div>
 }
 
-function Workbench({ account, products, orders, onOrderUpdated, imConnected, quickReplyAutoSuggest, onUnreadChanged, onChatRead, unreadJumpRequest }: { account?: Account; products: Product[]; orders: Order[]; onOrderUpdated: () => void; imConnected: boolean; quickReplyAutoSuggest: boolean; onUnreadChanged: () => Promise<void>; onChatRead: (accountId: string, chatId: string, unreadCount: number) => void; unreadJumpRequest: { accountId: string; chatId: string; nonce: number } }) {
+function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConnected, quickReplyAutoSuggest, onUnreadChanged, onChatRead, unreadJumpRequest }: { account?: Account; products: Product[]; orders: Order[]; onOrderUpdated: () => void; onNotice: (message: string) => void; imConnected: boolean; quickReplyAutoSuggest: boolean; onUnreadChanged: () => Promise<void>; onChatRead: (accountId: string, chatId: string, unreadCount: number) => void; unreadJumpRequest: { accountId: string; chatId: string; nonce: number } }) {
   const CONTACT_BATCH = 30
   const MESSAGE_BATCH = 50
   const [contacts, setContacts] = useState<ChatContact[]>([])
@@ -935,7 +962,7 @@ function Workbench({ account, products, orders, onOrderUpdated, imConnected, qui
   }
   const openOrderAction = async (order: Order, action: string) => {
     if (!isTauri()) {
-      setComposerNotice('订单发货需要在已扫码登录的桌面端完成')
+      setComposerNotice('订单处理需要在已扫码登录的桌面端完成')
       return
     }
     if (action === '提醒收货') {
@@ -947,16 +974,20 @@ function Workbench({ account, products, orders, onOrderUpdated, imConnected, qui
       }
       return
     }
+    if (action === '去处理') {
+      setTradeDrawer({ kind: 'refund', order })
+      return
+    }
     setTradeDrawer({ kind: action === '取消订单' ? 'cancel' : 'ship', order })
   }
   const openTradeAction = async (action: string) => {
     if (!account || !selected) return
-    const status = action === '去发货' ? '待发货' : '全部'
+    const status = action === '去发货' ? '待发货' : action === '去处理' ? '退款中' : '全部'
     try {
       const candidates = await api.relatedOrders(account.id, selected.chatId, status)
-      const order = candidates.find((item) => action !== '去发货' || item.status.includes('待发货'))
+      const order = candidates.find((item) => action === '去发货' ? item.statusCode === 'WAIT_SHIP' || item.status.includes('待发货') : action === '去处理' ? item.statusCode === 'REFUNDING' || item.status.includes('退款') : true)
       if (!order) {
-        setComposerNotice('暂未找到关联的待发货订单，请先同步订单后重试')
+        setComposerNotice(action === '去处理' ? '暂未找到关联的退款订单，请先同步订单后重试' : '暂未找到关联的待发货订单，请先同步订单后重试')
         return
       }
       await openOrderAction(order, action)
@@ -1525,7 +1556,7 @@ function Workbench({ account, products, orders, onOrderUpdated, imConnected, qui
                 <button className={`composer-tool-button ${productPickerOpen ? 'active' : ''}`} type="button" aria-label="插入商品" title="选择当前账号商品" onClick={() => { setProductPickerOpen((current) => !current); setQuickReplyOpen(false); setEmojiOpen(false) }}><ShoppingBag size={19} /></button>
                 {productPickerOpen && <div className="composer-popover product-picker"><header><strong>当前账号商品</strong><small>{accountProducts.length} 件在售</small></header>{accountProducts.length ? accountProducts.map((product) => <button type="button" key={product.id} onClick={() => void insertProduct(product)}><span className="product-picker-thumb"><Package size={16} />{product.imageUrl && <img src={displayImageUrl(product.imageUrl)} alt="" loading="lazy" onError={(event) => { event.currentTarget.style.display = 'none' }} />}</span><span><strong>{product.title}</strong><small>¥{product.price} · 库存 {product.stock}</small></span></button>) : <p>当前账号暂无已同步的在售商品。</p>}</div>}
               </div>
-              <button className="composer-tool-button composer-ai-button" type="button" aria-label="AI 回复未生效" title="AI 回复尚未生效" onClick={() => setComposerNotice('AI 回复尚未生效，请先在设置中完成配置')}><span className="composer-tool-badge">未生效</span><span className="composer-ai-glyph">AI</span></button>
+              <button className="composer-tool-button composer-ai-button" type="button" aria-label="AI 回复未生效" title="AI 回复尚未生效" onClick={() => onNotice('AI 回复尚未生效，请先在设置中完成配置')}><span className="composer-tool-badge">未生效</span><span className="composer-ai-glyph">AI</span></button>
               <div className="composer-tool-anchor" ref={quickReplyAnchorRef}>
                 <button className={`composer-tool-button ${quickReplyOpen ? 'active' : ''}`} type="button" aria-label="快捷回复" title="快捷回复" onClick={() => { setQuickReplyOpen((current) => !current); setEmojiOpen(false) }}><span className="composer-quick-glyph"><Zap size={12} /></span></button>
                 {quickReplyOpen && <div className="composer-popover quick-reply-picker"><header><strong>快捷回复</strong><button type="button" onClick={() => { setQuickReplyOpen(false); setQuickReplyManaging(true); setEditingQuickReply(undefined) }}>管理</button></header>{quickReplies.length ? quickReplies.map((reply) => <button type="button" key={reply.id} onClick={() => insertQuickReply(reply)}><strong>{reply.title}<code>/{reply.shortCode}</code></strong><span>{reply.content || `含 ${reply.images.length} 张图片`}</span>{reply.images.length > 0 && <em>{reply.images.length} 图</em>}</button>) : <div className="quick-reply-empty"><p>暂无快捷回复</p><button type="button" onClick={() => { setQuickReplyOpen(false); setQuickReplyManaging(true); setEditingQuickReply(undefined) }}>去添加</button></div>}</div>}
@@ -1544,6 +1575,7 @@ function Workbench({ account, products, orders, onOrderUpdated, imConnected, qui
     {customerRemarkOpen && selected && <CustomerRemarkDialog value={customerProfile?.remark ?? ''} onClose={() => setCustomerRemarkOpen(false)} onSave={saveCustomerRemark} />}
     {tradeDrawer?.kind === 'ship' && <ShipOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); setComposerNotice('已发货，订单状态已同步') }} />}
     {tradeDrawer?.kind === 'cancel' && <CancelOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); setComposerNotice('订单已取消，状态已同步') }} />}
+    {tradeDrawer?.kind === 'refund' && <RefundOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); setComposerNotice('退款处理已提交，订单状态已同步') }} />}
   </div>
 }
 
@@ -1573,15 +1605,17 @@ function customerCreditTone(value: string) {
 function orderStatusMeta(status: string) {
   const value = status.trim()
   const refunded = /退款成功|已退款|退款完成/.test(value)
+  const refunding = !refunded && /退款中|退款申请|待处理退款/.test(value)
   const shipped = !refunded && /待收货|已发货|已寄件/.test(value)
   const success = !refunded && /交易成功|已完成|完成/.test(value)
   const closed = refunded || /交易关闭|已关闭|关闭|取消/.test(value)
   return {
-    label: success ? '交易成功' : closed ? '交易关闭' : shipped ? '已发货' : value || '交易进行中',
+    label: success ? '交易成功' : closed ? '交易关闭' : refunding ? '退款中' : shipped ? '已发货' : value || '交易进行中',
     shipped,
     success,
     closed,
     refunded,
+    refunding,
   }
 }
 
@@ -1663,7 +1697,7 @@ function CustomerContextPanel({ contact, profile, inventory, orders, onOrderUpda
     <div className="customer-product-list">{products.length ? products.slice(0, 10).map((item, index) => activeTab === 'current'
       ? <article className="customer-current-item" key={`${item.itemId || item.title}-${index}`}><div className="customer-current-image">{item.imageUrl ? <img src={displayImageUrl(item.imageUrl)} alt="" loading="lazy" onError={(event) => event.currentTarget.parentElement?.classList.add('image-error')} /> : null}<Package size={21} />{item.status && <span>{item.status}</span>}</div><div className="customer-current-copy"><strong>{item.title || `商品 ${item.itemId}`}</strong><small>曝光：{item.exposureCount || '—'} <i>｜</i> 浏览：{item.viewCount || '—'} <i>｜</i> 想要：{item.wantCount || '—'}</small><b>{item.price && `¥${item.price.replace(/^¥/, '')}`}{item.fishCoin && <em>{item.price ? ' + ' : ''}{item.fishCoin}闲鱼币</em>}</b></div></article>
       : <article className="customer-footprint-item" key={`${item.itemId || item.title}-${index}`}><div className="customer-footprint-image">{item.imageUrl ? <img src={displayImageUrl(item.imageUrl)} alt={item.title || '商品图片'} loading="lazy" onError={(event) => event.currentTarget.parentElement?.classList.add('image-error')} /> : <Package size={17} />}{item.visitedAt && <small>{customerItemDate(item.visitedAt)}</small>}</div>{item.price && <b>¥{item.price.replace(/^¥/, '')}</b>}</article>) : <p>{tabEmptyCopy}</p>}</div>
-    <section className="related-orders"><div className="related-orders-head"><strong>关联订单</strong><small>{relatedOrdersSyncing ? '同步中…' : '⋯'}</small></div><div className="related-order-tabs">{orderTabs.map((tab) => <button type="button" className={orderFilter === tab ? 'active' : ''} key={tab} onClick={() => setOrderFilter(tab)}>{tab}</button>)}</div>{relatedOrders.length ? <div className="related-order-list">{relatedOrders.map((order) => { const product = inventory.find((item) => item.accountId === order.accountId && (item.id.endsWith(`-${order.itemId}`) || item.title === order.productTitle || item.title.includes(order.productTitle) || order.productTitle.includes(item.title))); const displayTitle = product?.title || order.productTitle || '未命名商品'; const meta = orderStatusMeta(order.status); const pendingShipment = order.status.includes('待发货'); return <article className={`related-order-card ${meta.closed ? 'closed' : ''} ${meta.success ? 'completed' : ''}`} key={order.id}><div className="related-order-meta"><span className={`related-order-status ${meta.success ? 'success' : ''}`}>{meta.label}</span><small>订单编号 {order.orderNo} <button type="button" className="copy-order-id" title="复制订单编号" onClick={() => void copyOrderNumber(order.orderNo)}><Clipboard size={11} /></button></small><button type="button" className="order-detail-link" onClick={() => setDetailOrder(order)}>详情</button></div><div className="related-order-date">下单 {order.createdAt ? formatDate(order.createdAt) : '时间未知'}{meta.success && `  付款 ${order.createdAt ? formatDate(order.createdAt) : ''}`}</div><div className="related-order-title"><span className="related-order-image">{product?.imageUrl ? <img src={displayImageUrl(product.imageUrl)} alt={displayTitle} loading="lazy" onError={(event) => event.currentTarget.style.display = 'none'} /> : <Package size={18} />}</span><span className="related-order-copy"><strong>{displayTitle}</strong><small>规格：一天</small></span><b>¥{(product?.price ?? order.amount).toFixed(2)}<small>[共1件]</small></b></div><div className="related-order-details"><div><span>成交价</span><strong>¥{order.amount.toFixed(2)}{meta.closed && !meta.refunded && <em>（含运费）</em>}</strong></div><div><span>发货状态</span><span>{meta.shipped || meta.success || meta.refunded ? '已发货' : '未发货'}</span></div>{meta.shipped && <div><span>发货时间</span><span>{order.createdAt ? formatDate(order.createdAt) : '时间未知'}</span></div>}<div><span>{meta.closed ? '完结时间' : '下单时间'}</span><span>{order.createdAt ? formatDate(order.createdAt) : '时间未知'}</span></div><div className="order-note-row"><span>订单备注</span>{editingOrderId === order.id ? <span className="order-note-editor"><input value={orderNote} onChange={(event) => setOrderNote(event.target.value)} autoFocus /><button type="button" disabled={savingNote} onClick={() => void saveOrderNote(order)}>保存</button></span> : <button type="button" className="order-note-button" onClick={() => { setEditingOrderId(order.id); setOrderNote(order.note) }}>{order.note || '添加备注'} <Pencil size={11} /></button>}</div></div>{pendingShipment && <div className="related-order-actions"><button type="button" className="primary" onClick={() => void onOrderAction(order, '去发货')}>去发货</button><button type="button" className="secondary" onClick={() => void onOrderAction(order, '取消订单')}>取消订单</button></div>}{meta.shipped && !meta.success && !meta.refunded && <div className="related-order-actions"><button type="button" className="primary" onClick={() => void onOrderAction(order, '提醒收货')}>提醒收货</button></div>}{meta.success && !meta.refunded && <div className="related-order-actions"><button type="button">查看评价</button><button type="button">查看钱款</button></div>}{meta.refunded && <div className="refund-success-banner">退款成功 <b>›</b></div>}</article> })}</div> : <p className="related-orders-empty">当前筛选暂无订单</p>}</section>{detailOrder && <OrderDetailModal order={detailOrder} product={inventory.find((item) => item.accountId === detailOrder.accountId && (item.id.endsWith(`-${detailOrder.itemId}`) || item.title === detailOrder.productTitle || detailOrder.productTitle.includes(item.id.split("-").pop() || "")))} onClose={() => setDetailOrder(null)} />}
+    <section className="related-orders"><div className="related-orders-head"><strong>关联订单</strong><small>{relatedOrdersSyncing ? '同步中…' : '⋯'}</small></div><div className="related-order-tabs">{orderTabs.map((tab) => <button type="button" className={orderFilter === tab ? 'active' : ''} key={tab} onClick={() => setOrderFilter(tab)}>{tab}</button>)}</div>{relatedOrders.length ? <div className="related-order-list">{relatedOrders.map((order) => { const product = inventory.find((item) => item.accountId === order.accountId && (item.id.endsWith(`-${order.itemId}`) || item.title === order.productTitle || item.title.includes(order.productTitle) || order.productTitle.includes(item.title))); const displayTitle = product?.title || order.productTitle || '未命名商品'; const meta = orderStatusMeta(order.status); const pendingShipment = order.status.includes('待发货'); return <article className={`related-order-card ${meta.closed ? 'closed' : ''} ${meta.success ? 'completed' : ''}`} key={order.id}><div className="related-order-meta"><span className={`related-order-status ${meta.success ? 'success' : ''}`}>{meta.label}</span><small>订单编号 {order.orderNo} <button type="button" className="copy-order-id" title="复制订单编号" onClick={() => void copyOrderNumber(order.orderNo)}><Clipboard size={11} /></button></small><button type="button" className="order-detail-link" onClick={() => setDetailOrder(order)}>详情</button></div><div className="related-order-date">下单 {order.createdAt ? formatDate(order.createdAt) : '时间未知'}{meta.success && ` 付款 ${order.createdAt ? formatDate(order.createdAt) : ''}`}</div><div className="related-order-title"><span className="related-order-image">{product?.imageUrl ? <img src={displayImageUrl(product.imageUrl)} alt={displayTitle} loading="lazy" onError={(event) => event.currentTarget.style.display = 'none'} /> : <Package size={18} />}</span><span className="related-order-copy"><strong>{displayTitle}</strong><small>规格：一天</small></span><b>¥{(product?.price ?? order.amount).toFixed(2)}<small>[共1件]</small></b></div><div className="related-order-details"><div><span>成交价</span><strong>¥{order.amount.toFixed(2)}{meta.closed && !meta.refunded && <em>（含运费）</em>}</strong></div><div><span>发货状态</span><span>{meta.shipped || meta.success || meta.refunded ? '已发货' : '未发货'}</span></div>{meta.shipped && <div><span>发货时间</span><span>{order.createdAt ? formatDate(order.createdAt) : '时间未知'}</span></div>}<div><span>{meta.closed ? '完结时间' : '下单时间'}</span><span>{order.createdAt ? formatDate(order.createdAt) : '时间未知'}</span></div><div className="order-note-row"><span>订单备注</span>{editingOrderId === order.id ? <span className="order-note-editor"><input value={orderNote} onChange={(event) => setOrderNote(event.target.value)} autoFocus /><button type="button" disabled={savingNote} onClick={() => void saveOrderNote(order)}>保存</button></span> : <button type="button" className="order-note-button" onClick={() => { setEditingOrderId(order.id); setOrderNote(order.note) }}>{order.note || '添加备注'} <Pencil size={11} /></button>}</div></div>{pendingShipment && <div className="related-order-actions"><button type="button" className="primary" onClick={() => void onOrderAction(order, '去发货')}>去发货</button><button type="button" className="secondary" onClick={() => void onOrderAction(order, '取消订单')}>取消订单</button></div>}{meta.shipped && !meta.success && !meta.refunded && <div className="related-order-actions"><button type="button" className="primary" onClick={() => void onOrderAction(order, '提醒收货')}>提醒收货</button></div>}{meta.success && !meta.refunded && <div className="related-order-actions"><button type="button">查看评价</button><button type="button">查看钱款</button></div>}{meta.refunded && <div className="refund-success-banner">退款成功 <b>›</b></div>}</article> })}</div> : <p className="related-orders-empty">当前筛选暂无订单</p>}</section>{detailOrder && <OrderDetailModal order={detailOrder} product={inventory.find((item) => item.accountId === detailOrder.accountId && (item.id.endsWith(`-${detailOrder.itemId}`) || item.title === detailOrder.productTitle || detailOrder.productTitle.includes(item.id.split("-").pop() || "")))} onClose={() => setDetailOrder(null)} onRefundAction={async () => { setDetailOrder(null); await onOrderAction(detailOrder, '去处理') }} />}
     {(profile?.syncNote || error) && <p className="customer-sync-note">{profile?.syncNote || `客户资料同步失败：${error}`}</p>}
   </div>
 }
@@ -1716,6 +1750,67 @@ function CancelOrderDrawer({ accountId, order, onClose, onDone }: { accountId: s
     }
   }
   return <div className="trade-drawer-backdrop" role="presentation" onMouseDown={() => { if (!submitting) onClose() }}><aside className="trade-drawer cancel-order-drawer" role="dialog" aria-modal="true" aria-label="取消订单" onMouseDown={(event) => event.stopPropagation()}><header><div><h2>关闭交易</h2><small>订单号 {order.orderNo}</small></div><button type="button" className="icon-button" disabled={submitting} onClick={onClose}><X size={19} /></button></header><main><p className="trade-drawer-warning">关闭后订单不可恢复，请确认已与买家沟通。</p><fieldset className="cancel-reason-list"><legend>请选择关闭原因</legend>{reasons.map((item) => <label key={item}><input type="radio" name="cancel-reason" value={item} checked={reason === item} onChange={() => setReason(item)} />{item}</label>)}</fieldset>{error && <div className="form-error">{error}</div>}</main><footer><button type="button" className="secondary" disabled={submitting} onClick={onClose}>暂不关闭</button><button type="button" className="danger-button" disabled={submitting || !reason} onClick={() => void submit()}>{submitting ? '关闭中…' : '确认关闭交易'}</button></footer></aside></div>
+}
+
+function refundCountdown(deadlineAt: string, now: number) {
+  if (!deadlineAt) return ''
+  const numeric = Number(deadlineAt)
+  const timestamp = Number.isFinite(numeric) && numeric > 0
+    ? (numeric < 10_000_000_000 ? numeric * 1000 : numeric)
+    : Date.parse(deadlineAt)
+  if (!Number.isFinite(timestamp)) return ''
+  const seconds = Math.max(0, Math.floor((timestamp - now) / 1000))
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor((seconds % 86400) / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const remainder = seconds % 60
+  return `${days}天${hours}小时${minutes}分钟${remainder}秒`
+}
+
+function RefundOrderDrawer({ accountId, order, onClose, onDone }: { accountId: string; order: Order; onClose: () => void; onDone: () => void }) {
+  const [detail, setDetail] = useState<RefundDetail | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+  const [verification, setVerification] = useState<RefundVerification | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    let active = true
+    void api.refundDetail(accountId, order.orderNo)
+      .then((value) => { if (active) setDetail(value) })
+      .catch((nextError) => { if (active) setError(nextError instanceof Error ? nextError.message : String(nextError)) })
+      .finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [accountId, order.orderNo])
+  useEffect(() => {
+    if (!detail?.deadlineAt) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [detail?.deadlineAt])
+  const submit = async (action: 'agree' | 'refuse') => {
+    if (!detail?.refundId) { setError('官方未返回退款编号，暂时无法处理'); return }
+    setSubmitting(true); setError('')
+    try {
+      if (action === 'agree') {
+        const nextVerification = await api.refundVerification(accountId, detail.refundId)
+        if (nextVerification.required) { setVerification(nextVerification); setSubmitting(false); return }
+        await api.refundAction(accountId, order.orderNo, detail.refundId, action, nextVerification.authToken)
+      } else {
+        await api.refundAction(accountId, order.orderNo, detail.refundId, action)
+      }
+      onDone()
+    } catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); setSubmitting(false) }
+  }
+  const submitVerified = async () => {
+    if (!detail?.refundId || !verification) return
+    setSubmitting(true); setError('')
+    try { await api.refundAction(accountId, order.orderNo, detail.refundId, 'agree', verification.authToken); onDone() }
+    catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); setSubmitting(false) }
+  }
+  const sellerStep = detail ? ['1', '2', '3'].includes(detail.statusCode) : false
+  const finished = detail?.statusCode === '5'
+  const countdown = detail ? refundCountdown(detail.deadlineAt, now) : ''
+  return <div className="trade-drawer-backdrop" role="presentation" onMouseDown={() => { if (!submitting) onClose() }}><aside className="trade-drawer refund-order-drawer" role="dialog" aria-modal="true" aria-label="退款处理" onMouseDown={(event) => event.stopPropagation()}><header><div><h2>退款处理</h2><small>订单号 {order.orderNo}</small></div><button type="button" className="icon-button" disabled={submitting} onClick={onClose}><X size={19} /></button></header><main>{loading ? <p className="order-detail-loading">正在读取官方退款信息…</p> : detail ? <><div className="refund-progress"><span className="active">✓<small>买家申请退款</small></span><i className={sellerStep || finished ? 'active' : ''} /><span className={sellerStep || finished ? 'active' : ''}>2<small>卖家处理</small></span><i className={finished ? 'active' : ''} /><span className={finished ? 'active' : ''}>3<small>退款结束</small></span></div><section className="refund-summary"><h3>{detail.status === '等待卖家处理' ? '买家申请退款，请及时处理' : detail.status}</h3>{detail.reason && <p>退款原因：{detail.reason}</p>}{countdown && !finished ? <p className="refund-timeout">{countdown}后未处理，将自动退款</p> : detail.timeoutText && <p className="refund-timeout">{detail.timeoutText}</p>}{verification ? <div className="refund-verification"><p>{verification.message}</p><iframe src={verification.verificationUrl} title="支付宝身份核验" /></div> : <><div className="refund-info-head"><span>退款编号 <b>{detail.refundId || '—'}</b></span><span>申请时间 <b>{detail.createTime || '—'}</b></span><span>申请金额 <strong>¥{detail.amount.toFixed(2)}</strong></span></div><dl><div><dt>售后原因</dt><dd>{detail.reason || '—'}</dd></div><div><dt>收货状态</dt><dd>{detail.receivedStatus || '—'}</dd></div><div><dt>售后说明</dt><dd>{detail.description || '—'}</dd></div><div><dt>退货货物状态</dt><dd>{detail.returnGoodsStatus || '—'}</dd></div><div><dt>买家凭证</dt><dd>{detail.buyerEvidence || '—'}</dd></div><div><dt>运费</dt><dd>{detail.freightStatus || '—'}</dd></div><div><dt>客服介入</dt><dd>{detail.customerService || '—'}</dd></div></dl></>}</section></> : null}{error && <div className="form-error">{error}</div>}</main>{verification ? <footer><button type="button" className="secondary" disabled={submitting} onClick={() => setVerification(null)}>返回</button><button type="button" className="primary" disabled={submitting} onClick={() => void submitVerified()}>{submitting ? '提交中…' : '已完成核验，提交退款'}</button></footer> : !loading && detail && !finished && <footer><button type="button" className="secondary" disabled={submitting} onClick={() => void submit('refuse')}>拒绝申请</button><button type="button" className="primary" disabled={submitting} onClick={() => void submit('agree')}>{submitting ? '核验中…' : '同意退款'}</button></footer>}</aside></div>
 }
 
 function QuickReplyManager({ replies, value, onClose, onSave, onEdit, onDelete }: { replies: QuickReply[]; value?: QuickReply; onClose: () => void; onSave: (input: { title: string; content: string; shortCode: string; images: QuickReplyImage[] }) => void; onEdit: (reply: QuickReply | undefined) => void; onDelete: (reply: QuickReply) => void }) {
