@@ -6,7 +6,7 @@ import {
   Bell, CheckCircle2, ChevronDown, CircleHelp, ClipboardList, Download, ExternalLink,
   History, Image as ImageIcon, LayoutDashboard, LogIn, MessageCircle, Package, Pencil,
   Plus, RefreshCw, Search, Send, Settings, ShieldCheck, ShoppingBag, Smile,
-  Store, Trash2, UserRound, UsersRound, X, Zap, ListPlus,
+  Store, Trash2, UserRound, UsersRound, Upload, X, Zap, ListPlus,
 } from 'lucide-react'
 import logo from './assets/shark-butler-logo.png'
 import { api } from './lib/api'
@@ -70,30 +70,81 @@ function displayImageUrl(value: string) {
 
 let messageNotificationContext: AudioContext | null = null
 
-function playMessageNotification() {
+
+type NotificationSoundId = `preset-${number}` | 'custom'
+type NotificationSoundGroup = 'standard'
+type NotificationSoundPreset = {
+  id: NotificationSoundId
+  name: string
+  description: string
+  accent: string
+  group: NotificationSoundGroup
+  sequence: Array<{ frequency: number; start: number; duration: number; type: OscillatorType }>
+}
+
+// 内置提示音均控制在 1～3 秒内，避免通知过长打扰客服工作。
+const notificationSoundPresets: NotificationSoundPreset[] = [
+  { id: 'preset-1', group: 'standard', name: '清脆提示', description: '轻快双音', accent: '#ffd400', sequence: [{ frequency: 660, start: 0, duration: .22, type: 'sine' }, { frequency: 880, start: .18, duration: .95, type: 'sine' }] },
+  { id: 'preset-2', group: 'standard', name: '柔和铃声', description: '温和三音', accent: '#ffc56b', sequence: [{ frequency: 523, start: 0, duration: .25, type: 'triangle' }, { frequency: 659, start: .2, duration: .3, type: 'triangle' }, { frequency: 784, start: .42, duration: .9, type: 'triangle' }] },
+  { id: 'preset-3', group: 'standard', name: '木琴短句', description: '明亮上行', accent: '#ff9e80', sequence: [{ frequency: 392, start: 0, duration: .18, type: 'triangle' }, { frequency: 494, start: .16, duration: .18, type: 'triangle' }, { frequency: 587, start: .32, duration: .18, type: 'triangle' }, { frequency: 784, start: .48, duration: .8, type: 'triangle' }] },
+  { id: 'preset-4', group: 'standard', name: '气泡提醒', description: '短促双跳', accent: '#7dd3fc', sequence: [{ frequency: 740, start: 0, duration: .16, type: 'sine' }, { frequency: 988, start: .15, duration: .95, type: 'sine' }] },
+  { id: 'preset-5', group: 'standard', name: '温暖和弦', description: '柔和叠音', accent: '#86efac', sequence: [{ frequency: 523, start: 0, duration: .46, type: 'sine' }, { frequency: 659, start: .03, duration: .46, type: 'sine' }, { frequency: 784, start: .06, duration: .95, type: 'sine' }] },
+  { id: 'preset-6', group: 'standard', name: '轻铃回响', description: '两段回响', accent: '#c4b5fd', sequence: [{ frequency: 587, start: 0, duration: .22, type: 'triangle' }, { frequency: 880, start: .28, duration: .26, type: 'triangle' }, { frequency: 1175, start: .54, duration: .65, type: 'triangle' }] },
+  { id: 'preset-7', group: 'standard', name: '订单到达', description: '稳重三拍', accent: '#fda4af', sequence: [{ frequency: 440, start: 0, duration: .2, type: 'square' }, { frequency: 554, start: .24, duration: .2, type: 'square' }, { frequency: 659, start: .48, duration: .7, type: 'square' }] },
+  { id: 'preset-8', group: 'standard', name: '消息泡泡', description: '清亮上扬', accent: '#67e8f9', sequence: [{ frequency: 494, start: 0, duration: .18, type: 'sine' }, { frequency: 659, start: .16, duration: .18, type: 'sine' }, { frequency: 988, start: .32, duration: .8, type: 'sine' }] },
+  { id: 'preset-9', group: 'standard', name: '安心提示', description: '低调双音', accent: '#a7f3d0', sequence: [{ frequency: 349, start: 0, duration: .35, type: 'triangle' }, { frequency: 523, start: .3, duration: .8, type: 'triangle' }] },
+  { id: 'preset-10', group: 'standard', name: '闪电提醒', description: '快速三连', accent: '#fcd34d', sequence: [{ frequency: 784, start: 0, duration: .13, type: 'sawtooth' }, { frequency: 988, start: .14, duration: .13, type: 'sawtooth' }, { frequency: 1175, start: .28, duration: .85, type: 'sawtooth' }] },
+]
+const notificationSoundGroups: Array<{ id: NotificationSoundGroup; label: string; description: string }> = [
+  { id: 'standard', label: '常用提示音', description: '日常消息提醒' },
+]
+
+const notificationSoundStorageKey = 'shark-butler-notification-sound'
+const notificationCustomSoundStorageKey = 'shark-butler-notification-custom-sound'
+function selectedNotificationSoundId(): NotificationSoundId {
+  const value = localStorage.getItem(notificationSoundStorageKey)
+  return value === 'custom' || notificationSoundPresets.some((item) => item.id === value) ? value as NotificationSoundId : 'preset-1'
+}
+
+function playToneSequence(context: AudioContext, sequence: NotificationSoundPreset['sequence']) {
+  const now = context.currentTime
+  sequence.forEach(({ frequency, start, duration, type }) => {
+    const oscillator = context.createOscillator()
+    const gain = context.createGain()
+    oscillator.type = type
+    oscillator.frequency.setValueAtTime(frequency, now + start)
+    gain.gain.setValueAtTime(0.0001, now + start)
+    gain.gain.exponentialRampToValueAtTime(0.22, now + start + .015)
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + start + duration)
+    oscillator.connect(gain)
+    gain.connect(context.destination)
+    oscillator.start(now + start)
+    oscillator.stop(now + start + duration + .02)
+  })
+}
+
+function playMessageNotification(category: 'chat' | 'order' | 'system' = 'chat') {
   try {
+    const toggleMap = JSON.parse(localStorage.getItem('shark-butler-notification-toggles') || '{"chat":true,"order":true,"system":true}') as Record<string, boolean>
+    if (toggleMap[category] === false) return
+    const selected = selectedNotificationSoundId()
+    if (selected === 'custom') {
+      const customDataUrl = localStorage.getItem(notificationCustomSoundStorageKey)
+      if (customDataUrl) {
+        const audio = new Audio(customDataUrl)
+        audio.volume = .85
+        void audio.play().catch(() => undefined)
+        return
+      }
+    }
+    const selectedPreset = notificationSoundPresets.find((item) => item.id === selected)
     const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
     if (!AudioContextCtor) return
     messageNotificationContext ??= new AudioContextCtor()
     const context = messageNotificationContext
     const play = () => {
-      const now = context.currentTime
-      // A short three-note chime is easier to recognize than the previous
-      // two-tone alert, while remaining unobtrusive during a busy session.
-      ;[523.25, 659.25, 783.99].forEach((frequency, index) => {
-        const start = now + index * 0.12
-        const oscillator = context.createOscillator()
-        const gain = context.createGain()
-        oscillator.type = 'triangle'
-        oscillator.frequency.setValueAtTime(frequency, start)
-        gain.gain.setValueAtTime(0.0001, start)
-        gain.gain.exponentialRampToValueAtTime(0.3, start + 0.012)
-        gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.2)
-        oscillator.connect(gain)
-        gain.connect(context.destination)
-        oscillator.start(start)
-        oscillator.stop(start + 0.22)
-      })
+      const preset = selectedPreset ?? notificationSoundPresets[0]
+      playToneSequence(context, preset.sequence)
     }
     if (context.state === 'suspended') void context.resume().then(play)
     else play()
@@ -389,7 +440,7 @@ function MainApp() {
   }
 
   return (
-    <main className="shell">
+    <main className={`shell ${page === 'settings' ? 'settings-shell' : ''}`}>
       <aside className="rail" aria-label="主导航">
         <button className="brand-mark" onClick={() => setPage('dashboard')} aria-label="鲨鱼管家首页">
           <img src={logo} alt="鲨鱼管家" />
@@ -406,7 +457,7 @@ function MainApp() {
       </aside>
 
       <section className="app-column">
-        <header className="topbar">
+        <header className={`topbar ${page === 'settings' ? 'settings-topbar' : ''}`}>
           {page === 'workbench' && <div className="conversation-tabs" aria-label="会话标签">
             <div className="conversation-tab-strip">{conversationTabIds.map((id) => accounts.find((account) => account.id === id)).filter((account): account is Account => Boolean(account)).map((account) => <div className={`conversation-tab ${account.id === activeAccount?.id ? 'active' : ''}`} key={account.id}><button className="conversation-tab-main" onClick={() => setAccountId(account.id)} onDoubleClick={() => jumpToUnreadConversation(account.id)} title="双击跳转到下一条未读会话"><AccountAvatar account={account} className="conversation-tab-avatar" />{(unreadTotals[account.id] ?? 0) > 0 && <em className="conversation-tab-unread" aria-label={`${unreadTotals[account.id]} 条未读消息`}>{unreadTotals[account.id] > 99 ? '99+' : unreadTotals[account.id]}</em>}<span><strong>{account.conversationName || account.displayName}</strong><small>{account.remoteAccountId || account.displayName} · {account.status}</small></span></button><button className="conversation-tab-action edit" onClick={() => setDialog({ kind: 'conversation-name', value: account })} title="自定义会话名称"><Pencil size={12} /></button><button className="conversation-tab-action close" onClick={() => closeConversationTab(account.id)} title="关闭会话标签"><X size={13} /></button></div>)}</div>
             <div className="account-menu-anchor"><button ref={accountMenuButtonRef} className={`round-button ${accountMenuOpen ? 'active' : ''}`} onClick={() => setAccountMenuOpen((open) => !open)} title="添加会话标签" aria-expanded={accountMenuOpen}><Plus size={20} /></button>{accountMenuOpen && createPortal(<div className="account-menu account-menu-portal" style={accountMenuPosition}><header><strong>选择会话账号</strong><span>{accounts.length} 个账号</span></header>{accounts.length ? accounts.map((account) => <button className={conversationTabIds.includes(account.id) ? 'selected' : ''} key={account.id} onClick={() => openConversationTab(account.id)}><AccountAvatar account={account} /><span><strong>{account.conversationName || account.displayName}</strong><small>{account.displayName} · {account.status}</small></span>{conversationTabIds.includes(account.id) && <CheckCircle2 size={17} />}</button>) : <p>暂无账号，请先到账号管理扫码登录。</p>}</div>, document.body)}</div>
@@ -429,13 +480,13 @@ function MainApp() {
 
         {notice && <div className="notice toast-notice" role="status" aria-live="polite"><ShieldCheck size={17} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">×</button></div>}
 
-        <div className={`content ${page === 'workbench' ? 'workbench-content' : ''}`}>
+        <div className={`content ${page === 'workbench' ? 'workbench-content' : ''} ${page === 'settings' ? 'settings-content' : ''}`}>
           {loading ? <Loading /> : page === 'dashboard' ? <Dashboard stats={stats} accounts={accounts} orders={orders} onGo={setPage} />
             : page === 'workbench' ? <Workbench key={activeAccount?.id ?? 'empty'} account={activeAccount} products={products} imConnected={Boolean(activeAccount?.remoteAccountId)} quickReplyAutoSuggest={quickReplyAutoSuggest} onUnreadChanged={refreshUnreadTotals} onChatRead={handleChatRead} unreadJumpRequest={unreadJumpRequest} />
               : page === 'accounts' ? <Accounts accounts={accounts} syncJobs={syncJobs} imStatuses={imStatuses} onQrLogin={() => setDialog({ kind: 'qr' })} onEdit={(value) => setDialog({ kind: 'account', value })} onDelete={(value) => setDialog({ kind: 'delete-account', value })} onSync={(account) => void syncAccount(account)} onSetStatus={(ids, status) => void setAccountsStatus(ids, status)} />
                 : page === 'products' ? <Products items={filteredProducts} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, action) => void bulkProducts(ids, action)} onAdd={() => setDialog({ kind: 'product' })} onEdit={(value) => setDialog({ kind: 'product', value })} onDelete={(id) => void remove('product', id)} />
                   : page === 'orders' ? <Orders items={filteredOrders} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, status) => void bulkOrders(ids, status)} onAdd={() => setDialog({ kind: 'order' })} onEdit={(value) => setDialog({ kind: 'order', value })} onDelete={(id) => void remove('order', id)} />
-                    : <SettingsPage quickReplyAutoSuggest={quickReplyAutoSuggest} onQuickReplyAutoSuggestChange={setQuickReplyAutoSuggest} onExport={() => void exportBackup()} onOpenLogs={() => setLogManagerOpen(true)} />}
+                    : <SettingsPage quickReplyAutoSuggest={quickReplyAutoSuggest} onQuickReplyAutoSuggestChange={setQuickReplyAutoSuggest} onExport={() => void exportBackup()} onOpenLogs={() => setLogManagerOpen(true)} onQrLogin={() => setDialog({ kind: 'qr' })} />}
         </div>
         {dialog?.kind === 'account' && <AccountDialog value={dialog.value} onClose={() => setDialog(null)} onSave={saveAccount} />}
         {dialog?.kind === 'product' && <ProductDialog accounts={accounts} selectedAccountId={activeAccount?.id} value={dialog.value} onClose={() => setDialog(null)} onSave={saveProduct} />}
@@ -1422,13 +1473,152 @@ function LogManager({ onClose }: { onClose: () => void }) {
   return <Modal title="日志管理" onClose={onClose}><div className="log-manager"><div className="log-manager-status"><span><i />自动刷新中 · 每秒更新</span><small>{logs.length} 条本地日志</small></div><div ref={scrollRef} className="log-list" aria-live="polite">{failed ? <p className="log-empty">日志暂时无法读取。</p> : logs.length ? logs.map((entry) => <article className={`log-entry ${entry.level}`} key={entry.id}><time>{formatDate(entry.createdAt)}</time><span className="log-level">{entry.level}</span><span className="log-category">{entry.category}</span><p>{entry.accountId ? `[${entry.accountId.slice(0, 8)}] ` : ''}{entry.message}</p></article>) : <p className="log-empty">暂无日志，连接 IM 后会在这里显示协议阶段与错误。</p>}</div></div></Modal>
 }
 
-function SettingsPage({ quickReplyAutoSuggest, onQuickReplyAutoSuggestChange, onExport, onOpenLogs }: { quickReplyAutoSuggest: boolean; onQuickReplyAutoSuggestChange: (value: boolean) => void; onExport: () => void; onOpenLogs: () => void }) { return <div className="page settings-page"><PageHead eyebrow="应用设置" title="本地优先，安全可控" description="账号会话、商品、订单和同步记录都保存在当前电脑。" />
-  <section className="settings-card"><div><h3>快捷回复自动联想</h3><p>在客服输入文字时，根据已有快捷回复的标题和内容显示匹配建议。</p></div><label className="settings-switch"><input type="checkbox" checked={quickReplyAutoSuggest} onChange={(event) => onQuickReplyAutoSuggestChange(event.target.checked)} /><span aria-hidden="true" /><b>{quickReplyAutoSuggest ? '已开启' : '已关闭'}</b></label></section>
-  <section className="settings-card"><div><h3>导出本地备份</h3><p>导出账号资料、商品和订单为 JSON 文件，便于迁移与排查。</p></div><button className="secondary" onClick={onExport}><Download size={17} />导出备份</button></section>
-  <section className="settings-card"><div><h3>本机闲鱼连接器</h3><p>扫码登录、商品和订单同步直接在鲨鱼管家中运行，不依赖 HLSRental 服务。</p></div><Store size={26} /></section>
-  <section className="settings-card"><div><h3>日志管理</h3><p>查看最近的 IM 连接、同步与错误日志，自动刷新并跟随最新记录。</p></div><button className="secondary" onClick={onOpenLogs}><History size={17} />查看日志</button></section>
-  <section className="settings-card"><div><h3>关于鲨鱼管家</h3><p>v0.1.2 · Tauri 跨平台桌面应用 · macOS / Windows / Linux</p></div><img src={logo} alt="鲨鱼管家" /></section>
-</div> }
+type SettingsSection = 'general' | 'account' | 'service' | 'notifications' | 'data' | 'about'
+
+function SettingsPage({ quickReplyAutoSuggest, onQuickReplyAutoSuggestChange, onExport, onOpenLogs, onQrLogin }: { quickReplyAutoSuggest: boolean; onQuickReplyAutoSuggestChange: (value: boolean) => void; onExport: () => void; onOpenLogs: () => void; onQrLogin: () => void }) {
+  const [section, setSection] = useState<SettingsSection>('general')
+  const sections: Array<{ id: SettingsSection; label: string; icon: typeof Settings }> = [
+    { id: 'general', label: '通用设置', icon: Settings },
+    { id: 'account', label: '账号登录', icon: UserRound },
+    { id: 'service', label: '客服设置', icon: MessageCircle },
+    { id: 'notifications', label: '通知提醒', icon: Bell },
+    { id: 'data', label: '数据与备份', icon: Download },
+    { id: 'about', label: '系统信息', icon: CircleHelp },
+  ]
+  const title = sections.find((item) => item.id === section)?.label ?? '通用设置'
+
+  return <div className="settings-layout settings-layout-reference">
+    <aside className="settings-nav" aria-label="设置分类">
+      <div className="settings-nav-title"><span>设置管理</span></div>
+      <div className="settings-nav-list">{sections.map(({ id, label }) => <button type="button" key={id} className={section === id ? 'active' : ''} onClick={() => setSection(id)}><span>{label}</span></button>)}</div>
+      <p className="settings-nav-note"><ShieldCheck size={14} />设置仅保存在当前电脑</p>
+    </aside>
+
+    <div className="settings-main">
+      <header className="settings-main-head"><div><p>设置管理</p><h1>{title}</h1><span>本地优先，安全可控</span></div></header>
+      {section === 'general' && <>
+        <SettingsGroup title="快捷回复" description="让常用话术在客服会话中更快出现。">
+          <div className="settings-row"><div><h3>快捷回复自动联想</h3><p>输入文字时，按已有快捷回复的标题和内容显示匹配建议。</p></div><label className="settings-switch"><b>{quickReplyAutoSuggest ? '已开启' : '已关闭'}</b><input type="checkbox" checked={quickReplyAutoSuggest} onChange={(event) => onQuickReplyAutoSuggestChange(event.target.checked)} /><span aria-hidden="true" /></label></div>
+        </SettingsGroup>
+        <SettingsGroup title="本机连接器" description="账号会话、商品和订单同步均直接在鲨鱼管家中运行。">
+          <div className="settings-row"><div className="settings-row-with-icon"><span className="settings-symbol"><Store size={18} /></span><div><h3>连接服务状态</h3><p>无需额外服务器，登录后的会话将保存在本机。</p></div></div><span className="settings-status"><i />已就绪</span></div>
+        </SettingsGroup>
+      </>}
+      {section === 'account' && <SettingsGroup title="账号登录" description="通过扫码连接闲鱼账号，账号信息会加入当前工作台。"><div className="settings-row"><div className="settings-row-with-icon"><span className="settings-symbol"><UserRound size={18} /></span><div><h3>扫码登录闲鱼</h3><p>打开二维码后使用闲鱼 App 扫描，登录成功后自动保存本机会话。</p></div></div><button className="settings-action" onClick={onQrLogin}>前往扫码<ExternalLink size={15} /></button></div></SettingsGroup>}
+      {section === 'service' && <SettingsGroup title="客服偏好" description="客服工作台会根据以下设置提供辅助。"><div className="settings-row"><div className="settings-row-with-icon"><span className="settings-symbol"><MessageCircle size={18} /></span><div><h3>快捷回复自动联想</h3><p>开启后，输入内容会自动匹配已有的话术，按需选择发送。</p></div></div><label className="settings-switch"><b>{quickReplyAutoSuggest ? '已开启' : '已关闭'}</b><input type="checkbox" checked={quickReplyAutoSuggest} onChange={(event) => onQuickReplyAutoSuggestChange(event.target.checked)} /><span aria-hidden="true" /></label></div></SettingsGroup>}
+      {section === 'notifications' && <NotificationSettings />}
+      {section === 'data' && <>
+        <SettingsGroup title="本地备份" description="导出的文件可用于迁移和问题排查。"><div className="settings-row"><div className="settings-row-with-icon"><span className="settings-symbol"><Download size={18} /></span><div><h3>导出本地备份</h3><p>导出账号资料、商品和订单为 JSON 文件。</p></div></div><button className="settings-action" onClick={onExport}>导出备份<Download size={15} /></button></div></SettingsGroup>
+        <SettingsGroup title="运行记录" description="查看连接、同步和错误日志，便于定位问题。"><div className="settings-row"><div className="settings-row-with-icon"><span className="settings-symbol"><History size={18} /></span><div><h3>日志管理</h3><p>日志会自动刷新并跟随最新记录。</p></div></div><button className="settings-action" onClick={onOpenLogs}>查看日志<ExternalLink size={15} /></button></div></SettingsGroup>
+      </>}
+      {section === 'about' && <SettingsGroup title="鲨鱼管家" description="专为闲鱼商家打造的本地优先桌面工作台。"><div className="settings-about"><img src={logo} alt="鲨鱼管家" /><div><h3>鲨鱼管家</h3><p>v0.1.2 · Tauri 跨平台桌面应用</p><span>macOS / Windows / Linux</span></div></div></SettingsGroup>}
+    </div>
+  </div>
+}
+
+function SettingsGroup({ title, description, children }: { title: string; description: string; children: React.ReactNode }) { return <section className="settings-group"><header><h2>{title}</h2><p>{description}</p></header>{children}</section> }
+
+type CustomNotificationSound = { name: string; duration: number }
+
+function NotificationSettings() {
+  const [selectedSound, setSelectedSound] = useState<NotificationSoundId>(() => selectedNotificationSoundId())
+  const [customSound, setCustomSound] = useState<CustomNotificationSound | null>(() => {
+    try { return JSON.parse(localStorage.getItem(notificationCustomSoundStorageKey.replace('sound', 'meta')) || 'null') as CustomNotificationSound | null } catch { return null }
+  })
+  const [uploadError, setUploadError] = useState('')
+  const [uploading, setUploading] = useState(false)
+  const [notificationToggles, setNotificationToggles] = useState<Record<string, boolean>>(() => {
+    try { return { chat: true, order: true, system: true, offline: false, ...JSON.parse(localStorage.getItem('shark-butler-notification-toggles') || '{}') as Record<string, boolean> } } catch { return { chat: true, order: true, system: true, offline: false } }
+  })
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  const updateToggle = (key: string, value: boolean) => {
+    setNotificationToggles((current) => {
+      const next = { ...current, [key]: value }
+      localStorage.setItem('shark-butler-notification-toggles', JSON.stringify(next))
+      return next
+    })
+  }
+
+  const selectSound = (id: NotificationSoundId) => {
+    setSelectedSound(id)
+    localStorage.setItem(notificationSoundStorageKey, id)
+  }
+
+  const previewSound = async (id: NotificationSoundId) => {
+    if (id === 'custom') {
+      const dataUrl = localStorage.getItem(notificationCustomSoundStorageKey)
+      if (dataUrl) { const audio = new Audio(dataUrl); audio.volume = .85; void audio.play().catch(() => undefined); }
+      return
+    }
+    const preset = notificationSoundPresets.find((item) => item.id === id)
+    try {
+      const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+      if (!AudioContextCtor) return
+      messageNotificationContext ??= new AudioContextCtor()
+      if (messageNotificationContext.state === 'suspended') await messageNotificationContext.resume()
+      if (preset) playToneSequence(messageNotificationContext, preset.sequence)
+    } catch { /* 浏览器禁止自动播放时，用户再次点击试听即可。 */ }
+  }
+
+  const handleUpload = async (file: File | undefined) => {
+    if (!file) return
+    setUploadError(''); setUploading(true)
+    try {
+      if (!file.type.startsWith('audio/')) throw new Error('请选择音频文件。')
+      const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+      if (!AudioContextCtor) throw new Error('当前环境不支持音频解析。')
+      const context = new AudioContextCtor()
+      const decoded = await context.decodeAudioData(await file.arrayBuffer())
+      const duration = decoded.duration
+      await context.close()
+      if (duration < 1 || duration > 3) throw new Error(`音频时长为 ${duration.toFixed(1)} 秒，请上传 1～3 秒的文件。`)
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('音频读取失败。'))
+        reader.onerror = () => reject(new Error('音频读取失败。'))
+        reader.readAsDataURL(file)
+      })
+      localStorage.setItem(notificationCustomSoundStorageKey, dataUrl)
+      localStorage.setItem(notificationCustomSoundStorageKey.replace('sound', 'meta'), JSON.stringify({ name: file.name, duration }))
+      localStorage.setItem(notificationSoundStorageKey, 'custom')
+      setCustomSound({ name: file.name, duration })
+      setSelectedSound('custom')
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : '音频处理失败，请换一个文件重试。')
+    } finally {
+      setUploading(false)
+      if (fileRef.current) fileRef.current.value = ''
+    }
+  }
+
+  return <>
+    <SettingsGroup title="通知开关" description="控制店铺消息和系统状态的提示提醒。">
+      <div className="notification-toggle-list">
+        {[
+          ['聊天新消息', '收到买家消息时播放提示音。'],
+          ['订单消息', '新订单、付款和售后消息使用同一提示音。'],
+          ['系统消息', '同步完成、连接异常等系统事件提醒。'],
+          ['离线提示', '应用切到后台后仍保留消息提醒。'],
+        ].map(([label, description], index) => { const key = ['chat', 'order', 'system', 'offline'][index]; return <label className="notification-toggle" key={label}><span><b>{label}</b><small>{description}</small></span><input type="checkbox" checked={Boolean(notificationToggles[key])} onChange={(event) => updateToggle(key, event.target.checked)} /><i aria-hidden="true" /></label> })}
+      </div>
+    </SettingsGroup>
+    <SettingsGroup title="提示音" description="选择一个内置提示音，或上传 1～3 秒的自定义音频。">
+      <div className="notification-sound-groups">{notificationSoundGroups.map((group) => <section className="notification-sound-group" key={group.id}>
+        <header><div><h3>{group.label}</h3><p>{group.description}</p></div><span>{notificationSoundPresets.filter((preset) => preset.group === group.id).length} 个</span></header>
+        <div className="notification-sound-grid">{notificationSoundPresets.filter((preset) => preset.group === group.id).map((preset) => <div className={`notification-sound-card ${selectedSound === preset.id ? 'selected' : ''}`} key={preset.id}>
+          <button type="button" className="notification-sound-main" onClick={() => selectSound(preset.id)}><span className="notification-sound-icon" style={{ background: preset.accent }}><Bell size={15} /></span><span><b>{preset.name}</b><small>{preset.description} · 1～2 秒</small></span><em>{selectedSound === preset.id ? '使用中' : '选择'}</em></button>
+          <button type="button" className="notification-preview-button" onClick={() => void previewSound(preset.id)} aria-label={`试听${preset.name}`}><Send size={13} />试听</button>
+        </div>)}</div>
+      </section>)}</div>
+      <div className={`notification-custom ${selectedSound === 'custom' ? 'selected' : ''}`}>
+        <div className="notification-custom-copy"><span className="notification-sound-icon custom"><Upload size={15} /></span><div><b>{customSound?.name || '自定义音频'}</b><small>{customSound ? `${customSound.duration.toFixed(1)} 秒 · 已通过时长校验` : '支持 MP3、WAV、M4A，时长必须为 1～3 秒'}</small></div></div>
+        <div className="notification-custom-actions"><input ref={fileRef} type="file" accept="audio/*" hidden onChange={(event) => void handleUpload(event.target.files?.[0])} /><button type="button" className="settings-action" onClick={() => fileRef.current?.click()} disabled={uploading}>{uploading ? '解析中…' : '上传音频'}</button>{customSound && <button type="button" className="notification-preview-button" onClick={() => void previewSound('custom')}>试听</button>}</div>
+      </div>
+      {uploadError && <p className="notification-upload-error" role="alert">{uploadError}</p>}
+    </SettingsGroup>
+  </>
+}
 
 function PageHead({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: React.ReactNode }) { return <div className="page-head"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{description}</p></div>{action}</div> }
 function Toolbar({ account, placeholder }: { account?: Account; placeholder: string }) { return <div className="toolbar"><div className="search-field"><Search size={17} /><input placeholder={placeholder} /></div><AccountPicker account={account} /><button className="filter-button">全部状态<ChevronDown size={15} /></button></div> }
