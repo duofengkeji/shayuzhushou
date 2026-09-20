@@ -895,7 +895,18 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
             let status = if json_bool(common.get("inRefund")) {
                 "退款中".to_owned()
             } else {
-                json_string(common.get("orderStatus"))
+                [
+                    common.get("orderStatus"),
+                    common.get("orderStatusDesc"),
+                    common.get("status"),
+                    item.get("orderStatus"),
+                    item.get("orderStatusDesc"),
+                    item.get("status"),
+                ]
+                .iter()
+                .map(|value| json_string(*value))
+                .find(|value| !value.is_empty())
+                .unwrap_or_default()
             };
             let item_id = json_string(common.get("itemId"));
             let item_title = json_string(common.get("itemTitle"));

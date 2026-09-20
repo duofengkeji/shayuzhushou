@@ -32,6 +32,7 @@ export const api = {
   syncChatEmojis: (accountId: string) => invoke<ChatEmoji[]>('sync_chat_emojis', { accountId }),
   syncChatMessages: (accountId: string, chatId: string, cursor: number | null = null) => invoke<ChatMessagesPage>('sync_chat_messages', { accountId, chatId, cursor }),
   openProductDetail: (accountId: string, url: string) => invoke<void>('open_product_detail', { accountId, url }),
+  openOrderDetail: (accountId: string, orderNo: string) => invoke<void>('open_order_detail', { accountId, orderNo }),
   sendChatMessage: (accountId: string, chatId: string, receiverUserId: string, text: string) => invoke<ChatMessage>('send_chat_message', { accountId, chatId, receiverUserId, text }),
   sendChatImage: (accountId: string, chatId: string, receiverUserId: string, fileName: string, mimeType: string, imageData: string, width: number, height: number) => invoke<ChatMessage>('send_chat_image', { accountId, chatId, receiverUserId, fileName, mimeType, imageData, width, height }),
   sendChatProduct: (accountId: string, chatId: string, receiverUserId: string, itemId: string, title: string, imageUrl: string, price: number) => invoke<ChatMessage>('send_chat_product', { accountId, chatId, receiverUserId, itemId, title, imageUrl, price }),

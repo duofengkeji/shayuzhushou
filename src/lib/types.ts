@@ -47,6 +47,7 @@ export interface Order {
   id: string
   accountId: string
   orderNo: string
+  itemId: string
   productTitle: string
   buyerMaskedName: string
   amount: number
