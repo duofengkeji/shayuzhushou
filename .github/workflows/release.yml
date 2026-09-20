@@ -90,6 +90,7 @@ jobs:
           args: ${{ matrix.args }}
 
   web-release:
+    needs: prepare-release
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -101,9 +102,7 @@ jobs:
       - run: npm run build
       - name: Package web build
         run: tar -czf "shark-butler-web-${GITHUB_REF_NAME}.tar.gz" -C dist .
-      - name: Upload web build
-        uses: actions/upload-artifact@v4
-        with:
-          name: shark-butler-web-${{ github.ref_name }}
-          path: shark-butler-web-${{ github.ref_name }}.tar.gz
-          if-no-files-found: error
+      - name: Upload web build to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" "shark-butler-web-${GITHUB_REF_NAME}.tar.gz" --repo "${GITHUB_REPOSITORY}" --clobber
