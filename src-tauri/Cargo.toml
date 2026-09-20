@@ -1,6 +1,6 @@
 [package]
 name = "shark-butler"
-version = "0.1.2"
+version = "0.1.3"
 description = "鲨鱼管家桌面工作台"
 authors = ["sunKit-io"]
 edition = "2021"

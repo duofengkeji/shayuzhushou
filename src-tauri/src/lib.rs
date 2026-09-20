@@ -2180,15 +2180,6 @@ fn ingest_im_push(
             .map_err(to_error)?;
         }
     }
-    if receipt_ids > 0 {
-        append_app_log(
-            app,
-            if receipt_updates > 0 { "info" } else { "warn" },
-            "IM 回执",
-            account_id,
-            &format!("收到已读回执 {receipt_ids} 条，匹配本地消息 {receipt_updates} 条"),
-        );
-    }
     let mut inserted = 0;
     for message in &messages {
         let exists = conn
@@ -2219,6 +2210,20 @@ fn ingest_im_push(
             "INSERT INTO chat_contacts (account_id, chat_id, other_user_id, other_user_name, avatar_url, item_id, item_title, item_image_url, order_status, buyer_tag, latest_message, latest_message_time, unread_count, profile_synced_at) VALUES (?1, ?2, ?3, ?4, '', '', '', '', '', '', ?5, ?6, ?7, '') ON CONFLICT(account_id, chat_id) DO UPDATE SET other_user_id = CASE WHEN excluded.other_user_id <> '' THEN excluded.other_user_id ELSE chat_contacts.other_user_id END, other_user_name = CASE WHEN excluded.other_user_name <> '' THEN excluded.other_user_name ELSE chat_contacts.other_user_name END, latest_message = CASE WHEN excluded.latest_message_time >= chat_contacts.latest_message_time THEN excluded.latest_message ELSE chat_contacts.latest_message END, latest_message_time = CASE WHEN excluded.latest_message_time >= chat_contacts.latest_message_time THEN excluded.latest_message_time ELSE chat_contacts.latest_message_time END, unread_count = chat_contacts.unread_count + excluded.unread_count",
             params![account_id, message.chat_id, other_user_id, other_user_name, message.text, message.sent_at, unread_increment],
         ).map_err(to_error)?;
+    }
+    // `append_app_log` also uses `state.db`. Do not call it while this
+    // function still owns the non-reentrant database mutex: an IM read receipt
+    // would otherwise deadlock the listener and block every later history or
+    // message query from the UI.
+    drop(conn);
+    if receipt_ids > 0 {
+        append_app_log(
+            app,
+            if receipt_updates > 0 { "info" } else { "warn" },
+            "IM 回执",
+            account_id,
+            &format!("收到已读回执 {receipt_ids} 条，匹配本地消息 {receipt_updates} 条"),
+        );
     }
     Ok(inserted)
 }
