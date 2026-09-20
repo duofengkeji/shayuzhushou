@@ -579,6 +579,7 @@
 .trade-message-card-detail button:active { transform: translateY(1px); }
 .trade-bubble.emphasized .trade-message-card > strong { border-bottom-color: #f0d800; }
 .trade-bubble.emphasized .trade-message-card-detail span { color: #8b8000; }
+.message-row.outgoing .message-bubble.trade-bubble.emphasized + .message-receipt { color: #ff4d4f; }
 .message-bubble.product-share-bubble { width: 100%; max-width: 100%; display: flex; justify-content: flex-start; padding: 0; overflow: visible; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
 .message-row.outgoing .message-bubble.product-share-bubble { justify-self: stretch; justify-content: flex-end; border: 0; background: transparent; }
 .message-card.product-share-card { position: relative; width: min(308px, 100%); min-height: 100px; align-items: stretch; gap: 0; padding: 0; overflow: hidden; border: 0; border-radius: 0; color: inherit; background: transparent; text-align: left; }

@@ -739,6 +739,7 @@ function tradeCardMeta(message: ChatMessage): TradeCardMeta | null {
   const raw = (message.cardTitle || message.text).replace(/^\[|\]$/g, '').trim()
   if (!raw) return null
   if (systemNoticeText(message)) return null
+  if (/记得及时确认收货|提醒收货/.test(raw)) return { title: '记得及时确认收货', subtitle: message.cardSubtitle || '请仔细检查商品信息无误，再确认收货', action: '' }
   if (/快给\s*ta\s*一个评价吧/i.test(raw)) return { title: raw, subtitle: message.cardSubtitle || '说说这次的交易体验，帮助更多人', action: '去评价' }
   if (/完成了评价|期待你的评价/.test(raw)) return { title: '我完成了评价', subtitle: message.cardSubtitle || '期待你的评价', action: '查看评价' }
   if (/退款/.test(raw)) return { title: raw.includes('申请') ? raw : '我发起了退款申请', subtitle: message.cardSubtitle || '等待你处理，请确认操作', action: '去处理' }
@@ -1493,7 +1494,7 @@ function Workbench({ account, products, orders, onOrderUpdated, imConnected, qui
           const systemNotice = systemNoticeText(message)
           const tradeCard = tradeCardMeta(message)
           const evaluationPrompt = Boolean(tradeCard && /快给\s*ta\s*一个评价吧/i.test(tradeCard.title))
-          const emphasizedTradeCard = Boolean(tradeCard && (/修改价格|等待.*付款|我完成了评价/.test(tradeCard.title)))
+          const emphasizedTradeCard = Boolean(tradeCard && (/修改价格|等待.*付款|我完成了评价|记得及时确认收货/.test(tradeCard.title)))
           const senderAvatar = isOutgoing
             ? account
               ? <AccountAvatar account={account} className="message-avatar" />
