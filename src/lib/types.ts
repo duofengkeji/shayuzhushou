@@ -51,6 +51,7 @@ export interface Order {
   productTitle: string
   buyerMaskedName: string
   amount: number
+  statusCode: string
   status: string
   createdAt: string
   note: string

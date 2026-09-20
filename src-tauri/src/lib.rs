@@ -166,6 +166,7 @@ struct Order {
     product_title: String,
     buyer_masked_name: String,
     amount: f64,
+    status_code: String,
     status: String,
     created_at: String,
     note: String,
@@ -731,7 +732,7 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
           item_id TEXT NOT NULL DEFAULT '',
           buyer_id TEXT NOT NULL DEFAULT '',
           product_title TEXT NOT NULL, buyer_masked_name TEXT NOT NULL,
-          amount REAL NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, note TEXT NOT NULL
+          amount REAL NOT NULL, status_code TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at TEXT NOT NULL, note TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS sync_jobs (
           id TEXT PRIMARY KEY, account_id TEXT NOT NULL, resource TEXT NOT NULL,
@@ -816,6 +817,24 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE orders ADD COLUMN buyer_id TEXT NOT NULL DEFAULT ''",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE orders ADD COLUMN status_code TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    // One-time backfill for local records created before status_code existed.
+    // Subsequent account syncs overwrite this with the official order status ID.
+    conn.execute(
+        "UPDATE orders SET status_code = CASE
+           WHEN status IN ('待付款', '待支付') THEN 'WAIT_PAY'
+           WHEN status IN ('待发货', '待寄件', '已付款') THEN 'WAIT_SHIP'
+           WHEN status IN ('待收货', '已发货', '已寄件') THEN 'SHIPPED'
+           WHEN status = '退款中' THEN 'REFUNDING'
+           WHEN status IN ('交易关闭', '已关闭', '退款关闭') THEN 'CLOSED'
+           WHEN status IN ('交易成功', '已完成') THEN 'SUCCESS'
+           ELSE status_code END
+         WHERE status_code = ''",
+        [],
+    )?;
     let _ = conn.execute(
         "ALTER TABLE chat_contacts ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''",
         [],
@@ -1061,7 +1080,7 @@ fn list_orders(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<Order>, String> {
     let conn = state.db.lock().map_err(to_error)?;
-    let query = "SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status, created_at, note FROM orders WHERE (?1 IS NULL OR account_id = ?1) ORDER BY created_at DESC";
+    let query = "SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE (?1 IS NULL OR account_id = ?1) ORDER BY created_at DESC";
     let mut statement = conn.prepare(query).map_err(to_error)?;
     let rows = statement
         .query_map([account_id], |row| {
@@ -1073,9 +1092,10 @@ fn list_orders(
                 product_title: row.get(4)?,
                 buyer_masked_name: row.get(5)?,
                 amount: row.get(6)?,
-                status: row.get(7)?,
-                created_at: row.get(8)?,
-                note: row.get(9)?,
+                status_code: row.get(7)?,
+                status: row.get(8)?,
+                created_at: row.get(9)?,
+                note: row.get(10)?,
             })
         })
         .map_err(to_error)?;
@@ -1096,23 +1116,30 @@ fn list_related_orders(
         params![account_id, chat_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).map_err(|_| "会话不存在，请先同步会话列表".to_owned())?;
-    let mut statement = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status, created_at, note FROM orders WHERE account_id = ?1 AND (buyer_masked_name = ?2 OR (?3 <> '' AND buyer_id = ?3) OR (?4 <> '' AND item_id = ?4)) ORDER BY created_at DESC").map_err(to_error)?;
+    let mut statement = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE account_id = ?1 AND (buyer_masked_name = ?2 OR (?3 <> '' AND buyer_id = ?3) OR (?4 <> '' AND item_id = ?4)) ORDER BY created_at DESC").map_err(to_error)?;
     let rows = statement.query_map(params![account_id, buyer_name, buyer_id, item_id], |row| Ok(Order {
-        id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?, status: row.get(7)?, created_at: row.get(8)?, note: row.get(9)?,
+        id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?, status_code: row.get(7)?, status: row.get(8)?, created_at: row.get(9)?, note: row.get(10)?,
     })).map_err(to_error)?;
     let mut orders = rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?;
     if orders.is_empty() && !item_id.trim().is_empty() {
-        let mut fallback = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status, created_at, note FROM orders WHERE account_id = ?1 AND product_title LIKE ?2 ORDER BY created_at DESC").map_err(to_error)?;
+        let mut fallback = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE account_id = ?1 AND product_title LIKE ?2 ORDER BY created_at DESC").map_err(to_error)?;
         let rows = fallback.query_map(params![account_id, format!("%{}%", item_id)], |row| Ok(Order {
-            id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?, status: row.get(7)?, created_at: row.get(8)?, note: row.get(9)?,
+            id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?, status_code: row.get(7)?, status: row.get(8)?, created_at: row.get(9)?, note: row.get(10)?,
         })).map_err(to_error)?;
         orders = rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?;
     }
-    let filtered = orders.into_iter().filter(|order| match status.as_str() {
-        "全部" | "" => true,
-        "交易成功" => order.status.contains("完成") || order.status.contains("成功"),
-        "交易关闭" => order.status.contains("关闭") || order.status.contains("退款") || order.status.contains("取消"),
-        value => order.status.contains(value),
+    let filtered = orders.into_iter().filter(|order| {
+        let code = order.status_code.trim().to_ascii_uppercase();
+        match status.as_str() {
+            "ALL" | "" => true,
+            "WAIT_PAY" => matches!(code.as_str(), "WAIT_PAY" | "WAIT_BUYER_PAY" | "UNPAID"),
+            "WAIT_SHIP" => matches!(code.as_str(), "WAIT_SHIP" | "WAIT_SELLER_SEND_GOODS" | "WAIT_SEND_GOODS" | "WAIT_DELIVERY" | "PAID"),
+            "SHIPPED" => matches!(code.as_str(), "SHIPPED" | "WAIT_BUYER_CONFIRM_GOODS" | "WAIT_BUYER_CONFIRM_RECEIVE" | "WAIT_RECEIVE"),
+            "REFUNDING" => matches!(code.as_str(), "REFUNDING" | "REFUND" | "IN_REFUND"),
+            "CLOSED" => matches!(code.as_str(), "CLOSED" | "TRADE_CLOSED" | "REFUND_CLOSED" | "CANCELLED"),
+            "SUCCESS" => matches!(code.as_str(), "SUCCESS" | "TRADE_SUCCESS" | "WAIT_SELLER_RATE" | "COMPLETED"),
+            _ => false,
+        }
     }).collect();
     Ok(filtered)
 }
@@ -1456,7 +1483,7 @@ async fn ship_order_without_parcel(
     .await?;
     let conn = state.db.lock().map_err(to_error)?;
     conn.execute(
-        "UPDATE orders SET status = '待收货' WHERE account_id = ?1 AND order_no = ?2",
+        "UPDATE orders SET status_code = 'SHIPPED', status = '待收货' WHERE account_id = ?1 AND order_no = ?2",
         params![account_id, order_no],
     )
     .map_err(to_error)?;
@@ -1575,7 +1602,7 @@ async fn ship_order_with_logistics(
     .await?;
     let conn = state.db.lock().map_err(to_error)?;
     conn.execute(
-        "UPDATE orders SET status = '待收货' WHERE account_id = ?1 AND order_no = ?2",
+        "UPDATE orders SET status_code = 'SHIPPED', status = '待收货' WHERE account_id = ?1 AND order_no = ?2",
         params![account_id, order_no],
     )
     .map_err(to_error)?;
@@ -1613,7 +1640,7 @@ async fn cancel_order_by_seller(
     .await?;
     let conn = state.db.lock().map_err(to_error)?;
     conn.execute(
-        "UPDATE orders SET status = '交易关闭' WHERE account_id = ?1 AND order_no = ?2",
+        "UPDATE orders SET status_code = 'CLOSED', status = '交易关闭' WHERE account_id = ?1 AND order_no = ?2",
         params![account_id, order_no],
     )
     .map_err(to_error)?;
@@ -2898,6 +2925,7 @@ fn create_order(input: OrderInput, state: tauri::State<'_, AppState>) -> Result<
         product_title: input.product_title.trim().to_owned(),
         buyer_masked_name: input.buyer_masked_name.trim().to_owned(),
         amount: input.amount,
+        status_code: String::new(),
         status: input.status,
         created_at: now,
         note: input.note.trim().to_owned(),
@@ -2922,8 +2950,8 @@ fn update_order(
         return Err("订单不存在或已被删除".to_owned());
     }
     conn.query_row(
-        "SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status, created_at, note FROM orders WHERE id = ?1", [id],
-        |row| Ok(Order { id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?, status: row.get(7)?, created_at: row.get(8)?, note: row.get(9)? }),
+        "SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE id = ?1", [id],
+        |row| Ok(Order { id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?, status_code: row.get(7)?, status: row.get(8)?, created_at: row.get(9)?, note: row.get(10)? }),
     ).map_err(to_error)
 }
 
@@ -3005,7 +3033,7 @@ fn export_backup(state: tauri::State<'_, AppState>) -> Result<BackupData, String
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_error)?;
 
-    let mut order_statement = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status, created_at, note FROM orders ORDER BY created_at DESC").map_err(to_error)?;
+    let mut order_statement = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders ORDER BY created_at DESC").map_err(to_error)?;
     let orders = order_statement
         .query_map([], |row| {
             Ok(Order {
@@ -3016,9 +3044,10 @@ fn export_backup(state: tauri::State<'_, AppState>) -> Result<BackupData, String
                 product_title: row.get(4)?,
                 buyer_masked_name: row.get(5)?,
                 amount: row.get(6)?,
-                status: row.get(7)?,
-                created_at: row.get(8)?,
-                note: row.get(9)?,
+                status_code: row.get(7)?,
+                status: row.get(8)?,
+                created_at: row.get(9)?,
+                note: row.get(10)?,
             })
         })
         .map_err(to_error)?
@@ -3153,8 +3182,8 @@ async fn sync_account(
         let order_no = value_string(order, &["order_no", "orderNo", "order_id", "id"]);
         let id = format!("SRC-O-{}-{}", &account_id[..8], remote_id);
         orders_changed += conn.execute(
-            "INSERT INTO orders (id, account_id, order_no, item_id, buyer_id, product_title, buyer_masked_name, amount, status, created_at, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(id) DO UPDATE SET order_no = excluded.order_no, item_id = excluded.item_id, buyer_id = excluded.buyer_id, product_title = excluded.product_title, buyer_masked_name = excluded.buyer_masked_name, amount = excluded.amount, status = excluded.status, created_at = excluded.created_at, note = excluded.note",
-            params![id, account_id, order_no, value_string(order, &["item_id", "itemId"]), value_string(order, &["buyer_id", "buyerId"]), value_string(order, &["item_title", "product_title", "productTitle", "title"]), value_string(order, &["buyer_fish_nick", "buyer_nick", "buyer_nickname", "buyer_name", "buyer_id"]), value_number(order, &["actual_amount", "amount", "price", "payment"]), normalize_order_status(value_string(order, &["status", "order_status", "orderStatus", "orderStatusDesc", "statusDesc"])), value_string(order, &["created_at", "createdAt", "create_time", "createTime"]), value_string(order, &["note", "remark", "message"])],
+            "INSERT INTO orders (id, account_id, order_no, item_id, buyer_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO UPDATE SET order_no = excluded.order_no, item_id = excluded.item_id, buyer_id = excluded.buyer_id, product_title = excluded.product_title, buyer_masked_name = excluded.buyer_masked_name, amount = excluded.amount, status_code = excluded.status_code, status = excluded.status, created_at = excluded.created_at, note = excluded.note",
+            params![id, account_id, order_no, value_string(order, &["item_id", "itemId"]), value_string(order, &["buyer_id", "buyerId"]), value_string(order, &["item_title", "product_title", "productTitle", "title"]), value_string(order, &["buyer_fish_nick", "buyer_nick", "buyer_nickname", "buyer_name", "buyer_id"]), value_number(order, &["actual_amount", "amount", "price", "payment"]), value_string(order, &["status_code", "statusCode", "order_status_code"]), normalize_order_status(value_string(order, &["status", "order_status", "orderStatus", "orderStatusDesc", "statusDesc"])), value_string(order, &["created_at", "createdAt", "create_time", "createTime"]), value_string(order, &["note", "remark", "message"])],
         ).map_err(to_error)?;
     }
     conn.execute(

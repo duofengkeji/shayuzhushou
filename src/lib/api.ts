@@ -1,12 +1,22 @@
 import { invoke } from '@tauri-apps/api/core'
 import type { Account, AccountInput, AppLog, BackupData, ChatContact, ChatContactsPage, ChatEmoji, ChatMessage, ChatMessagesPage, CustomerProfile, DashboardStats, Order, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, SyncJob, SyncResult } from './types'
 
+const relatedOrderStatusIds: Record<string, string> = {
+  '全部': 'ALL',
+  '待付款': 'WAIT_PAY',
+  '待发货': 'WAIT_SHIP',
+  '已发货': 'SHIPPED',
+  '退款中': 'REFUNDING',
+  '交易关闭': 'CLOSED',
+  '交易成功': 'SUCCESS',
+}
+
 export const api = {
   dashboard: () => invoke<DashboardStats>('dashboard_stats'),
   accounts: () => invoke<Account[]>('list_accounts'),
   products: (accountId?: string) => invoke<Product[]>('list_products', { accountId }),
   orders: (accountId?: string) => invoke<Order[]>('list_orders', { accountId }),
-  relatedOrders: (accountId: string, chatId: string, status = '全部') => invoke<Order[]>('list_related_orders', { accountId, chatId, status }),
+  relatedOrders: (accountId: string, chatId: string, status = '全部') => invoke<Order[]>('list_related_orders', { accountId, chatId, status: relatedOrderStatusIds[status] ?? status }),
   createAccount: (input: AccountInput) => invoke<Account>('create_account', { input }),
   updateAccount: (id: string, input: AccountInput) => invoke<Account>('update_account', { id, input }),
   updateConversationName: (accountId: string, conversationName: string) => invoke<Account>('update_conversation_name', { accountId, conversationName }),

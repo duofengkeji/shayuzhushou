@@ -709,6 +709,28 @@ fn merchant_order_status(item: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn merchant_order_status_code(raw: &str, display: &str, in_refund: bool) -> String {
+    if in_refund { return "REFUNDING".to_owned(); }
+    let raw = raw.trim().to_ascii_uppercase();
+    match raw.as_str() {
+        "WAIT_PAY" | "WAIT_BUYER_PAY" | "UNPAID" => "WAIT_PAY".to_owned(),
+        "WAIT_SHIP" | "WAIT_SELLER_SEND_GOODS" | "WAIT_SEND_GOODS" | "WAIT_DELIVERY" | "PAID" => "WAIT_SHIP".to_owned(),
+        "SHIPPED" | "WAIT_BUYER_CONFIRM_GOODS" | "WAIT_BUYER_CONFIRM_RECEIVE" | "WAIT_RECEIVE" => "SHIPPED".to_owned(),
+        "REFUNDING" | "REFUND" | "IN_REFUND" => "REFUNDING".to_owned(),
+        "CLOSED" | "TRADE_CLOSED" | "REFUND_CLOSED" | "CANCELLED" => "CLOSED".to_owned(),
+        "SUCCESS" | "TRADE_SUCCESS" | "WAIT_SELLER_RATE" | "COMPLETED" => "SUCCESS".to_owned(),
+        _ => match display {
+            "待付款" | "待支付" => "WAIT_PAY".to_owned(),
+            "待发货" | "待寄件" | "已付款" => "WAIT_SHIP".to_owned(),
+            "已发货" | "待收货" | "已寄件" => "SHIPPED".to_owned(),
+            "退款中" => "REFUNDING".to_owned(),
+            "交易关闭" | "已关闭" | "退款关闭" => "CLOSED".to_owned(),
+            "交易成功" | "已完成" => "SUCCESS".to_owned(),
+            _ => raw,
+        },
+    }
+}
+
 pub(crate) async fn mtop_call(
     cookie: &str,
     api_name: &str,
@@ -919,7 +941,8 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
             if order_id.is_empty() {
                 continue;
             }
-            let status = if json_bool(common.get("inRefund")) {
+            let in_refund = json_bool(common.get("inRefund"));
+            let status = if in_refund {
                 "退款中".to_owned()
             } else {
                 [
@@ -937,6 +960,7 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
                 .find(|value| !value.is_empty())
                 .unwrap_or_default()
             };
+            let status_code = merchant_order_status_code(&json_string(common.get("orderStatus")), &status, in_refund);
             let item_id = [common.get("itemId"), product.get("itemId"), item.get("itemId")]
                 .iter()
                 .map(|value| json_string(*value))
@@ -957,7 +981,7 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
                 "order_id": order_id, "item_id": item_id, "item_title": if item_title.is_empty() { format!("商品 {item_id}") } else { item_title },
                 "buyer_nick": json_string(buyer.get("userNick")), "buyer_id": json_string(buyer.get("buyerId")),
                 "amount": json_string(price.get("totalPrice")), "quantity": json_i64(price.get("buyNum")).max(1),
-                "status": status, "created_at": json_string(common.get("createTime"))
+                "status_code": status_code, "status": status, "created_at": json_string(common.get("createTime"))
             }));
         }
         let next_page = module
