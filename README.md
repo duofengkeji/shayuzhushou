@@ -27,6 +27,6 @@ rustup run stable cargo check --manifest-path src-tauri/Cargo.toml
 
 ## 许可证与参考
 
-本仓库代码使用 MIT 许可证。`zhinianboke/xianyu-auto-reply` 用于产品与自动化方案参考；本地 HLSRental 项目仅作已运行链路的源码参考，鲨鱼管家不调用它的 API、数据库或配置。Tauri、React、Lucide 和 GitHub Actions 均通过各自的开源许可证引入。
+本仓库代码使用 MIT 许可证。Tauri、React、Lucide 和 GitHub Actions 均通过各自的开源许可证引入。
 
 详细方案见 [开发文档](docs/鲨鱼管家-开发文档.md)。
