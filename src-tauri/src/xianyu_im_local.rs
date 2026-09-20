@@ -564,6 +564,25 @@ pub async fn clear_red_point(
     .await
 }
 
+pub async fn set_conversation_top(
+    cookie: &str,
+    chat_id: &str,
+    pinned: bool,
+    sender: Option<&ImRequestSender>,
+) -> Result<(Value, String), String> {
+    let cid = if chat_id.contains("@goofish") { chat_id.to_owned() } else { format!("{chat_id}@goofish") };
+    request_on_account_channel(cookie, sender, "/r/Conversation/setTop", serde_json::json!([cid, pinned])).await
+}
+
+pub async fn hide_conversation(
+    cookie: &str,
+    chat_id: &str,
+    sender: Option<&ImRequestSender>,
+) -> Result<(Value, String), String> {
+    let cid = if chat_id.contains("@goofish") { chat_id.to_owned() } else { format!("{chat_id}@goofish") };
+    request_on_account_channel(cookie, sender, "/r/Conversation/hide", serde_json::json!([cid])).await
+}
+
 fn value_object(value: Option<&Value>) -> Value {
     match value {
         Some(Value::Object(map)) => Value::Object(map.clone()),
@@ -808,6 +827,86 @@ pub fn push_message_refs(value: &Value) -> Vec<(String, String)> {
         }
     }
     refs
+}
+
+/// `/s/para` is the seller IM "typing" push. It does not contain a normal
+/// message model, but it does carry the conversation cid. Keep this parser
+/// deliberately tolerant because the gateway has returned both plain JSON
+/// objects and numeric MessagePack maps for this push.
+pub fn parse_typing_push_chat_ids(value: &Value) -> Vec<String> {
+    if value.get("lwp").and_then(Value::as_str) != Some("/s/para") {
+        return Vec::new();
+    }
+    let mut roots = vec![value.clone()];
+    if let Some(items) = value.pointer("/body/syncPushPackage/data").and_then(Value::as_array) {
+        for item in items {
+            if let Some(raw) = item.get("data").and_then(Value::as_str) {
+                if let Some(decoded) = decode_push_payload(raw) {
+                    roots.push(decoded);
+                }
+            }
+        }
+    }
+    collect_typing_push_payloads(value, &mut roots);
+    let mut ids = Vec::new();
+    for root in roots {
+        collect_typing_chat_ids(&root, &mut ids);
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn collect_typing_push_payloads(value: &Value, roots: &mut Vec<Value>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(raw) = map.get("data").and_then(Value::as_str) {
+                if let Some(decoded) = decode_push_payload(raw) {
+                    roots.push(decoded);
+                }
+            }
+            for child in map.values() {
+                collect_typing_push_payloads(child, roots);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_typing_push_payloads(item, roots);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_typing_chat_ids(value: &Value, ids: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for key in ["cid", "chatId", "chat_id", "conversationId", "conversation_id", "conversationCid", "conversation_cid"] {
+                if let Some(raw) = map.get(key).and_then(Value::as_str) {
+                    let chat_id = raw.trim().trim_end_matches("@goofish");
+                    if !chat_id.is_empty() {
+                        ids.push(chat_id.to_owned());
+                    }
+                }
+            }
+            // Numeric MessagePack schemas use field 1 for the conversation cid.
+            if let Some(raw) = map.get("1").and_then(Value::as_str) {
+                let chat_id = raw.trim().trim_end_matches("@goofish");
+                if !chat_id.is_empty() {
+                    ids.push(chat_id.to_owned());
+                }
+            }
+            for child in map.values() {
+                collect_typing_chat_ids(child, ids);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_typing_chat_ids(item, ids);
+            }
+        }
+        _ => {}
+    }
 }
 
 trait StringFallback {
@@ -1285,7 +1384,7 @@ fn payload_text(payload: &Value, fallback: &str) -> (String, String) {
             2 => "image",
             4 => "location",
             5 => "video",
-            12 | 25 | 26 => "product",
+            7 | 12 | 25 | 26 => "product",
             _ => "text",
         }
     };
@@ -1326,6 +1425,8 @@ fn payload_media_url(payload: &Value) -> String {
         .or_else(|| payload.pointer("/itemCard/itemPic"))
         .or_else(|| payload.pointer("/itemCard/picUrl"))
         .or_else(|| payload.pointer("/itemCard/coverUrl"))
+        .or_else(|| payload.pointer("/itemCard/item/mainPic"))
+        .or_else(|| payload.pointer("/itemCard/item/mainPicUrl"))
         .or_else(|| payload.pointer("/imageCard/imageUrl"))
         .or_else(|| payload.pointer("/imageCard/image"))
         .or_else(|| payload.pointer("/dxCard/item/main/exContent/imageUrl"))
@@ -1361,7 +1462,7 @@ fn payload_card(payload: &Value, kind: &str) -> (String, String, String) {
         return (String::new(), String::new(), String::new());
     }
     let title = payload_value(payload, &[
-        "/itemCard/title", "/itemCard/itemTitle", "/itemCard/name",
+        "/itemCard/title", "/itemCard/itemTitle", "/itemCard/name", "/itemCard/item/title",
         "/imageCard/title", "/textCard/title",
         "/dxCard/item/main/exContent/title", "/dxCard/item/main/title", "/title",
     ]);
@@ -1371,7 +1472,7 @@ fn payload_card(payload: &Value, kind: &str) -> (String, String, String) {
         "/dxCard/item/main/exContent/desc", "/dxCard/item/main/exContent/subTitle", "/subtitle",
     ]);
     let price = payload_value(payload, &[
-        "/itemCard/price", "/itemCard/priceText", "/itemCard/priceDesc",
+        "/itemCard/price", "/itemCard/priceText", "/itemCard/priceDesc", "/itemCard/item/price",
         "/dxCard/item/main/exContent/price", "/dxCard/item/main/exContent/priceText", "/price",
     ]);
     (
@@ -1393,7 +1494,16 @@ fn payload_target_url(payload: &Value) -> String {
     if !direct.is_empty() {
         return direct;
     }
-    find_string(payload, &["targetUrl", "actionUrl", "jumpUrl", "linkUrl", "itemUrl"])
+    let fallback = find_string(payload, &["targetUrl", "actionUrl", "jumpUrl", "linkUrl", "itemUrl"]);
+    if !fallback.is_empty() {
+        return fallback;
+    }
+    let item_id = payload_value(payload, &["/itemCard/item/itemId", "/itemCard/itemId", "/itemId"]);
+    if item_id.is_empty() {
+        String::new()
+    } else {
+        format!("https://www.goofish.com/item?id={item_id}")
+    }
 }
 
 fn millis_rfc3339(value: i64) -> String {
@@ -1892,6 +2002,74 @@ pub async fn send_text(
     ))
 }
 
+pub async fn send_product(
+    account_id: &str,
+    chat_id: &str,
+    receiver_user_id: &str,
+    cookie: &str,
+    item_id: &str,
+    title: &str,
+    image_url: &str,
+    price: f64,
+    sender: Option<&ImRequestSender>,
+) -> Result<(ChatMessage, String), String> {
+    let item_id = item_id.trim();
+    let title = title.trim();
+    if item_id.is_empty() || title.is_empty() {
+        return Err("商品缺少闲鱼商品 ID 或标题，请先同步商品".to_owned());
+    }
+    let own_id = cookie_value(cookie, &["unb", "munb"]);
+    let full_chat_id = if chat_id.contains("@goofish") { chat_id.to_owned() } else { format!("{chat_id}@goofish") };
+    let full_receiver = if receiver_user_id.contains("@goofish") { receiver_user_id.to_owned() } else { format!("{receiver_user_id}@goofish") };
+    let full_self = if own_id.contains("@goofish") { own_id } else { format!("{own_id}@goofish") };
+    // The web seller uses a negative, timestamp-shaped UUID for item cards.
+    // Matching it avoids the stricter validation applied to content type 7.
+    let uuid = format!("-{}0", chrono::Utc::now().timestamp_millis());
+    let price_text = format!("¥{price:.2}");
+    // This is the same card payload emitted by the official seller workbench.
+    let payload = serde_json::json!({
+        "contentType": 7,
+        "itemCard": {
+            "item": {
+                "itemId": item_id,
+                "mainPic": image_url.trim(),
+                "price": price_text,
+                "title": title,
+            },
+            "itemTip": "商品详情",
+        }
+    });
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload.to_string().as_bytes());
+    let (response, renewed_cookie) = request_on_account_channel(cookie, sender, "/r/MessageSend/sendByReceiverScope", serde_json::json!([
+        { "uuid": uuid, "cid": full_chat_id, "conversationType": 1, "content": { "contentType": 101, "custom": { "type": 7, "data": encoded } }, "redPointPolicy": 0, "extension": { "extJson": "{}" }, "ctx": { "appVersion": "1.0", "platform": "web" }, "mtags": {}, "msgReadStatusSetting": 1 },
+        { "actualReceivers": [full_self.clone(), full_receiver] }
+    ])).await?;
+    if response.get("code").and_then(Value::as_i64).unwrap_or(200) != 200 {
+        return Err(rejected_send_error("商品", &response));
+    }
+    if let Some(reason) = response.pointer("/body/reason").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+        return Err(reason.to_owned());
+    }
+    Ok((ChatMessage {
+        id: sent_message_id(&response, &uuid),
+        account_id: account_id.to_owned(),
+        chat_id: chat_id.trim_end_matches("@goofish").to_owned(),
+        sender_user_id: full_self.trim_end_matches("@goofish").to_owned(),
+        sender_user_name: "我".to_owned(),
+        direction: "outgoing".to_owned(),
+        content_kind: "product".to_owned(),
+        text: format!("[链接]{title}"),
+        media_url: image_url.trim().to_owned(),
+        sent_at: chrono::Utc::now().to_rfc3339(),
+        send_status: "sent".to_owned(),
+        read_status: "unread".to_owned(),
+        card_title: title.to_owned(),
+        card_subtitle: String::new(),
+        card_price: price_text,
+        target_url: format!("https://www.goofish.com/item?id={item_id}"),
+    }, renewed_cookie))
+}
+
 fn find_http_url(value: &Value) -> Option<String> {
     match value {
         Value::String(text) if text.starts_with("http://") || text.starts_with("https://") => {
@@ -2031,7 +2209,7 @@ pub async fn send_image(
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;
-    use super::{ack_message, decode_push_payload, device_id, official_session_order_status, parse_chat_message, parse_contact, parse_fetched_user_info, parse_push_messages, parse_push_read_receipts, push_message_refs};
+    use super::{ack_message, decode_push_payload, device_id, official_session_order_status, parse_chat_message, parse_contact, parse_fetched_user_info, parse_push_messages, parse_push_read_receipts, parse_typing_push_chat_ids, push_message_refs};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -2120,13 +2298,13 @@ mod tests {
             "message": {
                 "messageId": "product-1",
                 "extension": { "senderUserId": "seller@goofish", "reminderTitle": "卖家" },
-                "content": { "custom": { "data": "{\"contentType\":12,\"itemCard\":{\"itemTitle\":\"官方商品\",\"desc\":\"限时在售\",\"price\":\"69.00\",\"itemPic\":\"https://img.alicdn.com/item.png\",\"actionUrl\":\"https://www.goofish.com/item?id=123\"}}" } }
+                "content": { "custom": { "data": "{\"contentType\":7,\"itemCard\":{\"item\":{\"itemId\":\"123\",\"mainPic\":\"https://img.alicdn.com/item.png\",\"price\":\"¥69.00\",\"title\":\"官方商品\"},\"itemTip\":\"商品详情\"}}" } }
             }
         });
         let parsed = parse_chat_message(&product, "account", "buyer", "seller").expect("product");
         assert_eq!(parsed.content_kind, "product");
         assert_eq!(parsed.card_title, "官方商品");
-        assert_eq!(parsed.card_price, "69.00");
+        assert_eq!(parsed.card_price, "¥69.00");
         assert_eq!(parsed.media_url, "https://img.alicdn.com/item.png");
         assert_eq!(parsed.target_url, "https://www.goofish.com/item?id=123");
 
@@ -2243,6 +2421,35 @@ mod tests {
         assert_eq!(messages[0].chat_id, "2654721200");
         assert_eq!(messages[0].text, "实时消息");
         assert_eq!(messages[0].direction, "incoming");
+    }
+
+    #[test]
+    fn finds_conversation_from_typing_push() {
+        let push = json!({
+            "lwp": "/s/para",
+            "body": { "cid": "2654721200@goofish", "userId": "seller" }
+        });
+        assert_eq!(parse_typing_push_chat_ids(&push), vec!["2654721200"]);
+    }
+
+    #[test]
+    fn finds_conversation_from_numeric_typing_push_payload() {
+        let push = json!({
+            "lwp": "/s/para",
+            "body": { "syncPushPackage": { "data": [{
+                "data": base64::engine::general_purpose::STANDARD.encode(r#"{"1":"2654721200@goofish","2":"typing"}"#)
+            }] } }
+        });
+        assert_eq!(parse_typing_push_chat_ids(&push), vec!["2654721200"]);
+    }
+
+    #[test]
+    fn finds_conversation_from_direct_typing_data_payload() {
+        let push = json!({
+            "lwp": "/s/para",
+            "body": { "data": base64::engine::general_purpose::STANDARD.encode(r#"{"conversationId":"2654721200@goofish","command":0}"#) }
+        });
+        assert_eq!(parse_typing_push_chat_ids(&push), vec!["2654721200"]);
     }
 
     #[test]

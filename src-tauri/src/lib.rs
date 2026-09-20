@@ -1071,6 +1071,41 @@ fn list_orders(
 }
 
 #[tauri::command]
+fn list_related_orders(
+    account_id: String,
+    chat_id: String,
+    status: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Order>, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    ensure_account_exists(&conn, &account_id)?;
+    let (buyer_name, item_id): (String, String) = conn.query_row(
+        "SELECT other_user_name, item_id FROM chat_contacts WHERE account_id = ?1 AND chat_id = ?2",
+        params![account_id, chat_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|_| "会话不存在，请先同步会话列表".to_owned())?;
+    let mut statement = conn.prepare("SELECT id, account_id, order_no, product_title, buyer_masked_name, amount, status, created_at, note FROM orders WHERE account_id = ?1 AND buyer_masked_name = ?2 ORDER BY created_at DESC").map_err(to_error)?;
+    let rows = statement.query_map(params![account_id, buyer_name], |row| Ok(Order {
+        id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, product_title: row.get(3)?, buyer_masked_name: row.get(4)?, amount: row.get(5)?, status: row.get(6)?, created_at: row.get(7)?, note: row.get(8)?,
+    })).map_err(to_error)?;
+    let mut orders = rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?;
+    if orders.is_empty() && !item_id.trim().is_empty() {
+        let mut fallback = conn.prepare("SELECT id, account_id, order_no, product_title, buyer_masked_name, amount, status, created_at, note FROM orders WHERE account_id = ?1 AND product_title LIKE ?2 ORDER BY created_at DESC").map_err(to_error)?;
+        let rows = fallback.query_map(params![account_id, format!("%{}%", item_id)], |row| Ok(Order {
+            id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, product_title: row.get(3)?, buyer_masked_name: row.get(4)?, amount: row.get(5)?, status: row.get(6)?, created_at: row.get(7)?, note: row.get(8)?,
+        })).map_err(to_error)?;
+        orders = rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?;
+    }
+    let filtered = orders.into_iter().filter(|order| match status.as_str() {
+        "全部" | "" => true,
+        "交易成功" => order.status.contains("完成") || order.status.contains("成功"),
+        "交易关闭" => order.status.contains("关闭") || order.status.contains("退款") || order.status.contains("取消"),
+        value => order.status.contains(value),
+    }).collect();
+    Ok(filtered)
+}
+
+#[tauri::command]
 fn dashboard_stats(state: tauri::State<'_, AppState>) -> Result<DashboardStats, String> {
     let conn = state.db.lock().map_err(to_error)?;
     let count = |sql: &str| {
@@ -1781,9 +1816,15 @@ async fn start_chat_listener(
                 update_im_status(&connected_app, &connected_account_id, "connected", "闲鱼 IM 已连接");
             }, move |value| {
                 let message_refs = xianyu_im_local::push_message_refs(value);
+                let typing_chat_ids = xianyu_im_local::parse_typing_push_chat_ids(value);
                 let requires_sync = !message_refs.is_empty();
-                let chat_id = message_refs.first().map(|(chat_id, _)| chat_id.clone()).unwrap_or_default();
+                let chat_id = message_refs.first().map(|(chat_id, _)| chat_id.clone()).or_else(|| typing_chat_ids.first().cloned()).unwrap_or_default();
                 let _ = ingest_im_push(&push_app, &push_account_id, &push_cookie, value);
+                if !typing_chat_ids.is_empty() {
+                    if let Ok(read_refs) = mark_typing_chats_read(&push_app, &push_account_id, &typing_chat_ids) {
+                        schedule_typing_readback(&push_app, &push_account_id, &push_cookie, read_refs);
+                    }
+                }
                 let _ = push_app.emit(
                     "chat-im-event",
                     ChatImEvent { account_id: push_account_id.clone(), requires_sync, chat_id },
@@ -1889,6 +1930,72 @@ fn set_chat_read(conn: &Connection, account_id: &str, chat_id: &str) -> Result<(
     Ok(())
 }
 
+fn mark_typing_chats_read(
+    app: &tauri::AppHandle,
+    account_id: &str,
+    chat_ids: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "应用状态尚未初始化".to_owned())?;
+    let conn = state.db.lock().map_err(to_error)?;
+    let mut refs = Vec::new();
+    for chat_id in chat_ids {
+        let unread_count = conn
+            .query_row(
+                "SELECT unread_count FROM chat_contacts WHERE account_id = ?1 AND chat_id = ?2",
+                params![account_id, chat_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or_default();
+        let unread_messages = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chat_messages WHERE account_id = ?1 AND chat_id = ?2 AND read_status <> 'read'",
+                params![account_id, chat_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or_default();
+        let message_id = conn
+            .query_row(
+                "SELECT id FROM chat_messages WHERE account_id = ?1 AND chat_id = ?2 ORDER BY sent_at DESC LIMIT 1",
+                params![account_id, chat_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_default();
+        set_chat_read(&conn, account_id, chat_id)?;
+        conn.execute(
+            "UPDATE chat_messages SET read_status = 'read' WHERE account_id = ?1 AND chat_id = ?2",
+            params![account_id, chat_id],
+        )
+        .map_err(to_error)?;
+        if !message_id.is_empty() && (unread_count > 0 || unread_messages > 0) {
+            refs.push((chat_id.clone(), message_id));
+        }
+    }
+    Ok(refs)
+}
+
+fn schedule_typing_readback(
+    app: &tauri::AppHandle,
+    account_id: &str,
+    cookie: &str,
+    refs: Vec<(String, String)>,
+) {
+    for (chat_id, message_id) in refs {
+        let app = app.clone();
+        let account_id = account_id.to_owned();
+        let cookie = cookie.to_owned();
+        tauri::async_runtime::spawn(async move {
+            let Some(state) = app.try_state::<AppState>() else { return };
+            let Ok(sender) = account_im_sender(&state, &account_id) else { return };
+            let Ok((_, renewed_cookie)) = xianyu_im_local::clear_red_point(&cookie, &chat_id, &message_id, sender.as_ref()).await else { return };
+            if let Ok(conn) = state.db.lock() {
+                let _ = save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key);
+            };
+        });
+    }
+}
+
 #[tauri::command]
 async fn mark_chat_read(
     account_id: String,
@@ -1919,6 +2026,51 @@ async fn mark_chat_read(
             let _ = save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key);
         }
     }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_chat_pinned(
+    account_id: String,
+    chat_id: String,
+    pinned: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    let sender = account_im_sender(&state, &account_id)?;
+    let (response, renewed_cookie) = xianyu_im_local::set_conversation_top(&cookie, &chat_id, pinned, sender.as_ref()).await?;
+    if response.get("code").and_then(Value::as_i64).unwrap_or(200) != 200 {
+        return Err("闲鱼置顶会话失败".to_owned());
+    }
+    let conn = state.db.lock().map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_chat_conversation(
+    account_id: String,
+    chat_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    let sender = account_im_sender(&state, &account_id)?;
+    let (response, renewed_cookie) = xianyu_im_local::hide_conversation(&cookie, &chat_id, sender.as_ref()).await?;
+    if response.get("code").and_then(Value::as_i64).unwrap_or(200) != 200 {
+        return Err("闲鱼删除会话失败".to_owned());
+    }
+    let conn = state.db.lock().map_err(to_error)?;
+    conn.execute("DELETE FROM chat_messages WHERE account_id = ?1 AND chat_id = ?2", params![account_id, chat_id]).map_err(to_error)?;
+    conn.execute("DELETE FROM chat_contacts WHERE account_id = ?1 AND chat_id = ?2", params![account_id, chat_id]).map_err(to_error)?;
+    conn.execute("DELETE FROM chat_read_state WHERE account_id = ?1 AND chat_id = ?2", params![account_id, chat_id]).map_err(to_error)?;
+    conn.execute("DELETE FROM customer_remarks WHERE account_id = ?1 AND chat_id = ?2", params![account_id, chat_id]).map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
     Ok(())
 }
 
@@ -2336,6 +2488,36 @@ async fn send_chat_image(
         sender.as_ref(),
     )
     .await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    upsert_chat_message(&conn, &message)?;
+    conn.execute("UPDATE chat_contacts SET latest_message = ?1, latest_message_time = ?2 WHERE account_id = ?3 AND chat_id = ?4", params![message.text, message.sent_at, account_id, chat_id]).map_err(to_error)?;
+    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    Ok(message)
+}
+
+#[tauri::command]
+async fn send_chat_product(
+    account_id: String,
+    chat_id: String,
+    receiver_user_id: String,
+    item_id: String,
+    title: String,
+    image_url: String,
+    price: f64,
+    state: tauri::State<'_, AppState>,
+) -> Result<xianyu_im_local::ChatMessage, String> {
+    if chat_id.trim().is_empty() || receiver_user_id.trim().is_empty() {
+        return Err("会话或收件人信息不完整".to_owned());
+    }
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        local_session(&conn, &account_id, &state.secret_key)?
+    };
+    let sender = account_im_sender(&state, &account_id)?;
+    let (message, renewed_cookie) = xianyu_im_local::send_product(
+        &account_id, &chat_id, &receiver_user_id, &cookie, &item_id, &title,
+        &image_url, price, sender.as_ref(),
+    ).await?;
     let conn = state.db.lock().map_err(to_error)?;
     upsert_chat_message(&conn, &message)?;
     conn.execute("UPDATE chat_contacts SET latest_message = ?1, latest_message_time = ?2 WHERE account_id = ?3 AND chat_id = ?4", params![message.text, message.sent_at, account_id, chat_id]).map_err(to_error)?;
@@ -2811,6 +2993,7 @@ pub fn run() {
             update_conversation_name,
             list_products,
             list_orders,
+            list_related_orders,
             dashboard_stats,
             list_sync_jobs,
             create_account,
@@ -2829,6 +3012,8 @@ pub fn run() {
             stop_chat_listener,
             sync_chat_contacts,
             mark_chat_read,
+            set_chat_pinned,
+            delete_chat_conversation,
             list_chat_messages,
             list_chat_emojis,
             sync_chat_emojis,
@@ -2836,6 +3021,7 @@ pub fn run() {
             open_product_detail,
             send_chat_message,
             send_chat_image,
+            send_chat_product,
             list_quick_replies,
             create_quick_reply,
             update_quick_reply,

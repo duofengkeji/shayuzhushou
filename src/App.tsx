@@ -3,9 +3,9 @@ import { createPortal } from 'react-dom'
 import { listen } from '@tauri-apps/api/event'
 import { isTauri } from '@tauri-apps/api/core'
 import {
-  Bell, CheckCircle2, ChevronDown, CircleHelp, ClipboardList, Download, ExternalLink,
+  Bell, CheckCircle2, ChevronDown, CircleHelp, Clipboard, ClipboardList, Download, ExternalLink,
   History, Image as ImageIcon, LayoutDashboard, LogIn, MessageCircle, Package, Pencil,
-  Plus, RefreshCw, Search, Send, Settings, ShieldCheck, ShoppingBag, Smile,
+  Pin, Plus, RefreshCw, Search, Send, Settings, ShieldCheck, ShoppingBag, Smile,
   Store, Trash2, UserRound, UsersRound, Upload, X, Zap, ListPlus,
 } from 'lucide-react'
 import logo from './assets/shark-butler-logo.png'
@@ -34,6 +34,30 @@ const nav: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
 function formatDate(value: string) {
   if (!value) return '—'
   return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value))
+}
+
+async function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value)
+    return
+  }
+  const input = document.createElement('textarea')
+  input.value = value
+  input.style.position = 'fixed'
+  input.style.opacity = '0'
+  document.body.appendChild(input)
+  input.select()
+  document.execCommand('copy')
+  input.remove()
+}
+
+async function copyOrderNumber(value: string) {
+  try {
+    await copyText(value)
+    window.dispatchEvent(new CustomEvent('app-notice', { detail: '复制成功' }))
+  } catch {
+    window.dispatchEvent(new CustomEvent('app-notice', { detail: '复制失败，请重试' }))
+  }
 }
 
 function formatEventTime(value: string) {
@@ -346,6 +370,21 @@ function MainApp() {
     return () => window.clearTimeout(timer)
   }, [notice])
 
+  useEffect(() => {
+    const handleNotice = (event: Event) => {
+      const message = (event as CustomEvent<string>).detail
+      if (message) setNotice(message)
+    }
+    window.addEventListener('app-notice', handleNotice)
+    return () => window.removeEventListener('app-notice', handleNotice)
+  }, [])
+
+  useEffect(() => {
+    const disableBrowserMenu = (event: MouseEvent) => event.preventDefault()
+    document.addEventListener('contextmenu', disableBrowserMenu)
+    return () => document.removeEventListener('contextmenu', disableBrowserMenu)
+  }, [])
+
   const filteredProducts = useMemo(() => accountId ? products.filter((item) => item.accountId === accountId) : products, [products, accountId])
   const filteredOrders = useMemo(() => accountId ? orders.filter((item) => item.accountId === accountId) : orders, [orders, accountId])
   const globalUnreadCount = Object.values(unreadTotals).reduce((total, count) => total + Math.max(0, count), 0)
@@ -482,7 +521,7 @@ function MainApp() {
 
         <div className={`content ${page === 'workbench' ? 'workbench-content' : ''} ${page === 'settings' ? 'settings-content' : ''}`}>
           {loading ? <Loading /> : page === 'dashboard' ? <Dashboard stats={stats} accounts={accounts} orders={orders} onGo={setPage} />
-            : page === 'workbench' ? <Workbench key={activeAccount?.id ?? 'empty'} account={activeAccount} products={products} imConnected={Boolean(activeAccount?.remoteAccountId)} quickReplyAutoSuggest={quickReplyAutoSuggest} onUnreadChanged={refreshUnreadTotals} onChatRead={handleChatRead} unreadJumpRequest={unreadJumpRequest} />
+            : page === 'workbench' ? <Workbench key={activeAccount?.id ?? 'empty'} account={activeAccount} products={products} orders={orders} onOrderUpdated={() => void refresh()} imConnected={Boolean(activeAccount?.remoteAccountId)} quickReplyAutoSuggest={quickReplyAutoSuggest} onUnreadChanged={refreshUnreadTotals} onChatRead={handleChatRead} unreadJumpRequest={unreadJumpRequest} />
               : page === 'accounts' ? <Accounts accounts={accounts} syncJobs={syncJobs} imStatuses={imStatuses} onQrLogin={() => setDialog({ kind: 'qr' })} onEdit={(value) => setDialog({ kind: 'account', value })} onDelete={(value) => setDialog({ kind: 'delete-account', value })} onSync={(account) => void syncAccount(account)} onSetStatus={(ids, status) => void setAccountsStatus(ids, status)} />
                 : page === 'products' ? <Products items={filteredProducts} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, action) => void bulkProducts(ids, action)} onAdd={() => setDialog({ kind: 'product' })} onEdit={(value) => setDialog({ kind: 'product', value })} onDelete={(id) => void remove('product', id)} />
                   : page === 'orders' ? <Orders items={filteredOrders} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, status) => void bulkOrders(ids, status)} onAdd={() => setDialog({ kind: 'order' })} onEdit={(value) => setDialog({ kind: 'order', value })} onDelete={(id) => void remove('order', id)} />
@@ -643,6 +682,25 @@ function OrderDialog({ accounts, selectedAccountId, value, onClose, onSave }: { 
   return <Modal title={value ? `处理订单 ${value.orderNo}` : '录入订单'} onClose={onClose}><form className="form-grid" onSubmit={(event) => { event.preventDefault(); onSave({ accountId, productTitle, buyerMaskedName, amount: Number(amount), status, note }, value) }}><label>所属账号<select disabled={Boolean(value)} required value={accountId} onChange={(event) => setAccountId(event.target.value)}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.displayName}</option>)}</select></label><label>商品名称<input disabled={Boolean(value)} required autoFocus value={productTitle} onChange={(event) => setProductTitle(event.target.value)} /></label><div className="form-row"><label>买家标识<input disabled={Boolean(value)} required value={buyerMaskedName} onChange={(event) => setBuyerMaskedName(event.target.value)} placeholder="例如：张**" /></label><label>订单金额（元）<input disabled={Boolean(value)} required min="0" step="0.01" type="number" value={amount} onChange={(event) => setAmount(event.target.value)} /></label></div><label>订单状态<select value={status} onChange={(event) => setStatus(event.target.value)}><option>待付款</option><option>待发货</option><option>待收货</option><option>已完成</option><option>退款中</option><option>已退款</option><option>已关闭</option></select></label><label>内部备注<textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="仅保存在本机" rows={3} /></label><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存订单</button></div></form></Modal>
 }
 
+function OrderDetailModal({ order, product, onClose }: { order: Order; product?: Product; onClose: () => void }) {
+  const meta = orderStatusMeta(order.status)
+  const detailDate = order.createdAt ? new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(order.createdAt)) : '—'
+  const timeline = [
+    { label: '已拍下', done: true },
+    { label: '已付款', done: meta.success || meta.refunded || /待发货|待收货|已完成/.test(order.status) },
+    { label: '已发货', done: meta.success || meta.refunded || /待收货/.test(order.status) },
+    { label: meta.success ? '交易成功' : meta.refunded ? '交易关闭' : '交易完成', done: meta.success || meta.refunded },
+    { label: '已评价', done: false },
+  ]
+  return <div className="order-detail-drawer-backdrop" role="presentation" onMouseDown={onClose}><aside className="order-detail-drawer" role="dialog" aria-modal="true" aria-label="订单详情" onMouseDown={(event) => event.stopPropagation()}><header><div><span>订单详情</span><small>订单编号 {order.orderNo}</small></div><button className="icon-button" onClick={onClose}>×</button></header><div className="order-detail-modal">
+    {!meta.closed && <div className="order-detail-progress" aria-label="订单进度">{timeline.map((step, index) => <div className={`order-detail-step ${step.done ? 'done' : ''}`} key={step.label}><span className="order-detail-step-dot">{step.done ? '✓' : index + 1}</span><strong>{step.label}</strong><small>{step.done ? detailDate : '—'}</small>{index < timeline.length - 1 && <i />}</div>)}</div>}
+    <section className={`order-detail-summary ${meta.closed ? 'closed' : ''}`}><h3>{meta.label}</h3>{meta.closed && <p className="order-detail-status-desc">{meta.refunded ? '退款成功' : '买家取消了订单'}</p>}{meta.success && <div className="order-detail-actions"><button type="button" className="primary">查看评价</button><button type="button" className="secondary">查看钱款</button></div>}<div className="order-detail-note"><span>备注：{order.note || '暂无'}</span><button type="button" onClick={() => void copyOrderNumber(order.orderNo)}><Clipboard size={13} />复制订单号</button></div></section>
+    <section className="order-detail-section"><h4>订单信息</h4><div className="order-detail-info-grid"><div><h5>交易信息</h5><dl><div><dt>订单编号</dt><dd>{order.orderNo} <button type="button" onClick={() => void copyOrderNumber(order.orderNo)} title="复制订单编号"><Clipboard size={12} /></button></dd></div>{meta.closed ? <><div><dt>支付宝交易号</dt><dd>—</dd></div><div><dt>下单时间</dt><dd>{detailDate}</dd></div><div><dt>交易关闭时间</dt><dd>{detailDate}</dd></div></> : <><div><dt>下单时间</dt><dd>{detailDate}</dd></div><div><dt>付款时间</dt><dd>{meta.success || meta.refunded ? detailDate : '—'}</dd></div><div><dt>发货时间</dt><dd>{meta.success || meta.refunded ? detailDate : '—'}</dd></div><div><dt>成交时间</dt><dd>{meta.success ? detailDate : '—'}</dd></div></>}</dl></div><div><h5>买家信息</h5><dl><div><dt>买家昵称</dt><dd>{order.buyerMaskedName || '—'}</dd></div><div><dt>收货信息</dt><dd>已隐藏</dd></div></dl></div></div></section>
+    <section className="order-detail-section"><h4>商品信息</h4><div className="order-detail-product-table"><div className="order-detail-product-head"><span>商品信息</span><span>单价/数量</span><span>优惠</span></div><div className="order-detail-product-row"><span className="related-order-image">{product?.imageUrl ? <img src={displayImageUrl(product.imageUrl)} alt="" /> : <Package size={22} />}</span><div className="order-detail-product-name"><strong>{product?.title || order.productTitle || '未命名商品'}</strong><small>规格：一天</small></div><div className="order-detail-product-price"><b>¥{(product?.price ?? order.amount).toFixed(2)}</b><span>×1</span></div><span>—</span></div><div className="order-detail-totals"><div><span>成交价</span><b>¥{order.amount.toFixed(2)}</b></div><div><span>软件服务费</span><b>-¥0.03</b></div><div><span>预计到手</span><b className="price">¥{Math.max(0, order.amount - 0.03).toFixed(2)}</b></div></div></div></section>
+    <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>关闭</button></div>
+  </div></aside></div>
+}
+
 function MessageText({ text, emojis }: { text: string; emojis: ChatEmoji[] }) {
   const emojiByAlias = useMemo(() => new Map(emojis.map((emoji) => [emoji.iconAlias, emoji.iconUrl])), [emojis])
   const parts = text.split(/(\[[^\]\r\n]{1,40}\])/g)
@@ -739,7 +797,7 @@ function VirtualProductDetail({ url, onClose }: { url: string; onClose: () => vo
   </div>
 }
 
-function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUnreadChanged, onChatRead, unreadJumpRequest }: { account?: Account; products: Product[]; imConnected: boolean; quickReplyAutoSuggest: boolean; onUnreadChanged: () => Promise<void>; onChatRead: (accountId: string, chatId: string, unreadCount: number) => void; unreadJumpRequest: { accountId: string; chatId: string; nonce: number } }) {
+function Workbench({ account, products, orders, onOrderUpdated, imConnected, quickReplyAutoSuggest, onUnreadChanged, onChatRead, unreadJumpRequest }: { account?: Account; products: Product[]; orders: Order[]; onOrderUpdated: () => void; imConnected: boolean; quickReplyAutoSuggest: boolean; onUnreadChanged: () => Promise<void>; onChatRead: (accountId: string, chatId: string, unreadCount: number) => void; unreadJumpRequest: { accountId: string; chatId: string; nonce: number } }) {
   const CONTACT_BATCH = 30
   const MESSAGE_BATCH = 50
   const [contacts, setContacts] = useState<ChatContact[]>([])
@@ -747,6 +805,8 @@ function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUn
   const [selectedId, setSelectedId] = useState('')
   const [query, setQuery] = useState('')
   const [conversationStatus, setConversationStatus] = useState('全部')
+  const [pinnedChatIds, setPinnedChatIds] = useState<string[]>([])
+  const [conversationMenu, setConversationMenu] = useState<{ contact: ChatContact; x: number; y: number } | null>(null)
   const [draft, setDraft] = useState('')
   const [emojiOpen, setEmojiOpen] = useState(false)
   const [emojis, setEmojis] = useState<ChatEmoji[]>([])
@@ -790,6 +850,36 @@ function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUn
   const processedUnreadJumpRef = useRef(0)
   const selected = contacts.find((item) => item.chatId === selectedId) ?? contacts[0]
   useEffect(() => { contactsRef.current = contacts }, [contacts])
+  useEffect(() => {
+    setConversationMenu(null)
+    if (!account) { setPinnedChatIds([]); return }
+    try {
+      const saved = JSON.parse(localStorage.getItem(`shark-butler-pinned-chats:${account.id}`) || '[]')
+      setPinnedChatIds(Array.isArray(saved) ? saved.filter((value): value is string => typeof value === 'string') : [])
+    } catch { setPinnedChatIds([]) }
+  }, [account?.id])
+  useEffect(() => {
+    if (account) localStorage.setItem(`shark-butler-pinned-chats:${account.id}`, JSON.stringify(pinnedChatIds))
+  }, [account?.id, pinnedChatIds])
+  useEffect(() => {
+    const closeMenu = () => setConversationMenu(null)
+    document.addEventListener('mousedown', closeMenu)
+    return () => document.removeEventListener('mousedown', closeMenu)
+  }, [])
+  useEffect(() => {
+    const list = conversationListRef.current
+    if (!list) return
+    const openMenu = (event: MouseEvent) => {
+      const target = (event.target as Element | null)?.closest<HTMLButtonElement>('button.conversation')
+      const chatId = target?.dataset.chatId
+      const contact = chatId ? contactsRef.current.find((item) => item.chatId === chatId) : undefined
+      if (!contact) return
+      event.preventDefault()
+      setConversationMenu({ contact, x: event.clientX, y: event.clientY })
+    }
+    list.addEventListener('contextmenu', openMenu)
+    return () => list.removeEventListener('contextmenu', openMenu)
+  }, [account?.id])
   useEffect(() => {
     let active = true
     setCustomerProductTab('current')
@@ -835,7 +925,13 @@ function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUn
       || (conversationStatus === '待下单' ? !item.orderStatus && !/待付款|待发货|已发货|退款/.test(item.latestMessage) : upstreamStatus.includes(conversationStatus))
     return matchesStatus && `${item.otherUserName}${item.latestMessage}${item.itemTitle}`.toLowerCase().includes(query.toLowerCase())
   })
-  const visibleContacts = filteredContacts.slice(0, contactLimit)
+  const sortedContacts = [...filteredContacts].sort((left, right) => {
+    const leftPinned = pinnedChatIds.includes(left.chatId)
+    const rightPinned = pinnedChatIds.includes(right.chatId)
+    if (leftPinned !== rightPinned) return leftPinned ? -1 : 1
+    return 0
+  })
+  const visibleContacts = sortedContacts.slice(0, contactLimit)
   const visibleMessages = messages.slice(messageStart)
   const requestedConversation = (items: ChatContact[]) => unreadJumpRequest.accountId === account?.id && unreadJumpRequest.nonce > processedUnreadJumpRef.current
     ? items.find((contact) => contact.chatId === unreadJumpRequest.chatId) ?? items.find((contact) => contact.unreadCount > 0) ?? items[0]
@@ -847,12 +943,16 @@ function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUn
     contactLoadingRef.current = true
     setContactLoading(true); setError('')
     try {
+      let localContactsEmpty = false
       if (cursor === null) {
         const local = await api.chatContacts(account.id)
+        localContactsEmpty = local.length === 0
         setContacts(local)
         setSelectedId((current) => requestedConversation(local)?.chatId ?? (local.some((item) => item.chatId === current) ? current : local[0]?.chatId ?? ''))
       }
-      if (remote) {
+      // A newly re-added account has no local contacts after its old account
+      // record was deleted, so bootstrap the list even when IM is connected.
+      if (remote || localContactsEmpty) {
         const page = await api.syncChatContacts(account.id, cursor)
         setContacts(page.items)
         setContactCursor(page.nextCursor)
@@ -870,6 +970,37 @@ function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUn
         pushRefreshPendingRef.current = false
         void refreshContacts(true)
       }
+    }
+  }
+
+  const toggleConversationPin = async (contact: ChatContact) => {
+    if (!account) return
+    const pinned = !pinnedChatIds.includes(contact.chatId)
+    try {
+      await api.setChatPinned(account.id, contact.chatId, pinned)
+      setPinnedChatIds((current) => pinned ? [contact.chatId, ...current.filter((id) => id !== contact.chatId)] : current.filter((id) => id !== contact.chatId))
+      setConversationMenu(null)
+      setComposerNotice(pinned ? '会话已置顶' : '已取消置顶')
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    }
+  }
+
+  const deleteConversation = async (contact: ChatContact) => {
+    if (!account || !window.confirm(`确定删除与“${contact.otherUserName || '该用户'}”的会话吗？\n本地消息缓存和闲鱼会话都会被删除。`)) return
+    try {
+      await api.deleteChatConversation(account.id, contact.chatId)
+      const nextContacts = contacts.filter((item) => item.chatId !== contact.chatId)
+      setContacts(nextContacts)
+      setPinnedChatIds((current) => current.filter((id) => id !== contact.chatId))
+      if (selectedId === contact.chatId) {
+        setSelectedId(nextContacts[0]?.chatId ?? '')
+        setMessages([])
+      }
+      setConversationMenu(null)
+      setComposerNotice('会话已删除')
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
     }
   }
 
@@ -1079,7 +1210,11 @@ function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUn
           setMessageStart(Math.max(0, local.length - MESSAGE_BATCH))
           requestAnimationFrame(() => { const list = messageListRef.current; if (list) list.scrollTop = list.scrollHeight })
         }
-        if (!imConnected) {
+        // A freshly re-added account has a valid remote login but no local
+        // chat cache because deleting the old account intentionally removed
+        // all messages. Bootstrap that cache from the remote history even
+        // when the singleton IM connection is already online.
+        if (!imConnected || local.length === 0) {
           const page = await api.syncChatMessages(account.id, selected.chatId, null)
           if (active) {
             setMessages(page.items)
@@ -1229,11 +1364,27 @@ function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUn
     } finally { setBusy(false) }
   }
 
-  const insertProduct = (product: Product) => {
-    const detail = `【商品】${product.title}${Number.isFinite(product.price) ? ` ¥${product.price}` : ''}`
-    setDraft((current) => current ? `${current}\n${detail}` : detail)
-    setProductPickerOpen(false)
-    setComposerNotice('已插入商品，点击发送即可发送给客户')
+  const insertProduct = async (product: Product) => {
+    if (!account || !selected || busy) return
+    const parts = product.id.split('-')
+    const itemId = parts[0] === 'SRC' && parts[1] === 'P' ? parts.slice(3).join('-') : ''
+    if (!itemId) {
+      setProductPickerOpen(false)
+      setComposerNotice('该商品还没有闲鱼商品 ID，请先同步账号商品')
+      return
+    }
+    setBusy(true); setError(''); setProductPickerOpen(false); setComposerNotice('正在发送商品卡…')
+    try {
+      const message = await api.sendChatProduct(account.id, selected.chatId, selected.otherUserId, itemId, product.title, product.imageUrl, product.price)
+      setMessages((current) => [...current, message])
+      setDraft('')
+      setComposerNotice('商品链接已发送')
+      await refreshContacts(false)
+      requestAnimationFrame(() => { const list = messageListRef.current; if (list) list.scrollTop = list.scrollHeight })
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+      setComposerNotice('商品链接发送失败')
+    } finally { setBusy(false) }
   }
 
   const insertQuickReply = (reply: QuickReply, replaceCommand = false, replaceDraft = false) => {
@@ -1327,7 +1478,7 @@ function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUn
             <div className="composer-tools-right">
               <div className="composer-tool-anchor" ref={productPickerRef}>
                 <button className={`composer-tool-button ${productPickerOpen ? 'active' : ''}`} type="button" aria-label="插入商品" title="选择当前账号商品" onClick={() => { setProductPickerOpen((current) => !current); setQuickReplyOpen(false); setEmojiOpen(false) }}><ShoppingBag size={19} /></button>
-                {productPickerOpen && <div className="composer-popover product-picker"><header><strong>当前账号商品</strong><small>{accountProducts.length} 件在售</small></header>{accountProducts.length ? accountProducts.map((product) => <button type="button" key={product.id} onClick={() => insertProduct(product)}><Package size={16} /><span><strong>{product.title}</strong><small>¥{product.price} · 库存 {product.stock}</small></span></button>) : <p>当前账号暂无已同步的在售商品。</p>}</div>}
+                {productPickerOpen && <div className="composer-popover product-picker"><header><strong>当前账号商品</strong><small>{accountProducts.length} 件在售</small></header>{accountProducts.length ? accountProducts.map((product) => <button type="button" key={product.id} onClick={() => void insertProduct(product)}><span className="product-picker-thumb"><Package size={16} />{product.imageUrl && <img src={displayImageUrl(product.imageUrl)} alt="" loading="lazy" onError={(event) => { event.currentTarget.style.display = 'none' }} />}</span><span><strong>{product.title}</strong><small>¥{product.price} · 库存 {product.stock}</small></span></button>) : <p>当前账号暂无已同步的在售商品。</p>}</div>}
               </div>
               <button className="composer-tool-button composer-ai-button" type="button" aria-label="AI 回复未生效" title="AI 回复尚未生效" onClick={() => setComposerNotice('AI 回复尚未生效，请先在设置中完成配置')}><span className="composer-tool-badge">未生效</span><span className="composer-ai-glyph">AI</span></button>
               <div className="composer-tool-anchor" ref={quickReplyAnchorRef}>
@@ -1342,7 +1493,8 @@ function Workbench({ account, products, imConnected, quickReplyAutoSuggest, onUn
         </footer>
       </> : <div className="chat-blank"><MessageCircle size={42} /><h2>{account ? '暂无会话' : '请先添加账号'}</h2><p>{account ? '确保账号已扫码登录，然后点击左侧同步。' : '扫码登录后即可同步真实会话。'}</p></div>}
     </section>
-    <aside className={`context-panel ${quickReplyManaging ? 'quick-reply-manager-panel' : ''}`}>{quickReplyManaging ? <QuickReplyManager replies={quickReplies} value={editingQuickReply} onClose={() => { setQuickReplyManaging(false); setEditingQuickReply(undefined) }} onSave={saveQuickReply} onEdit={setEditingQuickReply} onDelete={(reply) => void deleteQuickReply(reply)} /> : selected ? <CustomerContextPanel contact={selected} profile={customerProfile} loading={customerProfileLoading} error={customerProfileError} activeTab={customerProductTab} onTabChange={setCustomerProductTab} onEditRemark={() => setCustomerRemarkOpen(true)} /> : <div className="context-empty"><img src={logo} alt="" /><p>选择会话后查看客户资料、交易统计和商品足迹。</p></div>}</aside>
+    <aside className={`context-panel ${quickReplyManaging ? 'quick-reply-manager-panel' : ''}`}>{quickReplyManaging ? <QuickReplyManager replies={quickReplies} value={editingQuickReply} onClose={() => { setQuickReplyManaging(false); setEditingQuickReply(undefined) }} onSave={saveQuickReply} onEdit={setEditingQuickReply} onDelete={(reply) => void deleteQuickReply(reply)} /> : selected ? <CustomerContextPanel contact={selected} profile={customerProfile} inventory={products} orders={orders} onOrderUpdated={onOrderUpdated} loading={customerProfileLoading} error={customerProfileError} activeTab={customerProductTab} onTabChange={setCustomerProductTab} onEditRemark={() => setCustomerRemarkOpen(true)} /> : <div className="context-empty"><img src={logo} alt="" /><p>选择会话后查看客户资料、交易统计和商品足迹。</p></div>}</aside>
+    {conversationMenu && createPortal(<div className="conversation-context-menu" style={{ left: Math.min(conversationMenu.x, window.innerWidth - 176), top: Math.min(conversationMenu.y, window.innerHeight - 104) }} onMouseDown={(event) => event.stopPropagation()}><button type="button" onClick={() => void toggleConversationPin(conversationMenu.contact)}><Pin size={15} />{pinnedChatIds.includes(conversationMenu.contact.chatId) ? '取消置顶' : '置顶'}</button><button type="button" className="danger" onClick={() => void deleteConversation(conversationMenu.contact)}><Trash2 size={15} />删除</button></div>, document.body)}
     {webProductPreviewUrl && <VirtualProductDetail url={webProductPreviewUrl} onClose={() => setWebProductPreviewUrl('')} />}
     {customerRemarkOpen && selected && <CustomerRemarkDialog value={customerProfile?.remark ?? ''} onClose={() => setCustomerRemarkOpen(false)} onSave={saveCustomerRemark} />}
   </div>
@@ -1371,7 +1523,26 @@ function customerCreditTone(value: string) {
   return 'neutral'
 }
 
-function CustomerContextPanel({ contact, profile, loading, error, activeTab, onTabChange, onEditRemark }: { contact: ChatContact; profile?: CustomerProfile; loading: boolean; error: string; activeTab: 'current' | 'favorite' | 'consulted'; onTabChange: (tab: 'current' | 'favorite' | 'consulted') => void; onEditRemark: () => void }) {
+function orderStatusMeta(status: string) {
+  const value = status.trim()
+  const refunded = /退款成功|已退款|退款完成/.test(value)
+  const success = !refunded && /交易成功|已完成|完成/.test(value)
+  const closed = refunded || /交易关闭|已关闭|关闭|取消/.test(value)
+  return {
+    label: success ? '交易成功' : closed ? '交易关闭' : value || '交易进行中',
+    success,
+    closed,
+    refunded,
+  }
+}
+
+function CustomerContextPanel({ contact, profile, inventory, orders, onOrderUpdated, loading, error, activeTab, onTabChange, onEditRemark }: { contact: ChatContact; profile?: CustomerProfile; inventory: Product[]; orders: Order[]; onOrderUpdated: () => void; loading: boolean; error: string; activeTab: 'current' | 'favorite' | 'consulted'; onTabChange: (tab: 'current' | 'favorite' | 'consulted') => void; onEditRemark: () => void }) {
+  const [orderFilter, setOrderFilter] = useState('全部')
+  const [relatedOrders, setRelatedOrders] = useState<Order[]>([])
+  const [editingOrderId, setEditingOrderId] = useState('')
+  const [orderNote, setOrderNote] = useState('')
+  const [savingNote, setSavingNote] = useState(false)
+  const [detailOrder, setDetailOrder] = useState<Order | null>(null)
   const displayName = profile?.displayName || contact.otherUserName
   const avatarUrl = profile?.avatarUrl || contact.avatarUrl
   const rawCredit = profile?.creditLevel || contact.buyerTag
@@ -1385,8 +1556,24 @@ function CustomerContextPanel({ contact, profile, loading, error, activeTab, onT
     ? profile?.currentItems ?? [{ itemId: contact.itemId, title: contact.itemTitle, imageUrl: contact.itemImageUrl, price: '', fishCoin: '', status: '', exposureCount: '', viewCount: '', wantCount: '', visitedAt: contact.latestMessageTime }].filter((item) => item.itemId || item.title)
     : activeTab === 'favorite' ? profile?.favoriteItems ?? [] : profile?.consultedItems ?? []
   const tabEmptyCopy = activeTab === 'current' ? '当前会话没有关联商品。' : activeTab === 'favorite' ? '闲鱼暂未返回收藏/浏览商品。' : '闲鱼暂未返回咨询过的商品。'
+  useEffect(() => {
+    let active = true
+    void api.relatedOrders(contact.accountId, contact.chatId, orderFilter)
+      .then((items) => { if (active) setRelatedOrders(items.slice(0, 8)) })
+      .catch(() => { if (active) setRelatedOrders([]) })
+    return () => { active = false }
+  }, [contact.accountId, contact.chatId, orderFilter, orders])
+  const orderTabs = ['全部', '待付款', '待发货', '已发货', '退款中', '交易关闭', '交易成功']
+  const saveOrderNote = async (order: Order) => {
+    setSavingNote(true)
+    try {
+      const updatedOrder = await api.updateOrder(order.id, order.status, orderNote)
+      setRelatedOrders((current) => current.map((item) => item.id === updatedOrder.id ? updatedOrder : item))
+      setEditingOrderId('')
+    } finally { setSavingNote(false) }
+  }
   return <div className="customer-context">
-    <div className="context-tabs customer-context-tabs"><b>买家信息</b><span>官方同步</span></div>
+    <div className="context-tabs customer-context-tabs"><button className="active" type="button">买家信息</button><button type="button">快捷回复</button></div>
     <section className="customer-identity">
       <div className="customer-profile-avatar"><span>{displayName.trim().slice(0, 1) || '?'}</span>{avatarUrl && <img src={displayImageUrl(avatarUrl)} alt="" onError={(event) => event.currentTarget.remove()} />}</div>
       <div><strong>{displayName}</strong><button type="button" className="customer-remark-button" onClick={onEditRemark}><span>{profile?.remark || '给买家添加备注'}</span><Pencil size={12} /></button></div>
@@ -1409,6 +1596,7 @@ function CustomerContextPanel({ contact, profile, loading, error, activeTab, onT
     <div className="customer-product-list">{products.length ? products.slice(0, 10).map((item, index) => activeTab === 'current'
       ? <article className="customer-current-item" key={`${item.itemId || item.title}-${index}`}><div className="customer-current-image">{item.imageUrl ? <img src={displayImageUrl(item.imageUrl)} alt="" loading="lazy" onError={(event) => event.currentTarget.parentElement?.classList.add('image-error')} /> : null}<Package size={21} />{item.status && <span>{item.status}</span>}</div><div className="customer-current-copy"><strong>{item.title || `商品 ${item.itemId}`}</strong><small>曝光：{item.exposureCount || '—'} <i>｜</i> 浏览：{item.viewCount || '—'} <i>｜</i> 想要：{item.wantCount || '—'}</small><b>{item.price && `¥${item.price.replace(/^¥/, '')}`}{item.fishCoin && <em>{item.price ? ' + ' : ''}{item.fishCoin}闲鱼币</em>}</b></div></article>
       : <article className="customer-footprint-item" key={`${item.itemId || item.title}-${index}`}><div className="customer-footprint-image">{item.imageUrl ? <img src={displayImageUrl(item.imageUrl)} alt={item.title || '商品图片'} loading="lazy" onError={(event) => event.currentTarget.parentElement?.classList.add('image-error')} /> : <Package size={17} />}{item.visitedAt && <small>{customerItemDate(item.visitedAt)}</small>}</div>{item.price && <b>¥{item.price.replace(/^¥/, '')}</b>}</article>) : <p>{tabEmptyCopy}</p>}</div>
+    <section className="related-orders"><div className="related-orders-head"><strong>关联订单</strong><small>⋯</small></div><div className="related-order-tabs">{orderTabs.map((tab) => <button type="button" className={orderFilter === tab ? 'active' : ''} key={tab} onClick={() => setOrderFilter(tab)}>{tab}</button>)}</div>{relatedOrders.length ? <div className="related-order-list">{relatedOrders.map((order) => { const product = inventory.find((item) => item.accountId === order.accountId && (item.title === order.productTitle || item.title.includes(order.productTitle) || order.productTitle.includes(item.title) || order.productTitle.includes(item.id.split('-').pop() || ''))); const displayTitle = product?.title || order.productTitle || '未命名商品'; const meta = orderStatusMeta(order.status); return <article className={`related-order-card ${meta.closed ? 'closed' : ''} ${meta.success ? 'completed' : ''}`} key={order.id}><div className="related-order-meta"><span className={`related-order-status ${meta.success ? 'success' : ''}`}>{meta.label}</span><small>订单编号 {order.orderNo} <button type="button" className="copy-order-id" title="复制订单编号" onClick={() => void copyOrderNumber(order.orderNo)}><Clipboard size={11} /></button></small><button type="button" className="order-detail-link" onClick={() => setDetailOrder(order)}>详情</button></div><div className="related-order-date">下单 {order.createdAt ? formatDate(order.createdAt) : '时间未知'}{meta.success && `  付款 ${order.createdAt ? formatDate(order.createdAt) : ''}`}</div><div className="related-order-title"><span className="related-order-image">{product?.imageUrl ? <img src={displayImageUrl(product.imageUrl)} alt={displayTitle} loading="lazy" onError={(event) => event.currentTarget.style.display = 'none'} /> : <Package size={18} />}</span><span className="related-order-copy"><strong>{displayTitle}</strong><small>规格：一天</small></span><b>¥{(product?.price ?? order.amount).toFixed(2)}<small>[共1件]</small></b></div><div className="related-order-details"><div><span>成交价</span><strong>¥{order.amount.toFixed(2)}{meta.closed && !meta.refunded && <em>（含运费）</em>}</strong></div><div><span>发货状态</span><span>{meta.success || meta.refunded ? '已发货' : '未发货'}</span></div>{meta.success && <div><span>发货时间</span><span>{order.createdAt ? formatDate(order.createdAt) : '时间未知'}</span></div>}<div><span>{meta.closed ? '完结时间' : '下单时间'}</span><span>{order.createdAt ? formatDate(order.createdAt) : '时间未知'}</span></div><div className="order-note-row"><span>订单备注</span>{editingOrderId === order.id ? <span className="order-note-editor"><input value={orderNote} onChange={(event) => setOrderNote(event.target.value)} autoFocus /><button type="button" disabled={savingNote} onClick={() => void saveOrderNote(order)}>保存</button></span> : <button type="button" className="order-note-button" onClick={() => { setEditingOrderId(order.id); setOrderNote(order.note) }}>{order.note || '添加备注'} <Pencil size={11} /></button>}</div></div>{meta.success && !meta.refunded && <div className="related-order-actions"><button type="button">查看评价</button><button type="button">查看钱款</button></div>}{meta.refunded && <div className="refund-success-banner">退款成功 <b>›</b></div>}</article> })}</div> : <p className="related-orders-empty">当前筛选暂无订单</p>}</section>{detailOrder && <OrderDetailModal order={detailOrder} product={inventory.find((item) => item.accountId === detailOrder.accountId && (item.title === detailOrder.productTitle || detailOrder.productTitle.includes(item.id.split("-").pop() || "")))} onClose={() => setDetailOrder(null)} />}
     {(profile?.syncNote || error) && <p className="customer-sync-note">{profile?.syncNote || `客户资料同步失败：${error}`}</p>}
   </div>
 }
