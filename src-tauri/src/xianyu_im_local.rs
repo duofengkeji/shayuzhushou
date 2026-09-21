@@ -1,17 +1,86 @@
+//! 闲鱼 IM 适配层。
+//!
+//! 负责长连接、会话消息、图片和表情接口。普通商品、订单和售后请求由
+//! `xianyu_local` 处理；两者共享同一套本机会话 Cookie 和 MTop 基础请求。
+
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::multipart::{Form, Part};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest,
+    http::{header, HeaderValue, Request},
+    Message,
+};
 use uuid::Uuid;
 
 use crate::xianyu_local::mtop_call;
 
 const WS_URL: &str = "wss://wss-goofish.dingtalk.com/";
 const IM_APP_KEY: &str = "444e9908a51d1cb236a27862abc769c9";
+// Keep one stable browser profile across the MTop and WebSocket requests.
+// Rotating this value makes the same account look like a new device on every
+// reconnect and is counterproductive for normal session compatibility.
+const IM_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const IM_TOKEN_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+struct CachedImToken {
+    token: String,
+    cached_at: Instant,
+}
+
+static IM_TOKEN_CACHE: OnceLock<Mutex<HashMap<String, CachedImToken>>> = OnceLock::new();
+static IM_RENEWED_COOKIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn im_token_cache() -> &'static Mutex<HashMap<String, CachedImToken>> {
+    IM_TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn renewed_cookie_cache() -> &'static Mutex<HashMap<String, String>> {
+    IM_RENEWED_COOKIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take the most recent Cookie returned while preparing an IM connection.
+/// This is needed by the manual verification window: the validation URL and
+/// its refreshed session Cookie must be used together.
+pub(crate) fn take_renewed_cookie(account_id: &str) -> Option<String> {
+    renewed_cookie_cache().lock().ok()?.remove(account_id)
+}
+
+fn invalidate_im_token(user_id: &str) {
+    if let Ok(mut cache) = im_token_cache().lock() {
+        cache.remove(user_id);
+    }
+}
+
+fn websocket_request(cookie: &str) -> Result<Request<()>, String> {
+    let mut request = WS_URL
+        .into_client_request()
+        .map_err(|error| format!("闲鱼 IM WebSocket 请求格式异常：{error}"))?;
+    request.headers_mut().insert(
+        header::USER_AGENT,
+        HeaderValue::from_static(IM_USER_AGENT),
+    );
+    request.headers_mut().insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://www.goofish.com"),
+    );
+    request.headers_mut().insert(
+        header::ACCEPT_LANGUAGE,
+        HeaderValue::from_static("zh-CN,zh;q=0.9"),
+    );
+    if !cookie.trim().is_empty() {
+        let value = HeaderValue::from_str(cookie)
+            .map_err(|_| "闲鱼 IM WebSocket Cookie 格式异常".to_owned())?;
+        request.headers_mut().insert(header::COOKIE, value);
+    }
+    Ok(request)
+}
 
 /// A request submitted to the account's one persistent LWP connection.
 /// Keeping requests on this channel avoids the gateway closing the IM socket
@@ -152,7 +221,7 @@ fn register_message(token: &str, device_id: &str, request_mid: &str) -> String {
         "lwp": "/reg",
         "headers": {
             "cache-header": "app-key token ua wv", "app-key": IM_APP_KEY, "token": token,
-            "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "ua": IM_USER_AGENT,
             "dt": "j", "wv": "im:3,au:3,sy:6", "sync": "0,0;0;0;",
             "did": device_id, "mid": request_mid
         }
@@ -205,6 +274,20 @@ fn ack_message(value: &Value) -> Option<String> {
 }
 
 async fn im_token(cookie: &str, device_id: &str) -> Result<(String, String), String> {
+    let user_id = cookie_value(cookie, &["unb", "munb"]);
+    if user_id.is_empty() {
+        return Err("当前登录会话缺少闲鱼用户标识，请重新扫码登录".to_owned());
+    }
+    if let Ok(cache) = im_token_cache().lock() {
+        if let Some(entry) = cache.get(&user_id) {
+            if entry.cached_at.elapsed() < IM_TOKEN_CACHE_TTL {
+                if let Ok(mut cookies) = renewed_cookie_cache().lock() {
+                    cookies.insert(user_id.clone(), cookie.to_owned());
+                }
+                return Ok((entry.token.clone(), cookie.to_owned()));
+            }
+        }
+    }
     let (body, cookie) = mtop_call(
         cookie,
         "mtop.taobao.idlemessage.pc.login.token",
@@ -219,6 +302,12 @@ async fn im_token(cookie: &str, device_id: &str) -> Result<(String, String), Str
         .filter(|value| !value.is_empty())
         .ok_or("闲鱼 IM Token 返回缺少 accessToken")?
         .to_owned();
+    if let Ok(mut cookies) = renewed_cookie_cache().lock() {
+        cookies.insert(user_id.clone(), cookie.clone());
+    }
+    if let Ok(mut cache) = im_token_cache().lock() {
+        cache.insert(user_id, CachedImToken { token: token.clone(), cached_at: Instant::now() });
+    }
     Ok((token, cookie))
 }
 
@@ -256,7 +345,7 @@ async fn ws_request(cookie: &str, lwp: &str, body: Value) -> Result<(Value, Stri
     }
     let did = device_id(&user_id);
     let (token, renewed_cookie) = im_token(cookie, &did).await?;
-    let (stream, _) = tokio_tungstenite::connect_async(WS_URL)
+    let (stream, _) = tokio_tungstenite::connect_async(websocket_request(cookie)?)
         .await
         .map_err(|error| format!("闲鱼 IM WebSocket 连接失败：{error}"))?;
     let (mut write, mut read) = stream.split();
@@ -281,8 +370,11 @@ async fn ws_request(cookie: &str, lwp: &str, body: Value) -> Result<(Value, Stri
             if let Some(ack) = ack_message(&value) {
                 let _ = write.send(Message::Text(ack.into())).await;
             }
-            if value.pointer("/headers/mid").and_then(Value::as_str) == Some(register_mid.as_str())
-            {
+            if value.pointer("/headers/mid").and_then(Value::as_str) == Some(register_mid.as_str()) {
+                if value.get("code").and_then(Value::as_i64).is_some_and(|code| code != 200) {
+                    invalidate_im_token(&user_id);
+                    return Err(format!("闲鱼 IM 注册被拒绝：{}", value));
+                }
                 return Ok::<(), String>(());
             }
         }
@@ -367,7 +459,7 @@ where
     on_trace("正在获取 IM 访问令牌");
     let (token, renewed_cookie) = im_token(cookie, &did).await?;
     on_trace("IM 访问令牌已获取，正在建立 WebSocket");
-    let (stream, _) = tokio_tungstenite::connect_async(WS_URL)
+    let (stream, _) = tokio_tungstenite::connect_async(websocket_request(cookie)?)
         .await
         .map_err(|error| format!("闲鱼 IM WebSocket 连接失败：{error}"))?;
     let (mut write, mut read) = stream.split();
@@ -390,6 +482,10 @@ where
                 let _ = write.send(Message::Text(ack.into())).await;
             }
             if value.pointer("/headers/mid").and_then(Value::as_str) == Some(register_mid.as_str()) {
+                if value.get("code").and_then(Value::as_i64).is_some_and(|code| code != 200) {
+                    invalidate_im_token(&user_id);
+                    return Err(format!("闲鱼 IM 注册被拒绝：{}", value));
+                }
                 return Ok::<(), String>(());
             }
         }

@@ -6,13 +6,14 @@ import {
   Bell, CheckCircle2, ChevronDown, CircleHelp, Clipboard, ClipboardList, Download, ExternalLink,
   History, Image as ImageIcon, LayoutDashboard, LogIn, MessageCircle, Package, Pencil,
   Pin, Plus, RefreshCw, Search, Send, Settings, ShieldCheck, ShoppingBag, Smile,
-  Store, Trash2, UserRound, UsersRound, Upload, X, Zap, ListPlus,
+  Store, Trash2, UserRound, UsersRound, Upload, X, Zap, ListPlus, ContactRound, Eye,
 } from 'lucide-react'
 import logo from './assets/shark-butler-logo.png'
 import { api } from './lib/api'
-import type { Account, AccountInput, AppLog, ChatContact, ChatEmoji, ChatMessage, CustomerItem, CustomerProfile, DashboardStats, Order, OrderDetail, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, RefundDetail, RefundVerification, SyncJob } from './lib/types'
+import type { Account, AccountInput, AppLog, ChatContact, ChatEmoji, ChatMessage, CustomerItem, CustomerProfile, DashboardStats, Member, MemberOrder, Order, OrderDetail, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, RefundDetail, RefundVerification } from './lib/types'
 
-type Page = 'dashboard' | 'workbench' | 'accounts' | 'products' | 'orders' | 'settings'
+type Page = 'dashboard' | 'workbench' | 'accounts' | 'products' | 'trade' | 'orders' | 'members' | 'settings'
+type TradeSection = 'orders' | 'refunds' | 'reviews' | 'complaints' | 'addresses'
 type Dialog =
   | { kind: 'account'; value?: Account }
   | { kind: 'product'; value?: Product }
@@ -20,6 +21,7 @@ type Dialog =
   | { kind: 'conversation-name'; value: Account }
   | { kind: 'delete-account'; value: Account }
   | { kind: 'qr' }
+  | { kind: 'im-verification'; value: Account }
   | null
 
 type TradeDrawer =
@@ -33,13 +35,14 @@ const nav: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'workbench', label: '客服', icon: MessageCircle },
   { id: 'accounts', label: '账号', icon: UsersRound },
   { id: 'products', label: '商品', icon: Package },
-  { id: 'orders', label: '订单', icon: ClipboardList },
+  { id: 'trade', label: '交易', icon: ClipboardList },
+  { id: 'members', label: 'CRM', icon: ContactRound },
   { id: 'settings', label: '设置', icon: Settings },
 ]
 
+// 闲鱼返回的日期时间可能带有平台特定格式；界面保持原始字符串，避免本地时区和格式化造成误差。
 function formatDate(value: string) {
-  if (!value) return '—'
-  return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value))
+  return value || '—'
 }
 
 async function copyText(value: string) {
@@ -69,6 +72,7 @@ async function copyOrderNumber(value: string) {
 function formatEventTime(value: string) {
   if (!value) return ''
   const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
   const parts = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(date)
   const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? ''
   return `${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`
@@ -76,14 +80,24 @@ function formatEventTime(value: string) {
 
 function formatRelativeTime(value: string) {
   if (!value) return '—'
-  const elapsed = Math.max(0, Date.now() - new Date(value).getTime())
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  const elapsed = Math.max(0, Date.now() - date.getTime())
   const minutes = Math.floor(elapsed / 60_000)
   if (minutes < 1) return '刚刚'
   if (minutes < 60) return `${minutes}分钟前`
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours}小时前`
   const days = Math.floor(hours / 24)
-  return days < 7 ? `${days}天前` : formatDate(value)
+  return days < 7 ? `${days}天前` : formatChatDate(value)
+}
+
+// 聊天时间轴保留原有的短日期展示；订单等业务日期使用 API 原始值。
+function formatChatDate(value: string) {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date)
 }
 
 function displayImageUrl(value: string) {
@@ -131,7 +145,57 @@ const notificationSoundGroups: Array<{ id: NotificationSoundGroup; label: string
 
 const notificationSoundStorageKey = 'shark-butler-notification-sound'
 const notificationCustomSoundStorageKey = 'shark-butler-notification-custom-sound'
-function selectedNotificationSoundId(): NotificationSoundId {
+const notificationTogglesStorageKey = 'shark-butler-notification-toggles'
+const notificationAccountSettingsStorageKey = 'shark-butler-notification-settings-by-account'
+type NotificationToggles = { chat: boolean; order: boolean; system: boolean; offline: boolean }
+type AccountNotificationSettings = {
+  sound: NotificationSoundId
+  customSoundDataUrl: string
+  customSound: CustomNotificationSound | null
+  toggles: NotificationToggles
+}
+
+const defaultNotificationToggles: NotificationToggles = { chat: true, order: true, system: true, offline: false }
+
+function readNotificationSettingsByAccount(): Record<string, AccountNotificationSettings> {
+  try { return JSON.parse(localStorage.getItem(notificationAccountSettingsStorageKey) || '{}') as Record<string, AccountNotificationSettings> } catch { return {} }
+}
+
+function readLegacyNotificationSettings(): AccountNotificationSettings {
+  let toggles = defaultNotificationToggles
+  try { toggles = { ...defaultNotificationToggles, ...JSON.parse(localStorage.getItem(notificationTogglesStorageKey) || '{}') as Partial<NotificationToggles> } } catch { /* use defaults */ }
+  const customSoundDataUrl = localStorage.getItem(notificationCustomSoundStorageKey) || ''
+  let customSound: CustomNotificationSound | null = null
+  try { customSound = JSON.parse(localStorage.getItem(notificationCustomSoundStorageKey.replace('sound', 'meta')) || 'null') as CustomNotificationSound | null } catch { /* use no custom sound */ }
+  const value = localStorage.getItem(notificationSoundStorageKey)
+  const sound = value === 'custom' || notificationSoundPresets.some((item) => item.id === value) ? value as NotificationSoundId : 'preset-1'
+  return { sound, customSoundDataUrl, customSound, toggles }
+}
+
+function notificationSettingsForAccount(accountId?: string): AccountNotificationSettings {
+  const legacy = readLegacyNotificationSettings()
+  if (!accountId) return legacy
+  const stored = readNotificationSettingsByAccount()[accountId]
+  const storedSound = stored?.sound
+  const sound = storedSound === 'custom' || notificationSoundPresets.some((item) => item.id === storedSound) ? storedSound : legacy.sound
+  return {
+    ...legacy,
+    ...stored,
+    sound,
+    customSoundDataUrl: stored?.customSoundDataUrl ?? legacy.customSoundDataUrl,
+    customSound: stored?.customSound ?? legacy.customSound,
+    toggles: { ...legacy.toggles, ...(stored?.toggles || {}) },
+  }
+}
+
+function saveNotificationSettingsForAccount(accountId: string, settings: AccountNotificationSettings) {
+  const all = readNotificationSettingsByAccount()
+  all[accountId] = settings
+  localStorage.setItem(notificationAccountSettingsStorageKey, JSON.stringify(all))
+}
+
+function selectedNotificationSoundId(accountId?: string): NotificationSoundId {
+  if (accountId) return notificationSettingsForAccount(accountId).sound
   const value = localStorage.getItem(notificationSoundStorageKey)
   return value === 'custom' || notificationSoundPresets.some((item) => item.id === value) ? value as NotificationSoundId : 'preset-1'
 }
@@ -153,13 +217,14 @@ function playToneSequence(context: AudioContext, sequence: NotificationSoundPres
   })
 }
 
-function playMessageNotification(category: 'chat' | 'order' | 'system' = 'chat') {
+function playMessageNotification(accountId?: string, category: 'chat' | 'order' | 'system' = 'chat') {
   try {
-    const toggleMap = JSON.parse(localStorage.getItem('shark-butler-notification-toggles') || '{"chat":true,"order":true,"system":true}') as Record<string, boolean>
+    const settings = notificationSettingsForAccount(accountId)
+    const toggleMap = settings.toggles
     if (toggleMap[category] === false) return
-    const selected = selectedNotificationSoundId()
+    const selected = selectedNotificationSoundId(accountId)
     if (selected === 'custom') {
-      const customDataUrl = localStorage.getItem(notificationCustomSoundStorageKey)
+      const customDataUrl = settings.customSoundDataUrl
       if (customDataUrl) {
         const audio = new Audio(customDataUrl)
         audio.volume = .85
@@ -200,6 +265,7 @@ function ImStatusBadge({ value }: { value?: string }) {
     connected: ['已连接', 'connected'],
     connecting: ['连接中', 'connecting'],
     disconnected: ['已断开', 'disconnected'],
+    verification_required: ['需要验证', 'error'],
     not_logged_in: ['未登录', 'not-logged-in'],
     stopped: ['未启动', 'stopped'],
     error: ['连接异常', 'error'],
@@ -214,10 +280,12 @@ export default function App() {
 
 function MainApp() {
   const [page, setPage] = useState<Page>('dashboard')
+  const [tradeSection, setTradeSection] = useState<TradeSection>('orders')
+  const [tradeDetailOrder, setTradeDetailOrder] = useState<Order | null>(null)
   const [accounts, setAccounts] = useState<Account[]>([])
   const [products, setProducts] = useState<Product[]>([])
   const [orders, setOrders] = useState<Order[]>([])
-  const [syncJobs, setSyncJobs] = useState<SyncJob[]>([])
+  const [members, setMembers] = useState<Member[]>([])
   const [stats, setStats] = useState<DashboardStats | null>(null)
   const [accountId, setAccountId] = useState('')
   const [loading, setLoading] = useState(true)
@@ -246,10 +314,10 @@ function MainApp() {
   const refresh = async () => {
     setLoading(true)
     try {
-      const [nextStats, nextAccounts, nextProducts, nextOrders, nextJobs, nextUnreadTotals, nextImStatuses] = await Promise.all([
-        api.dashboard(), api.accounts(), api.products(), api.orders(), api.syncJobs(), api.chatUnreadTotals(), api.imStatuses(),
+      const [nextStats, nextAccounts, nextProducts, nextOrders, nextMembers, nextUnreadTotals, nextImStatuses] = await Promise.all([
+        api.dashboard(), api.accounts(), api.products(), api.orders(), api.members(), api.chatUnreadTotals(), api.imStatuses(),
       ])
-      setStats(nextStats); setAccounts(nextAccounts); setProducts(nextProducts); setOrders(nextOrders); setSyncJobs(nextJobs)
+      setStats(nextStats); setAccounts(nextAccounts); setProducts(nextProducts); setOrders(nextOrders); setMembers(nextMembers)
       setUnreadTotals(nextUnreadTotals)
       setImStatuses(nextImStatuses)
       setConversationTabIds((currentTabs) => {
@@ -304,6 +372,7 @@ function MainApp() {
       try {
         const nextItems: Array<{ account: Account; contact: ChatContact }> = []
         let hasNewMessage = false
+        let notificationAccountId = ''
         const nextSnapshot = new Map<string, { unreadCount: number; latestMessageTime: string }>()
         for (const account of accounts) {
           try {
@@ -313,6 +382,7 @@ function MainApp() {
               const previous = globalMessageSnapshotRef.current.get(key)
               if (initialized && previous && (contact.unreadCount > previous.unreadCount || (contact.unreadCount > 0 && contact.latestMessageTime !== previous.latestMessageTime))) {
                 hasNewMessage = true
+                notificationAccountId = account.id
               }
               nextSnapshot.set(key, { unreadCount: contact.unreadCount, latestMessageTime: contact.latestMessageTime })
               if (contact.unreadCount > 0) nextItems.push({ account, contact })
@@ -324,7 +394,9 @@ function MainApp() {
         if (cancelled) return
         globalMessageSnapshotRef.current = nextSnapshot
         setGlobalMessages(nextItems.sort((left, right) => new Date(right.contact.latestMessageTime).getTime() - new Date(left.contact.latestMessageTime).getTime()).slice(0, 8))
-        if (hasNewMessage && pageRef.current !== 'workbench') playMessageNotification()
+        if (hasNewMessage && pageRef.current !== 'workbench') {
+          if (notificationAccountId) playMessageNotification(notificationAccountId)
+        }
         initialized = true
         // The visible conversation list is pageable. Refresh the aggregate from
         // the local read watermark so the global badge includes every cached
@@ -462,8 +534,26 @@ function MainApp() {
   const exportBackup = async () => {
     try { const data = await api.exportBackup(); downloadFile(`鲨鱼管家备份-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data, null, 2), 'application/json'); setNotice('本地数据备份已导出。') } catch (error) { handleError(error) }
   }
-  const finishQrLogin = async () => {
-    setDialog(null); await refresh(); setNotice('扫码登录成功，本机会话已保存，账号已加入工作台。')
+  const finishQrLogin = async (remoteAccountId: string) => {
+    setDialog(null)
+    await refresh()
+    try {
+      // Re-authenticating an existing account does not change its React
+      // lifecycle key, so explicitly replace a listener that may have exited
+      // after an authentication failure.
+      const account = (await api.accounts()).find((item) => item.remoteAccountId === remoteAccountId)
+      if (account) {
+        await api.stopChatListener(account.id)
+        await api.startChatListener(account.id)
+      }
+      setNotice('扫码登录成功，本机会话已保存，IM 正在重新连接。')
+    } catch (error) {
+      handleError(error)
+    }
+  }
+  const openTrade = (section: TradeSection = 'orders') => {
+    setTradeSection(section)
+    setPage('trade')
   }
   const openConversationTab = (id: string) => {
     setConversationTabIds((current) => current.includes(id) ? current : [...current, id])
@@ -497,7 +587,11 @@ function MainApp() {
         <button className="brand-mark" onClick={() => setPage('dashboard')} aria-label="鲨鱼管家首页">
           <img src={logo} alt="鲨鱼管家" />
         </button>
-        <nav>{nav.slice(0, 5).map(({ id, label, icon: Icon }) => (
+        <nav>{nav.filter(({ id }) => id !== 'settings').map(({ id, label, icon: Icon }) => id === 'members' ? (
+          <button key={id} className={`rail-link ${page === id ? 'active' : ''}`} onClick={() => setPage(id)}>
+            <span className="rail-link-icon"><Icon size={21} /></span><span>{label}</span>
+          </button>
+        ) : (
           <button key={id} className={`rail-link ${page === id ? 'active' : ''}`} onClick={() => setPage(id)}>
             <span className="rail-link-icon"><Icon size={21} />{id === 'workbench' && globalUnreadCount > 0 && <em className="rail-unread-badge" aria-label={`${globalUnreadCount} 条未读消息`}>{globalUnreadCount > 99 ? '99+' : globalUnreadCount}</em>}</span><span>{label}</span>
           </button>
@@ -514,6 +608,8 @@ function MainApp() {
             <div className="conversation-tab-strip">{conversationTabIds.map((id) => accounts.find((account) => account.id === id)).filter((account): account is Account => Boolean(account)).map((account) => <div className={`conversation-tab ${account.id === activeAccount?.id ? 'active' : ''}`} key={account.id}><button className="conversation-tab-main" onClick={() => setAccountId(account.id)} onDoubleClick={() => jumpToUnreadConversation(account.id)} title="双击跳转到下一条未读会话"><AccountAvatar account={account} className="conversation-tab-avatar" />{(unreadTotals[account.id] ?? 0) > 0 && <em className="conversation-tab-unread" aria-label={`${unreadTotals[account.id]} 条未读消息`}>{unreadTotals[account.id] > 99 ? '99+' : unreadTotals[account.id]}</em>}<span><strong>{account.conversationName || account.displayName}</strong><small>{account.remoteAccountId || account.displayName} · {account.status}</small></span></button><button className="conversation-tab-action edit" onClick={() => setDialog({ kind: 'conversation-name', value: account })} title="自定义会话名称"><Pencil size={12} /></button><button className="conversation-tab-action close" onClick={() => closeConversationTab(account.id)} title="关闭会话标签"><X size={13} /></button></div>)}</div>
             <div className="account-menu-anchor"><button ref={accountMenuButtonRef} className={`round-button ${accountMenuOpen ? 'active' : ''}`} onClick={() => setAccountMenuOpen((open) => !open)} title="添加会话标签" aria-expanded={accountMenuOpen}><Plus size={20} /></button>{accountMenuOpen && createPortal(<div className="account-menu account-menu-portal" style={accountMenuPosition}><header><strong>选择会话账号</strong><span>{accounts.length} 个账号</span></header>{accounts.length ? accounts.map((account) => <button className={conversationTabIds.includes(account.id) ? 'selected' : ''} key={account.id} onClick={() => openConversationTab(account.id)}><AccountAvatar account={account} /><span><strong>{account.conversationName || account.displayName}</strong><small>{account.displayName} · {account.status}</small></span>{conversationTabIds.includes(account.id) && <CheckCircle2 size={17} />}</button>) : <p>暂无账号，请先到账号管理扫码登录。</p>}</div>, document.body)}</div>
           </div>}
+          {(page === 'trade' || page === 'members') && <div className="trade-topbar-title">{page === 'trade' ? <ShoppingBag size={18} /> : <ContactRound size={18} />}<strong>{page === 'trade' ? '交易' : 'CRM'}</strong><span>{page === 'trade' ? '订单与售后管理' : '客户关系管理'}</span></div>}
+          {(page === 'trade' || page === 'members') && <label className="trade-account-switcher"><Store size={15} /><span>当前账号</span><select value={accountId} onChange={(event) => setAccountId(event.target.value)} aria-label="选择当前账号"><option value="">全部账号</option>{accounts.filter((account) => Boolean(account.remoteAccountId)).map((account) => <option value={account.id} key={account.id}>{account.displayName}</option>)}</select><ChevronDown size={14} /></label>}
           <div className="top-actions">
             <div className="message-center-anchor">
               <button className={`message-center-button ${messageCenterOpen ? 'active' : ''}`} onClick={() => setMessageCenterOpen((open) => !open)} aria-label={`未读消息 ${globalUnreadCount} 条`} aria-expanded={messageCenterOpen}>
@@ -532,13 +628,16 @@ function MainApp() {
 
         {notice && <div className="notice toast-notice" role="status" aria-live="polite"><ShieldCheck size={17} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">×</button></div>}
 
-        <div className={`content ${page === 'workbench' ? 'workbench-content' : ''} ${page === 'settings' ? 'settings-content' : ''}`}>
-          {loading ? <Loading /> : page === 'dashboard' ? <Dashboard stats={stats} accounts={accounts} orders={orders} onGo={setPage} />
+        <div className={`content ${page === 'workbench' ? 'workbench-content' : ''} ${page === 'settings' ? 'settings-content' : ''} ${page === 'members' ? 'members-content' : ''}`}>
+          {page === 'members' && <aside className="trade-sidebar crm-secondary-menu"><nav><button className="active" onClick={() => setPage('members')}><ContactRound size={16} /><span><strong>会员列表</strong><small>查看和管理会员信息</small></span><ChevronDown size={15} /></button></nav></aside>}
+          {loading ? <Loading /> : page === 'dashboard' ? <Dashboard stats={stats} accounts={accounts} orders={orders} onGo={(target) => target === 'orders' ? openTrade() : setPage(target)} />
             : page === 'workbench' ? <Workbench key={activeAccount?.id ?? 'empty'} account={activeAccount} products={products} orders={orders} onOrderUpdated={() => void refreshWorkbenchOrders()} onNotice={setNotice} imConnected={Boolean(activeAccount?.remoteAccountId)} quickReplyAutoSuggest={quickReplyAutoSuggest} onUnreadChanged={refreshUnreadTotals} onChatRead={handleChatRead} unreadJumpRequest={unreadJumpRequest} />
-              : page === 'accounts' ? <Accounts accounts={accounts} syncJobs={syncJobs} imStatuses={imStatuses} onQrLogin={() => setDialog({ kind: 'qr' })} onEdit={(value) => setDialog({ kind: 'account', value })} onDelete={(value) => setDialog({ kind: 'delete-account', value })} onSync={(account) => void syncAccount(account)} onSetStatus={(ids, status) => void setAccountsStatus(ids, status)} />
+              : page === 'accounts' ? <Accounts accounts={accounts} imStatuses={imStatuses} onQrLogin={() => setDialog({ kind: 'qr' })} onVerify={(value) => setDialog({ kind: 'im-verification', value })} onEdit={(value) => setDialog({ kind: 'account', value })} onDelete={(value) => setDialog({ kind: 'delete-account', value })} onSync={(account) => void syncAccount(account)} onSetStatus={(ids, status) => void setAccountsStatus(ids, status)} />
                 : page === 'products' ? <Products items={filteredProducts} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, action) => void bulkProducts(ids, action)} onAdd={() => setDialog({ kind: 'product' })} onEdit={(value) => setDialog({ kind: 'product', value })} onDelete={(id) => void remove('product', id)} />
+                  : page === 'trade' ? <TradeWorkspace section={tradeSection} onSectionChange={setTradeSection} accounts={accounts} account={activeAccount} onAccountChange={setAccountId} items={filteredOrders} products={filteredProducts} onSync={() => void syncAccount()} onBulk={(ids, status) => void bulkOrders(ids, status)} onAdd={() => setDialog({ kind: 'order' })} onDetail={setTradeDetailOrder} onEdit={(value) => setDialog({ kind: 'order', value })} onDelete={(id) => void remove('order', id)} />
                   : page === 'orders' ? <Orders items={filteredOrders} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, status) => void bulkOrders(ids, status)} onAdd={() => setDialog({ kind: 'order' })} onEdit={(value) => setDialog({ kind: 'order', value })} onDelete={(id) => void remove('order', id)} />
-                    : <SettingsPage quickReplyAutoSuggest={quickReplyAutoSuggest} onQuickReplyAutoSuggestChange={setQuickReplyAutoSuggest} onExport={() => void exportBackup()} onOpenLogs={() => setLogManagerOpen(true)} onQrLogin={() => setDialog({ kind: 'qr' })} />}
+                    : page === 'members' ? <Members items={members} accounts={accounts} onRefresh={() => void refresh()} onNotice={setNotice} />
+                    : <SettingsPage accounts={accounts} quickReplyAutoSuggest={quickReplyAutoSuggest} onQuickReplyAutoSuggestChange={setQuickReplyAutoSuggest} onExport={() => void exportBackup()} onOpenLogs={() => setLogManagerOpen(true)} onQrLogin={() => setDialog({ kind: 'qr' })} />}
         </div>
         {dialog?.kind === 'account' && <AccountDialog value={dialog.value} onClose={() => setDialog(null)} onSave={saveAccount} />}
         {dialog?.kind === 'product' && <ProductDialog accounts={accounts} selectedAccountId={activeAccount?.id} value={dialog.value} onClose={() => setDialog(null)} onSave={saveProduct} />}
@@ -547,12 +646,49 @@ function MainApp() {
         {dialog?.kind === 'delete-account' && <DeleteAccountDialog account={dialog.value} onClose={() => setDialog(null)} onDelete={deleteAccount} />}
         {logManagerOpen && <LogManager onClose={() => setLogManagerOpen(false)} />}
         {dialog?.kind === 'qr' && <QrLoginDialog onClose={() => setDialog(null)} onConnected={finishQrLogin} />}
+        {dialog?.kind === 'im-verification' && <ImVerificationDialog account={dialog.value} onClose={() => setDialog(null)} onCompleted={async () => { await refresh(); setDialog(null); setNotice('闲鱼安全验证已保存，IM 正在重新连接。') }} />}
+        {tradeDetailOrder && <OrderDetailModal order={tradeDetailOrder} product={products.find((item) => item.accountId === tradeDetailOrder.accountId && (item.id.endsWith(`-${tradeDetailOrder.itemId}`) || item.title === tradeDetailOrder.productTitle))} onClose={() => setTradeDetailOrder(null)} />}
       </section>
     </main>
   )
 }
 
 function Loading() { return <div className="loading"><span /><p>正在加载本地工作台…</p></div> }
+
+function Members({ items, accounts, onRefresh, onNotice }: { items: Member[]; accounts: Account[]; onRefresh: () => void; onNotice: (value: string) => void }) {
+  const pageSize = 20
+  const [query, setQuery] = useState('')
+  const [accountFilter, setAccountFilter] = useState('all')
+  const [currentPage, setCurrentPage] = useState(1)
+  const [selected, setSelected] = useState<string[]>([])
+  const [detail, setDetail] = useState<Member | null>(null)
+  const [detailOrders, setDetailOrders] = useState<MemberOrder[]>([])
+  const [revealed, setRevealed] = useState<Member | null>(null)
+  const [tags, setTags] = useState('')
+  const [remark, setRemark] = useState('')
+  const [mergeView, setMergeView] = useState(false)
+  const visible = items.filter((item) => (accountFilter === 'all' || item.accountId === accountFilter) && `${item.displayName} ${item.buyerId} ${item.phoneMasked} ${item.addressMasked}`.toLowerCase().includes(query.toLowerCase()))
+  const accountName = (id: string) => accounts.find((account) => account.id === id)?.displayName || '未知店铺'
+  const merged = Array.from(items.reduce((groups, item) => {
+    const key = item.buyerId || `${item.displayName}:${item.phoneMasked}`
+    const current = groups.get(key)
+    if (!current) { groups.set(key, { ...item, accountId: 'merged', orderCount: item.orderCount, paidOrderCount: item.paidOrderCount, totalSpend: item.totalSpend, averageOrderValue: item.averageOrderValue, tags: [...item.tags] }); return groups }
+    current.orderCount += item.orderCount; current.paidOrderCount += item.paidOrderCount; current.totalSpend += item.totalSpend; current.averageOrderValue = current.paidOrderCount ? current.totalSpend / current.paidOrderCount : 0; current.lastOrderAt = current.lastOrderAt > item.lastOrderAt ? current.lastOrderAt : item.lastOrderAt; current.tags = Array.from(new Set([...current.tags, ...item.tags]));
+    return groups
+  }, new Map<string, Member>()).values())
+  const mergedVisible = merged.filter((item) => `${item.displayName} ${item.buyerId} ${item.phoneMasked} ${item.addressMasked}`.toLowerCase().includes(query.toLowerCase()))
+  const displayItems = mergeView ? mergedVisible : visible
+  const totalPages = Math.max(1, Math.ceil(displayItems.length / pageSize))
+  const pageItems = displayItems.slice((currentPage - 1) * pageSize, currentPage * pageSize)
+  useEffect(() => { setCurrentPage(1) }, [query, accountFilter, mergeView])
+  useEffect(() => { if (currentPage > totalPages) setCurrentPage(totalPages) }, [currentPage, totalPages])
+  const openDetail = async (member: Member) => { setDetail(member); setRemark(member.remark); setTags(member.tags.join(', ')); try { setDetailOrders(await api.memberOrders(member.id)) } catch { setDetailOrders([]) } }
+  const reveal = async () => { if (!detail) return; try { const next = await api.revealMember(detail.id); setRevealed(next); onNotice('已记录查看敏感信息的本地审计日志') } catch (error) { onNotice(error instanceof Error ? error.message : String(error)) } }
+  const save = async () => { if (!detail) return; try { const next = await api.updateMember(detail.id, remark, tags.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean)); setDetail(next); onRefresh(); onNotice('会员资料已保存') } catch (error) { onNotice(error instanceof Error ? error.message : String(error)) } }
+  const applyTags = async () => { const nextTags = window.prompt('输入批量标签，多个标签用逗号分隔', '重点客户')?.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean); if (!nextTags?.length) return; await Promise.all(selected.map(async (id) => { const member = items.find((item) => item.id === id); if (member) await api.updateMember(id, member.remark, Array.from(new Set([...member.tags, ...nextTags]))) })); setSelected([]); onRefresh(); onNotice(`已为 ${selected.length} 位会员添加标签`) }
+  const exportCsv = () => { const rows = [['会员', '闲鱼ID', '店铺', '手机号', '地址', '下单次数', '有效订单数', '累计消费', '最近下单时间'], ...displayItems.map((item) => [item.displayName, item.buyerId, mergeView ? '跨店铺汇总' : accountName(item.accountId), item.phoneMasked, item.addressMasked, item.orderCount, item.paidOrderCount, item.totalSpend.toFixed(2), item.lastOrderAt])]; const csv = '\ufeff' + rows.map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n'); downloadFile(`鲨鱼管家会员-${new Date().toISOString().slice(0, 10)}.csv`, csv, 'text/csv;charset=utf-8') }
+  return <div className="page members-page"><PageHead eyebrow="CRM · 会员列表" title="会员列表" description="订单同步后自动建档；手机号和地址默认脱敏，跨店铺视图仅用于汇总查看。" action={<div className="head-actions"><button className="secondary" onClick={onRefresh}><RefreshCw size={16} />刷新会员</button><button className="secondary" onClick={exportCsv}><Download size={16} />导出 CSV</button></div>} /><div className="toolbar"><div className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索会员、闲鱼 ID、手机号" /></div><select className="filter-select" value={accountFilter} onChange={(event) => setAccountFilter(event.target.value)}><option value="all">全部店铺</option>{accounts.map((account) => <option key={account.id} value={account.id}>{account.displayName}</option>)}</select><button className={`secondary ${mergeView ? 'active' : ''}`} onClick={() => setMergeView((value) => !value)}><UsersRound size={16} />{mergeView ? '店铺隔离' : '跨店铺汇总'}</button></div><div className="batch-bar"><span>已选择 {selected.length} 位会员</span><button disabled={!selected.length} onClick={() => void applyTags()}>批量加标签</button></div><section className="table-panel"><table><thead><tr><th><input aria-label="全选当前页会员" type="checkbox" checked={Boolean(pageItems.length) && pageItems.every((item) => selected.includes(item.id))} onChange={() => setSelected(pageItems.every((item) => selected.includes(item.id)) ? selected.filter((id) => !pageItems.some((item) => item.id === id)) : Array.from(new Set([...selected, ...pageItems.map((item) => item.id)])))} /></th><th>会员</th><th>店铺</th><th>手机号</th><th>下单次数</th><th>累计消费</th><th>最近下单</th><th>标签</th><th>操作</th></tr></thead><tbody>{pageItems.map((item) => <tr key={item.id}><td><input aria-label={`选择 ${item.displayName}`} type="checkbox" checked={selected.includes(item.id)} onChange={() => setSelected((current) => current.includes(item.id) ? current.filter((id) => id !== item.id) : [...current, item.id])} /></td><td><div className="member-cell"><span className="member-avatar"><UserRound size={16} /></span><div><strong>{item.displayName || '未命名会员'}</strong><small>{item.buyerId || '未取得闲鱼 ID'}</small></div></div></td><td>{mergeView ? '跨店铺汇总' : accountName(item.accountId)}</td><td>{item.phoneMasked || '—'}</td><td>{item.orderCount} <small className="muted">({item.paidOrderCount} 有效)</small></td><td><strong>¥{item.totalSpend.toFixed(2)}</strong></td><td>{formatDate(item.lastOrderAt)}</td><td><div className="tags">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></td><td><button className="link-button" onClick={() => void openDetail(item)}>查看详情</button></td></tr>)}</tbody></table>{displayItems.length === 0 && <EmptyTable text="暂无会员，先同步订单即可自动建档" />}</section><div className="pagination-bar"><span>共 {displayItems.length} 条，每页 20 条</span><div><button disabled={currentPage <= 1} onClick={() => setCurrentPage((value) => value - 1)}>上一页</button><strong>{currentPage} / {totalPages}</strong><button disabled={currentPage >= totalPages} onClick={() => setCurrentPage((value) => value + 1)}>下一页</button></div></div>{detail && <Modal title={`会员详情 · ${detail.displayName || '未命名会员'}`} onClose={() => setDetail(null)}><div className="member-detail"><div className="member-detail-grid"><div><span>所属店铺</span><strong>{accountName(detail.accountId)}</strong></div><div><span>闲鱼 ID</span><strong>{detail.buyerId || '—'}</strong></div><div><span>手机号</span><strong>{revealed?.id === detail.id ? revealed.phoneMasked || '—' : detail.phoneMasked || '—'}</strong></div><div><span>收货地址</span><strong>{revealed?.id === detail.id ? revealed.addressMasked || '—' : detail.addressMasked || '—'}</strong></div><div><span>下单次数</span><strong>{detail.orderCount}（有效 {detail.paidOrderCount}）</strong></div><div><span>累计消费</span><strong>¥{detail.totalSpend.toFixed(2)}</strong></div></div><button className="secondary" onClick={() => void reveal()}><Eye size={15} />查看完整敏感信息</button><label>会员备注<textarea value={remark} onChange={(event) => setRemark(event.target.value)} /></label><label>会员标签<input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="重点客户, 复购" /></label><div className="member-orders"><h3>关联订单</h3>{detailOrders.map(({ order, matchedBy }) => <div className="member-order-row" key={order.id}><span>{order.orderNo}</span><span>{order.productTitle}</span><span>¥{(order.amount - order.refundAmount).toFixed(2)}</span><small>匹配：{matchedBy}</small></div>)}{detailOrders.length === 0 && <p className="muted">暂无关联订单</p>}</div><div className="modal-actions"><button className="secondary" onClick={() => setDetail(null)}>关闭</button><button className="primary" onClick={() => void save()}>保存资料</button></div></div></Modal>}</div>
+}
 
 function Dashboard({ stats, accounts, orders, onGo }: { stats: DashboardStats | null; accounts: Account[]; orders: Order[]; onGo: (p: Page) => void }) {
   const cards: Array<{ label: string; value: number; detail: string; icon: typeof UsersRound; target: Page }> = [
@@ -581,18 +717,24 @@ function AccountAvatar({ account, className = '' }: { account: Account; classNam
   return <span className={`avatar account-avatar ${className}`}><span>{fallback}</span>{account.avatarUrl && <img src={displayImageUrl(account.avatarUrl)} alt={`${account.displayName}头像`} loading="lazy" onError={(event) => event.currentTarget.remove()} />}</span>
 }
 
-function Accounts({ accounts, syncJobs, imStatuses, onQrLogin, onEdit, onDelete, onSync, onSetStatus }: { accounts: Account[]; syncJobs: SyncJob[]; imStatuses: Record<string, string>; onQrLogin: () => void; onEdit: (account: Account) => void; onDelete: (account: Account) => void; onSync: (account: Account) => void; onSetStatus: (ids: string[], status: AccountInput['status']) => void }) {
+function Accounts({ accounts, imStatuses, onQrLogin, onVerify, onEdit, onDelete, onSync, onSetStatus }: { accounts: Account[]; imStatuses: Record<string, string>; onQrLogin: () => void; onVerify: (account: Account) => void; onEdit: (account: Account) => void; onDelete: (account: Account) => void; onSync: (account: Account) => void; onSetStatus: (ids: string[], status: AccountInput['status']) => void }) {
   const [query, setQuery] = useState(''); const [status, setStatus] = useState('全部状态'); const [selected, setSelected] = useState<string[]>([])
   const visible = accounts.filter((account) => (status === '全部状态' || account.status === status) && `${account.displayName}${account.alias}${account.platform}`.toLowerCase().includes(query.toLowerCase()))
   const toggleAll = () => setSelected(selected.length === visible.length ? [] : visible.map((account) => account.id))
   const toggle = (id: string) => setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])
   return <div className="page account-page">
-    <PageHead eyebrow="账号管理" title="店铺账号与本机会话" description="支持本机扫码登录、批量启停、同步商品与订单，并保留同步记录。" action={<div className="head-actions"><button className="secondary" onClick={onQrLogin}><LogIn size={17} />扫码登录</button></div>} />
+    <PageHead eyebrow="账号管理" title="店铺账号与本机会话" description="支持本机扫码登录、批量启停，并同步商品与订单。" action={<div className="head-actions"><button className="secondary" onClick={onQrLogin}><LogIn size={17} />扫码登录</button></div>} />
     <section className="table-panel accounts-table"><div className="account-table-head"><div><h2>账号列表 <span>{visible.length} 个账号</span></h2><p>已选择 {selected.length} 个账号</p></div><div className="account-batch-actions"><button className="secondary" disabled={!selected.length} onClick={() => onSetStatus(selected, '授权有效')}>批量启用</button><button className="secondary" disabled={!selected.length} onClick={() => onSetStatus(selected, '已停用')}>批量停用</button><button className="secondary" onClick={() => visible.forEach(onSync)}><RefreshCw size={15} />同步当前列表</button></div></div>
       <div className="toolbar account-toolbar"><div className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索店铺名、别名或平台" /></div><select className="filter-select" value={status} onChange={(event) => setStatus(event.target.value)}><option>全部状态</option><option>授权有效</option><option>即将过期</option><option>同步异常</option><option>已停用</option></select></div>
-      <table><thead><tr><th><input aria-label="全选账号" type="checkbox" checked={Boolean(visible.length) && selected.length === visible.length} onChange={toggleAll} /></th><th>店铺账号</th><th>平台 / 别名</th><th>本机会话</th><th>IM 状态</th><th>状态</th><th>商品</th><th>订单</th><th>最后同步</th><th>操作</th></tr></thead><tbody>{visible.map((account) => <tr key={account.id}><td><input aria-label={`选择 ${account.displayName}`} type="checkbox" checked={selected.includes(account.id)} onChange={() => toggle(account.id)} /></td><td><div className="product-cell"><AccountAvatar account={account} /><div><strong>{account.displayName}</strong><span>{account.remoteAccountId || account.id.slice(0, 8)}</span></div></div></td><td><strong>{account.platform}</strong><br /><span className="muted">{account.alias || '未设置别名'}</span></td><td>{account.remoteAccountId ? <span className="source-connected"><CheckCircle2 size={13} />已登录</span> : <span className="muted">仅本地资料</span>}</td><td><ImStatusBadge value={imStatuses[account.id] ?? (account.remoteAccountId ? 'connecting' : 'not_logged_in')} /></td><td><Status value={account.status} /></td><td>{account.productCount}</td><td>{account.orderCount}</td><td>{formatDate(account.lastSyncAt)}</td><td><div className="row-actions"><button className="link-button" onClick={() => onSync(account)}>同步</button><button className="link-button" onClick={() => onEdit(account)}>编辑</button><button className="danger-link" onClick={() => onDelete(account)}>删除</button></div></td></tr>)}</tbody></table>{visible.length === 0 && <EmptyTable text="没有符合条件的账号" />}
+      <div className="account-cards account-cards-page">{visible.map((account) => <article className={`account-card account-card-rich ${selected.includes(account.id) ? 'selected' : ''}`} key={account.id}>
+        <header className="account-card-rich-head"><label className="account-card-check"><input aria-label={`选择 ${account.displayName}`} type="checkbox" checked={selected.includes(account.id)} onChange={() => toggle(account.id)} /><span>选择账号</span></label><Status value={account.status} /></header>
+        <div className="account-card-identity"><AccountAvatar account={account} className="large" /><div className="account-card-name-block"><div className="account-card-name-line"><h3>{account.displayName}</h3><span className="account-card-platform">{account.platform}</span></div><p><span>会员名</span>{account.memberName || account.remoteAccountId || `本地账号 · ${account.id.slice(0, 8)}`}</p></div></div>
+        <div className="account-card-badges"><span className={account.remoteAccountId ? 'account-card-connected' : 'account-card-muted'}>{account.remoteAccountId ? <><CheckCircle2 size={13} />已登录</> : '仅本地资料'}</span><ImStatusBadge value={imStatuses[account.id] ?? (account.remoteAccountId ? 'connecting' : 'not_logged_in')} /></div>
+        <div className="account-card-info"><div><span>账号别名</span><strong>{account.alias || '未设置别名'}</strong></div><div><span>最后同步</span><strong>{formatDate(account.lastSyncAt)}</strong></div></div>
+        <div className="account-card-metrics"><div><span>商品</span><b>{account.productCount}</b></div><div><span>订单</span><b>{account.orderCount}</b></div><div><span>同步状态</span><b>{account.status === '授权有效' ? '正常' : '需关注'}</b></div></div>
+        <footer className="account-card-rich-footer">{imStatuses[account.id] === 'verification_required' && <button className="account-card-sync" onClick={() => onVerify(account)}><ShieldCheck size={14} />完成验证</button>}<button className="account-card-sync" onClick={() => onSync(account)}><RefreshCw size={14} />同步</button><button onClick={() => onEdit(account)}>编辑</button><button className="danger-link" onClick={() => onDelete(account)}>删除</button></footer>
+      </article>)}{visible.length === 0 && <EmptyTable text="没有符合条件的账号" />}</div>
     </section>
-    <section className="panel sync-history"><div className="panel-head"><div><h2>最近同步记录</h2><p>显示最近 100 次同步结果，失败原因会保留在本机。</p></div><History size={18} /></div>{syncJobs.length ? <div className="sync-job-list">{syncJobs.slice(0, 8).map((job) => <div className="sync-job" key={job.id}><Status value={job.status} /><div><strong>{accounts.find((account) => account.id === job.accountId)?.displayName ?? job.accountId.slice(0, 8)}</strong><span>{job.resource} · {formatDate(job.startedAt)}</span>{job.errorMessage && <small>{job.errorMessage}</small>}</div></div>)}</div> : <EmptyTable text="还没有同步记录" />}</section>
   </div>
 }
 
@@ -609,6 +751,52 @@ function Products({ items, account, onSync, onBulk, onAdd, onEdit, onDelete }: {
   </div>
 }
 
+function TradeWorkspace({ section, onSectionChange, accounts, account, onAccountChange, items, products, onSync, onBulk, onAdd, onDetail, onEdit, onDelete }: { section: TradeSection; onSectionChange: (section: TradeSection) => void; accounts: Account[]; account?: Account; onAccountChange: (id: string) => void; items: Order[]; products: Product[]; onSync: () => void; onBulk: (ids: string[], status: string) => void; onAdd: () => void; onDetail: (order: Order) => void; onEdit: (order: Order) => void; onDelete: (id: string) => void }) {
+  const [shopMenuOpen, setShopMenuOpen] = useState(false)
+  const menu: Array<{ id: TradeSection; label: string; icon: typeof ClipboardList; description: string }> = [
+    { id: 'orders', label: '订单管理', icon: ClipboardList, description: '查看和处理全部订单' },
+    { id: 'refunds', label: '退款管理', icon: RefreshCw, description: '处理退款与售后申请' },
+    { id: 'reviews', label: '评价管理', icon: MessageCircle, description: '管理买家评价' },
+    { id: 'complaints', label: '投诉管理', icon: CircleHelp, description: '跟进平台投诉' },
+    { id: 'addresses', label: '退货地址', icon: Store, description: '维护退货收货地址' },
+  ]
+  const selected = menu.find((item) => item.id === section) ?? menu[0]
+  const loggedInAccounts = accounts.filter((item) => Boolean(item.remoteAccountId))
+  return <div className="trade-layout">
+    <aside className="trade-sidebar"><nav aria-label="交易管理菜单">{menu.map(({ id, label, icon: Icon, description }) => <button key={id} className={section === id ? 'active' : ''} onClick={() => onSectionChange(id)}><Icon size={17} /><span><strong>{label}</strong><small>{description}</small></span>{section === id && <ChevronDown size={15} />}</button>)}</nav></aside>
+    <section className="trade-main"><div className="trade-main-head"><div><p className="eyebrow">{selected.label}</p><h1>{selected.label}</h1><p>{selected.description} · 数据统一来自已封装的闲鱼 API。</p></div><div className="trade-main-actions"><button className="secondary" onClick={onSync} disabled={!account}><RefreshCw size={16} />同步数据</button>{section === 'orders' && <button className="primary" onClick={onAdd}><Plus size={16} />录入订单</button>}</div></div>{section === 'orders' ? <TradeOrders items={items} products={products} account={account} onSync={onSync} onBulk={onBulk} onDetail={onDetail} onEdit={onEdit} onDelete={onDelete} /> : <div className="trade-placeholder"><span><IconPlaceholder /></span><h2>{selected.label}</h2><p>页面结构已预留，后续接入对应官方接口。</p></div>}</section>
+  </div>
+}
+
+function IconPlaceholder() { return <ListPlus size={25} /> }
+
+function TradeOrders({ items, products, account, onSync, onBulk, onDetail, onEdit, onDelete }: { items: Order[]; products: Product[]; account?: Account; onSync: () => void; onBulk: (ids: string[], status: string) => void; onDetail: (order: Order) => void; onEdit: (order: Order) => void; onDelete: (id: string) => void }) {
+  const [tab, setTab] = useState('全部')
+  const [query, setQuery] = useState('')
+  const [orderNo, setOrderNo] = useState('')
+  const [buyer, setBuyer] = useState('')
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+  const tabs: Array<{ label: string; statuses?: string[] }> = [
+    { label: '全部' }, { label: '待付款', statuses: ['待付款'] }, { label: '待发货', statuses: ['待发货'] },
+    { label: '发货即将超时', statuses: [] }, { label: '发货已超时', statuses: [] }, { label: '已发货', statuses: ['待收货'] },
+    { label: '售后中', statuses: ['退款中'] }, { label: '交易成功', statuses: ['已完成'] }, { label: '交易关闭', statuses: ['已关闭'] },
+  ]
+  const countFor = (statuses?: string[]) => statuses ? items.filter((item) => statuses.includes(item.status)).length : items.length
+  const visible = items.filter((item) => {
+    const selectedTab = tabs.find((item) => item.label === tab)
+    const matchesTab = !selectedTab?.statuses || selectedTab.statuses.includes(item.status)
+    return matchesTab && (!query || `${item.orderNo} ${item.productTitle} ${item.buyerMaskedName}`.toLowerCase().includes(query.toLowerCase())) && (!orderNo || item.orderNo.includes(orderNo)) && (!buyer || item.buyerMaskedName.includes(buyer)) && (!startDate || item.createdAt.slice(0, 10) >= startDate) && (!endDate || item.createdAt.slice(0, 10) <= endDate)
+  })
+  const reset = () => { setTab('全部'); setQuery(''); setOrderNo(''); setBuyer(''); setStartDate(''); setEndDate('') }
+  return <div className="trade-orders">
+    <div className="trade-order-tabs">{tabs.map(({ label, statuses }) => <button key={label} className={tab === label ? 'active' : ''} onClick={() => setTab(label)}>{label}<b>{countFor(statuses)}</b></button>)}</div>
+    <section className="trade-filters"><label>精准查询<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="请输入完整订单号/物流单号/商品ID/买家昵称" /></label><div className="trade-filter-row"><label>订单编号<input value={orderNo} onChange={(event) => setOrderNo(event.target.value)} placeholder="订单编号" /></label><label>买家昵称<input value={buyer} onChange={(event) => setBuyer(event.target.value)} placeholder="买家昵称" /></label><label>订单状态<select value={tab} onChange={(event) => setTab(event.target.value)}>{tabs.map(({ label }) => <option key={label}>{label}</option>)}</select></label><label>下单时间<div className="trade-date-range"><input aria-label="开始日期" type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} /><span>→</span><input aria-label="结束日期" type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} /></div></label><button className="secondary" onClick={reset}>重置</button><button className="primary" onClick={() => undefined}>确认筛选</button></div></section>
+    <div className="trade-order-actions"><button className="secondary" onClick={onSync} disabled={!account}><RefreshCw size={15} />批量导入发货</button><span>当前账号：{account?.displayName || '全部账号'} · 共 {visible.length} 条</span></div>
+    <section className="table-panel trade-order-table"><table><thead><tr><th><input aria-label="全选订单" type="checkbox" /></th><th>商品信息</th><th>发货/退款状态</th><th>单价/数量</th><th>成交价</th><th>买家/收货信息</th><th>操作</th></tr></thead><tbody>{visible.map((item) => { const product = products.find((candidate) => candidate.id === item.itemId); const imageUrl = item.itemImageUrl || product?.imageUrl || ''; return <tr key={item.id}><td><input aria-label={`选择订单 ${item.orderNo}`} type="checkbox" /></td><td><div className="trade-product-cell"><span className="trade-product-image">{imageUrl ? <img src={displayImageUrl(imageUrl)} alt="" /> : <Package size={20} />}</span><span><strong>{item.productTitle || product?.title || '未命名商品'}</strong><small>{item.specification || '规格：—'}</small><em>{item.status}　订单编号 {item.orderNo}</em></span></div></td><td><span className="trade-raw-status">{item.shippingRefundStatus || '—'}</span></td><td>¥{(product?.price ?? item.amount).toFixed(2)}<br /><small>×1</small></td><td><strong>¥{item.amount.toFixed(2)}</strong><small>包邮</small></td><td><span className="trade-buyer"><UserRound size={14} />{item.buyerMaskedName || '买家'}</span><a href="#" onClick={(event) => event.preventDefault()}>联系买家</a><small>下单时间 {formatDate(item.createdAt)}</small></td><td><div className="trade-row-actions"><button onClick={() => onDetail(item)}>查看详情</button><button onClick={() => onEdit(item)}>查看评价</button><button onClick={() => onEdit(item)}>查看钱款</button><button onClick={() => onEdit(item)}>添加备注</button></div></td></tr> })}</tbody></table>{visible.length === 0 && <EmptyTable text="当前筛选暂无订单" />}</section>
+  </div>
+}
+
 function Orders({ items, account, onSync, onBulk, onAdd, onEdit, onDelete }: { items: Order[]; account?: Account; onSync: () => void; onBulk: (ids: string[], status: string) => void; onAdd: () => void; onEdit: (order: Order) => void; onDelete: (id: string) => void }) {
   const [query, setQuery] = useState(''); const [status, setStatus] = useState('全部状态'); const [startDate, setStartDate] = useState(''); const [endDate, setEndDate] = useState(''); const [selected, setSelected] = useState<string[]>([]); const [batchStatus, setBatchStatus] = useState('待发货')
   const visible = items.filter((item) => (status === '全部状态' || item.status === status) && (!startDate || item.createdAt.slice(0, 10) >= startDate) && (!endDate || item.createdAt.slice(0, 10) <= endDate) && `${item.orderNo}${item.productTitle}${item.buyerMaskedName}`.toLowerCase().includes(query.toLowerCase()))
@@ -619,7 +807,7 @@ function Orders({ items, account, onSync, onBulk, onAdd, onEdit, onDelete }: { i
     <PageHead eyebrow="订单管理" title="订单中心" description={account?.remoteAccountId ? '当前账号已完成本机登录；同步会直接拉取闲鱼订单最新状态。' : '默认脱敏展示买家信息，可更新状态、维护备注并按当前筛选导出。'} action={<div className="head-actions"><button className="secondary" disabled={!account} onClick={onSync}><RefreshCw size={17} />同步订单</button><button className="secondary" onClick={exportOrders}><ExternalLink size={17} />导出 CSV</button></div>} />
     <div className="toolbar order-toolbar"><div className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索订单号、商品或买家" /></div><AccountPicker account={account} /><select className="filter-select" value={status} onChange={(event) => setStatus(event.target.value)}><option>全部状态</option><option>待付款</option><option>待发货</option><option>待收货</option><option>已完成</option><option>退款中</option><option>已退款</option><option>已关闭</option></select><input className="date-filter" aria-label="开始日期" type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} /><input className="date-filter" aria-label="结束日期" type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} /><button className="primary" onClick={onAdd}><Plus size={16} />录入订单</button></div>
     <div className="batch-bar"><span>已选择 {selected.length} 个订单</span><select value={batchStatus} onChange={(event) => setBatchStatus(event.target.value)}><option>待付款</option><option>待发货</option><option>待收货</option><option>已完成</option><option>退款中</option><option>已退款</option><option>已关闭</option></select><button disabled={!selected.length} onClick={() => onBulk(selected, batchStatus)}>批量更新状态</button></div>
-    <section className="table-panel"><table><thead><tr><th><input aria-label="全选订单" type="checkbox" checked={Boolean(visible.length) && visible.every((item) => selected.includes(item.id))} onChange={toggleAll} /></th><th>订单号</th><th>商品</th><th>买家</th><th>金额</th><th>状态</th><th>创建时间</th><th>备注</th><th>操作</th></tr></thead><tbody>{visible.map((item) => <tr key={item.id}><td><input aria-label={`选择订单 ${item.orderNo}`} type="checkbox" checked={selected.includes(item.id)} onChange={() => toggle(item.id)} /></td><td><strong>{item.orderNo}</strong></td><td>{item.productTitle}</td><td><span className="masked"><UserRound size={14} />{item.buyerMaskedName}</span></td><td><strong>¥{item.amount.toFixed(2)}</strong></td><td><Status value={item.status} /></td><td>{formatDate(item.createdAt)}</td><td className="muted">{item.note || '—'}</td><td><div className="row-actions"><button className="link-button" onClick={() => onEdit(item)}>处理</button><button className="danger-link" onClick={() => onDelete(item.id)}>删除</button></div></td></tr>)}</tbody></table>{visible.length === 0 && <EmptyTable text="没有符合条件的订单" />}</section>
+    <section className="table-panel"><table><thead><tr><th><input aria-label="全选订单" type="checkbox" checked={Boolean(visible.length) && visible.every((item) => selected.includes(item.id))} onChange={toggleAll} /></th><th>订单号</th><th>商品</th><th>买家</th><th>金额</th><th>状态</th><th>创建时间</th><th>备注</th><th>操作</th></tr></thead><tbody>{visible.map((item) => <tr key={item.id}><td><input aria-label={`选择订单 ${item.orderNo}`} type="checkbox" checked={selected.includes(item.id)} onChange={() => toggle(item.id)} /></td><td><strong>{item.orderNo}</strong></td><td><strong>{item.productTitle}</strong>{item.specification && <small className="order-specification">{item.specification}</small>}</td><td><span className="masked"><UserRound size={14} />{item.buyerMaskedName}</span></td><td><strong>¥{item.amount.toFixed(2)}</strong></td><td><Status value={item.status} /></td><td>{formatDate(item.createdAt)}</td><td className="muted">{item.note || '—'}</td><td><div className="row-actions"><button className="link-button" onClick={() => onEdit(item)}>处理</button><button className="danger-link" onClick={() => onDelete(item.id)}>删除</button></div></td></tr>)}</tbody></table>{visible.length === 0 && <EmptyTable text="没有符合条件的订单" />}</section>
   </div>
 }
 
@@ -652,7 +840,7 @@ function AccountDialog({ value, onClose, onSave }: { value?: Account; onClose: (
   return <Modal title={value ? '编辑账号资料' : '添加本地账号资料'} onClose={onClose}><form className="form-grid" onSubmit={(event) => { event.preventDefault(); onSave({ displayName, alias, platform, status, sourceUrl: value?.sourceUrl ?? '', remoteAccountId: value?.remoteAccountId ?? '' }, value) }}><label>店铺名称<input required autoFocus value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="例如：鲨鱼精选店" /></label><label>账号别名<input value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="用于内部区分" /></label><label>平台<select value={platform} onChange={(event) => setPlatform(event.target.value)}><option>闲鱼</option><option>淘宝（仅本地资料）</option><option>其他平台（仅本地资料）</option></select></label><label>运营状态<select value={status} onChange={(event) => setStatus(event.target.value as AccountInput['status'])}><option>授权有效</option><option>即将过期</option><option>同步异常</option><option>已停用</option></select></label><p className="form-note">这里用于维护显示名称和备注。需要同步闲鱼真实数据时，请使用账号页的“扫码登录”。</p><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存账号</button></div></form></Modal>
 }
 
-function QrLoginDialog({ onClose, onConnected }: { onClose: () => void; onConnected: () => Promise<void> }) {
+function QrLoginDialog({ onClose, onConnected }: { onClose: () => void; onConnected: (remoteAccountId: string) => Promise<void> }) {
   const [session, setSession] = useState<QrLoginStart | null>(null)
   const [status, setStatus] = useState<QrLoginStatus | null>(null)
   const [working, setWorking] = useState(true)
@@ -675,14 +863,38 @@ function QrLoginDialog({ onClose, onConnected }: { onClose: () => void; onConnec
         const next = await api.checkQrLoginStatus(session.sessionId)
         if (cancelled) return
         setStatus(next)
-        if (next.status === 'success') await onConnected()
+        if (next.status === 'success') await onConnected(next.accountId)
       } catch (value) { if (!cancelled) setError(value instanceof Error ? value.message : String(value)) }
     }
     void poll(); const timer = window.setInterval(() => void poll(), 2000)
     return () => { cancelled = true; window.clearInterval(timer) }
   }, [session, status?.status, onConnected])
-  const qr = status?.status === 'verification_required' && status.faceQrUrl ? status.faceQrUrl : session?.qrCodeUrl
-  return <Modal title="本机扫码登录闲鱼" onClose={onClose}><div className="qr-login"><p>二维码由鲨鱼管家在本机直接生成。请使用闲鱼 App 扫码并在手机端确认。</p>{qr ? <img className="qr-image" src={qr} alt="闲鱼登录二维码" /> : <div className="qr-placeholder"><LogIn size={32} /><span>{working ? '正在生成二维码…' : '二维码加载失败，请刷新'}</span></div>}<strong>{status?.message || session?.message || (working ? '正在生成二维码…' : '二维码生成失败')}</strong>{status?.verificationUrl && <a href={status.verificationUrl} target="_blank" rel="noreferrer">在浏览器中打开身份验证</a>}{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button type="button" className="primary" disabled={working} onClick={() => void generate()}><RefreshCw size={16} />{working ? '生成中…' : '刷新二维码'}</button></div></div></Modal>
+  const identityVerification = status?.status === 'verification_required'
+  const qr = identityVerification ? status?.faceQrUrl : session?.qrCodeUrl
+  const message = status?.message || session?.message || (working ? '正在生成二维码…' : '二维码生成失败')
+  return <Modal title={identityVerification ? '闲鱼身份验证' : '本机扫码登录闲鱼'} onClose={onClose}><div className="qr-login"><p>{identityVerification ? '闲鱼要求本次登录完成身份验证。请使用闲鱼 App 扫描下方人脸验证二维码，并在手机端完成验证。' : '二维码由鲨鱼管家在本机直接生成。请使用闲鱼 App 扫码并在手机端确认。'}</p>{qr ? <img className="qr-image" src={qr} alt={identityVerification ? '闲鱼身份验证二维码' : '闲鱼登录二维码'} /> : <div className="qr-placeholder">{identityVerification ? <ShieldCheck size={32} /> : <LogIn size={32} />}<span>{working ? '正在生成二维码…' : identityVerification ? '正在获取身份验证二维码…' : '二维码加载失败，请刷新'}</span></div>}<strong>{message}</strong>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button type="button" className="primary" disabled={working} onClick={() => void generate()}><RefreshCw size={16} />{working ? '生成中…' : '刷新二维码'}</button></div></div></Modal>
+}
+
+function ImVerificationDialog({ account, onClose, onCompleted }: { account: Account; onClose: () => void; onCompleted: () => Promise<void> }) {
+  const [opening, setOpening] = useState(false)
+  const [completing, setCompleting] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let cancelled = false
+    void api.imVerificationState(account.id).then((state) => {
+      if (!cancelled && !state.required) setError('验证请求已失效。请重新启动 IM 后再试。')
+    }).catch((value) => { if (!cancelled) setError(value instanceof Error ? value.message : String(value)) })
+    return () => { cancelled = true }
+  }, [account.id])
+  const open = async () => {
+    setOpening(true); setError('')
+    try { await api.openImVerification(account.id) } catch (value) { setError(value instanceof Error ? value.message : String(value)) } finally { setOpening(false) }
+  }
+  const complete = async () => {
+    setCompleting(true); setError('')
+    try { await api.completeImVerification(account.id); await onCompleted() } catch (value) { setError(value instanceof Error ? value.message : String(value)) } finally { setCompleting(false) }
+  }
+  return <Modal title="完成闲鱼安全验证" onClose={onClose}><div className="qr-login"><p>闲鱼要求此账号完成一次安全验证。打开验证页后，请在新窗口中手动完成挑战；验证 Cookie 只保存在本机加密会话中。</p><strong>{account.displayName}</strong>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={() => void open()} disabled={opening || completing}><ExternalLink size={16} />{opening ? '正在打开…' : '打开验证页'}</button><button type="button" className="primary" onClick={() => void complete()} disabled={opening || completing}><ShieldCheck size={16} />{completing ? '正在保存…' : '我已完成验证'}</button></div></div></Modal>
 }
 
 function ProductDialog({ accounts, selectedAccountId, value, onClose, onSave }: { accounts: Account[]; selectedAccountId?: string; value?: Product; onClose: () => void; onSave: (input: ProductInput, current?: Product) => void }) {
@@ -697,30 +909,37 @@ function OrderDialog({ accounts, selectedAccountId, value, onClose, onSave }: { 
 
 function OrderDetailModal({ order, product, onClose, onRefundAction }: { order: Order; product?: Product; onClose: () => void; onRefundAction?: () => Promise<void> }) {
   const [detail, setDetail] = useState<OrderDetail>()
+  const [officialRefundAmount, setOfficialRefundAmount] = useState<number>()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   useEffect(() => {
     let active = true
     setLoading(true); setError(''); setDetail(undefined)
     void api.orderDetail(order.accountId, order.orderNo)
-      .then((value) => { if (active) setDetail(value) })
+      .then((value) => { if (active) { setDetail(value); setOfficialRefundAmount(value.refundAmount) } })
       .catch((value) => { if (active) setError(value instanceof Error ? value.message : String(value)) })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [order.accountId, order.orderNo])
   const currentOrder = detail?.order ?? order
   const meta = orderStatusMeta(currentOrder.status)
+  useEffect(() => {
+    if (!detail || (!meta.refunded && !meta.refunding) || detail.refundAmount != null) return
+    let active = true
+    void api.refundDetail(order.accountId, order.orderNo)
+      .then((value) => { if (active) setOfficialRefundAmount(value.amount) })
+      .catch(() => undefined)
+    return () => { active = false }
+  }, [detail, meta.refunded, meta.refunding, order.accountId, order.orderNo])
   const formatDetailDate = (value: string) => {
-    if (!value) return '—'
-    const numeric = /^\d+$/.test(value.trim()) ? Number(value) : NaN
-    const date = Number.isFinite(numeric) ? new Date(numeric < 1e12 ? numeric * 1000 : numeric) : new Date(value)
-    return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(date)
+    return value || '—'
   }
   const detailDate = formatDetailDate(currentOrder.createdAt)
   const paidDate = formatDetailDate(detail?.paidAt ?? '')
   const shippedDate = formatDetailDate(detail?.shippedAt ?? '')
   const completedDate = formatDetailDate(detail?.completedAt ?? '')
   const closedDate = formatDetailDate(detail?.closedAt ?? '')
+  const refundAmount = detail?.refundAmount ?? officialRefundAmount ?? (meta.refunded ? currentOrder.amount : undefined)
   const timeline = [
     { label: '已拍下', done: true, date: detailDate },
     { label: '已付款', done: meta.success || meta.refunded || /待发货|待收货|已完成/.test(currentOrder.status), date: paidDate },
@@ -733,9 +952,9 @@ function OrderDetailModal({ order, product, onClose, onRefundAction }: { order: 
     {loading && <p className="order-detail-loading">正在从闲鱼官方获取订单详情…</p>}
     {error && <p className="order-detail-loading">官方详情暂时不可用：{error}</p>}
     {!meta.closed && <div className="order-detail-progress" aria-label="订单进度">{timeline.map((step, index) => <div className={`order-detail-step ${step.done ? 'done' : ''}`} key={step.label}><span className="order-detail-step-dot">{step.done ? '✓' : index + 1}</span><strong>{step.label}</strong><small>{step.done ? step.date : '—'}</small>{index < timeline.length - 1 && <i />}</div>)}</div>}
-    <section className={`order-detail-summary ${meta.closed ? 'closed' : ''} ${meta.refunding ? 'refunding' : ''}`}><h3>{meta.refunding ? '买家申请退款，请尽快处理' : meta.label}</h3>{meta.refunding && onRefundAction && <div className="order-detail-actions"><button type="button" className="secondary" onClick={() => void onRefundAction()}>处理退款</button></div>}{meta.closed && <p className="order-detail-status-desc">{meta.refunded ? '退款成功' : '买家取消了订单'}</p>}{meta.success && <div className="order-detail-actions"><button type="button" className="primary">查看评价</button><button type="button" className="secondary">查看钱款</button></div>}<div className="order-detail-note"><span>备注：{currentOrder.note || '暂无'}</span><button type="button" onClick={() => void copyOrderNumber(currentOrder.orderNo)}><Clipboard size={13} />复制订单号</button></div></section>
-    <section className="order-detail-section"><h4>订单信息</h4><div className="order-detail-info-grid"><div><h5>交易信息</h5><dl><div><dt>订单编号</dt><dd>{currentOrder.orderNo} <button type="button" onClick={() => void copyOrderNumber(currentOrder.orderNo)} title="复制订单编号"><Clipboard size={12} /></button></dd></div>{meta.closed ? <><div><dt>支付宝交易号</dt><dd>—</dd></div><div><dt>下单时间</dt><dd>{detailDate}</dd></div><div><dt>交易关闭时间</dt><dd>{closedDate}</dd></div></> : <><div><dt>下单时间</dt><dd>{detailDate}</dd></div><div><dt>付款时间</dt><dd>{paidDate}</dd></div><div><dt>发货时间</dt><dd>{shippedDate}</dd></div><div><dt>成交时间</dt><dd>{completedDate}</dd></div></>}</dl></div><div><h5>买家信息</h5><dl><div><dt>买家昵称</dt><dd>{currentOrder.buyerMaskedName || '—'}</dd></div><div><dt>收货信息</dt><dd>已隐藏</dd></div></dl></div></div></section>
-    <section className="order-detail-section"><h4>商品信息</h4><div className="order-detail-product-table"><div className="order-detail-product-head"><span>商品信息</span><span>单价/数量</span><span>优惠</span></div><div className="order-detail-product-row"><span className="related-order-image">{product?.imageUrl ? <img src={displayImageUrl(product.imageUrl)} alt="" /> : <Package size={22} />}</span><div className="order-detail-product-name"><strong>{product?.title || currentOrder.productTitle || '未命名商品'}</strong><small>规格：一天</small></div><div className="order-detail-product-price"><b>¥{(product?.price ?? currentOrder.amount).toFixed(2)}</b><span>×1</span></div><span>—</span></div><div className="order-detail-totals"><div><span>成交价</span><b>¥{currentOrder.amount.toFixed(2)}</b></div><div><span>软件服务费</span><b>{serviceFee == null ? '—' : `-¥${serviceFee.toFixed(2)}`}</b></div><div><span>预计到手</span><b className="price">{serviceFee == null ? '—' : `¥${Math.max(0, currentOrder.amount - serviceFee).toFixed(2)}`}</b></div></div></div></section>
+    <section className={`order-detail-summary ${meta.closed ? 'closed' : ''} ${meta.refunding ? 'refunding' : ''}`}><h3>{meta.refunding ? '买家申请退款，请尽快处理' : meta.label}</h3>{meta.refunding && onRefundAction && <div className="order-detail-actions"><button type="button" className="secondary" onClick={() => void onRefundAction()}>处理退款</button></div>}{meta.closed && <p className={`order-detail-status-desc ${meta.refunded ? 'refund-amount' : ''}`}>{meta.refunded ? `退款成功，退款金额 ¥${(refundAmount ?? 0).toFixed(2)} 已原路退回买家` : '买家取消了订单'}</p>}{meta.success && <div className="order-detail-actions"><button type="button" className="primary">查看评价</button></div>}<div className="order-detail-note"><span>备注：{currentOrder.note || '暂无'}</span><button type="button" onClick={() => void copyOrderNumber(currentOrder.orderNo)}><Clipboard size={13} />复制订单号</button></div></section>
+    <section className="order-detail-section"><h4>订单信息</h4><div className="order-detail-info-grid"><div><h5>交易信息</h5><dl><div><dt>订单编号</dt><dd>{currentOrder.orderNo} <button type="button" onClick={() => void copyOrderNumber(currentOrder.orderNo)} title="复制订单编号"><Clipboard size={12} /></button></dd></div>{meta.closed ? <><div><dt>支付宝交易号</dt><dd>—</dd></div><div><dt>下单时间</dt><dd>{detailDate}</dd></div><div><dt>付款时间</dt><dd>{paidDate}</dd></div><div><dt>交易关闭时间</dt><dd>{closedDate}</dd></div></> : <><div><dt>下单时间</dt><dd>{detailDate}</dd></div><div><dt>付款时间</dt><dd>{paidDate}</dd></div><div><dt>发货时间</dt><dd>{shippedDate}</dd></div><div><dt>成交时间</dt><dd>{completedDate}</dd></div></>}</dl></div><div><h5>买家信息</h5><dl><div><dt>买家昵称</dt><dd>{currentOrder.buyerMaskedName || '—'}</dd></div><div><dt>收货信息</dt><dd>已隐藏</dd></div></dl></div></div></section>
+    <section className="order-detail-section"><h4>商品信息</h4><div className="order-detail-product-table"><div className="order-detail-product-head"><span>商品信息</span><span>单价/数量</span><span>优惠</span></div><div className="order-detail-product-row"><span className="related-order-image">{product?.imageUrl ? <img src={displayImageUrl(product.imageUrl)} alt="" /> : <Package size={22} />}</span><div className="order-detail-product-name"><strong>{product?.title || currentOrder.productTitle || '未命名商品'}</strong><small>{currentOrder.specification || '规格：—'}</small></div><div className="order-detail-product-price"><b>¥{(product?.price ?? currentOrder.amount).toFixed(2)}</b><span>×1</span></div><span>—</span></div><div className="order-detail-totals"><div><span>成交价</span><b>¥{currentOrder.amount.toFixed(2)}</b></div><div><span>软件服务费</span><b>{serviceFee == null ? '—' : `-¥${serviceFee.toFixed(2)}`}</b></div><div><span>预计到手</span><b className="price">{serviceFee == null ? '—' : `¥${Math.max(0, currentOrder.amount - serviceFee).toFixed(2)}`}</b></div></div></div></section>
     <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>关闭</button></div>
   </div></aside></div>
 }
@@ -797,7 +1016,9 @@ function productTargetUrl(message: ChatMessage, contact: ChatContact) {
 
 type ProductCardFallback = { title: string; imageUrl: string; price: string }
 
-function MessageBody({ message, emojis, onProductPreview, onTradeAction, productFallback }: { message: ChatMessage; emojis: ChatEmoji[]; onProductPreview: (message: ChatMessage) => void; onTradeAction: (action: string) => void; productFallback?: ProductCardFallback }) {
+type TradeActionState = { label: string; disabled: boolean }
+
+function MessageBody({ message, emojis, onProductPreview, onTradeAction, productFallback, tradeActionState }: { message: ChatMessage; emojis: ChatEmoji[]; onProductPreview: (message: ChatMessage) => void; onTradeAction: (action: string) => void; productFallback?: ProductCardFallback; tradeActionState?: TradeActionState }) {
   const notice = systemNoticeText(message)
   if (notice) return <span className="system-notice-text">{notice}</span>
   if (message.contentKind === 'image' && message.mediaUrl) return <img className="message-image" src={displayImageUrl(message.mediaUrl)} alt="聊天图片" loading="lazy" />
@@ -810,7 +1031,7 @@ function MessageBody({ message, emojis, onProductPreview, onTradeAction, product
   }
   const tradeCard = tradeCardMeta(message)
   if (tradeCard && /快给\s*ta\s*一个评价吧/i.test(tradeCard.title)) return <article className="evaluation-message-card"><div><strong>{tradeCard.title}</strong><span>{tradeCard.subtitle}</span></div><button type="button" onClick={() => onTradeAction(tradeCard.action)}>{tradeCard.action}</button></article>
-  if (tradeCard) return <article className="trade-message-card"><strong>{tradeCard.title}</strong><div className="trade-message-card-detail"><span>{tradeCard.subtitle}</span>{tradeCard.action && <button type="button" onClick={() => onTradeAction(tradeCard.action)}>{tradeCard.action}</button>}</div></article>
+  if (tradeCard) { const actionState = tradeActionState ?? { label: tradeCard.action, disabled: false }; return <article className="trade-message-card"><strong>{tradeCard.title}</strong><div className="trade-message-card-detail"><span>{tradeCard.subtitle}</span>{tradeCard.action && <button type="button" disabled={actionState.disabled} onClick={() => onTradeAction(tradeCard.action)}>{actionState.label}</button>}</div></article> }
   if (message.contentKind === 'product' || message.cardTitle) return <button type="button" className="message-card product-share-card" onClick={() => onProductPreview(message)}><span className="product-share-media">{message.mediaUrl ? <img src={displayImageUrl(message.mediaUrl)} alt="商品图片" loading="lazy" /> : <Package size={25} />}</span><span className="message-card-copy"><strong>{message.cardTitle || message.text || '商品分享'}</strong>{message.cardSubtitle && <span>{message.cardSubtitle}</span>}{message.cardPrice && <b>{message.cardPrice.startsWith('¥') ? message.cardPrice : `¥${message.cardPrice}`}</b>}</span></button>
   return <MessageText text={message.text || `[${message.contentKind}]`} emojis={emojis} />
 }
@@ -857,7 +1078,6 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
   const [editingQuickReply, setEditingQuickReply] = useState<QuickReply | undefined>()
   const [queuedReplyImages, setQueuedReplyImages] = useState<QuickReplyImage[]>([])
   const [productPickerOpen, setProductPickerOpen] = useState(false)
-  const [composerNotice, setComposerNotice] = useState('')
   const [webProductPreviewUrl, setWebProductPreviewUrl] = useState('')
   const [busy, setBusy] = useState(false)
   const [contactLoading, setContactLoading] = useState(false)
@@ -939,14 +1159,14 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
     await api.updateCustomerRemark(account.id, selected.chatId, remark)
     setCustomerProfile((current) => current ? { ...current, remark } : current)
     setCustomerRemarkOpen(false)
-    setComposerNotice('买家备注已同步到闲鱼')
+    onNotice('买家备注已同步到闲鱼')
   }
   const accountProducts = products.filter((product) => product.accountId === account?.id && product.status === '已上架')
   const openProductPreview = async (message: ChatMessage) => {
     if (!selected) return
     const targetUrl = productTargetUrl(message, selected)
     if (!targetUrl) {
-      setComposerNotice('该商品消息没有返回可打开的链接')
+      onNotice('该商品消息没有返回可打开的链接')
       return
     }
     if (!isTauri()) {
@@ -957,20 +1177,20 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
     try {
       await api.openProductDetail(account.id, targetUrl)
     } catch (nextError) {
-      setComposerNotice(`商品详情窗口打开失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
+      onNotice(`商品详情窗口打开失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
     }
   }
   const openOrderAction = async (order: Order, action: string) => {
     if (!isTauri()) {
-      setComposerNotice('订单处理需要在已扫码登录的桌面端完成')
+      onNotice('订单处理需要在已扫码登录的桌面端完成')
       return
     }
     if (action === '提醒收货') {
       try {
         await api.remindOrderReceipt(order.accountId, order.orderNo)
-        setComposerNotice('已提醒买家确认收货')
+        onNotice('已提醒买家确认收货')
       } catch (nextError) {
-        setComposerNotice(`提醒收货失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
+        onNotice(`提醒收货失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
       }
       return
     }
@@ -987,12 +1207,12 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
       const candidates = await api.relatedOrders(account.id, selected.chatId, status)
       const order = candidates.find((item) => action === '去发货' ? item.statusCode === 'WAIT_SHIP' || item.status.includes('待发货') : action === '去处理' ? item.statusCode === 'REFUNDING' || item.status.includes('退款') : true)
       if (!order) {
-        setComposerNotice(action === '去处理' ? '暂未找到关联的退款订单，请先同步订单后重试' : '暂未找到关联的待发货订单，请先同步订单后重试')
+        onNotice(action === '去处理' ? '暂未找到关联的退款订单，请先同步订单后重试' : '暂未找到关联的待发货订单，请先同步订单后重试')
         return
       }
       await openOrderAction(order, action)
     } catch (nextError) {
-      setComposerNotice(`读取关联订单失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
+      onNotice(`读取关联订单失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
     }
   }
   const filteredContacts = contacts.filter((item) => {
@@ -1056,7 +1276,7 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
       await api.setChatPinned(account.id, contact.chatId, pinned)
       setPinnedChatIds((current) => pinned ? [contact.chatId, ...current.filter((id) => id !== contact.chatId)] : current.filter((id) => id !== contact.chatId))
       setConversationMenu(null)
-      setComposerNotice(pinned ? '会话已置顶' : '已取消置顶')
+      onNotice(pinned ? '会话已置顶' : '已取消置顶')
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
     }
@@ -1074,7 +1294,7 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
         setMessages([])
       }
       setConversationMenu(null)
-      setComposerNotice('会话已删除')
+      onNotice('会话已删除')
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
     }
@@ -1104,15 +1324,9 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
   useEffect(() => { setContactLimit(CONTACT_BATCH) }, [query])
   useEffect(() => { setContactLimit(CONTACT_BATCH) }, [conversationStatus])
   useEffect(() => {
-    if (!composerNotice) return
-    const timer = window.setTimeout(() => setComposerNotice(''), 3200)
-    return () => window.clearTimeout(timer)
-  }, [composerNotice])
-  useEffect(() => {
     setEmojiOpen(false)
     setQuickReplyOpen(false)
     setQuickReplyCommandOpen(false)
-    setComposerNotice('')
   }, [account?.id, selected?.chatId])
 
   // The native IM listener emits an event as soon as the seller WebSocket
@@ -1186,7 +1400,7 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
           setContacts(contactsPage.items)
           setContactCursor(contactsPage.nextCursor)
           setContactHasMore(contactsPage.hasMore)
-          if (hasNewUnread) playMessageNotification()
+          if (hasNewUnread) playMessageNotification(account.id)
           void onUnreadChanged()
         }
         const page = await api.syncChatMessages(account.id, syncChatId, null)
@@ -1207,7 +1421,7 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
         setMessageCursor(page.nextCursor)
         setMessageHasMore(page.hasMore)
         if (hasNewIncoming) {
-          playMessageNotification()
+          playMessageNotification(account.id)
           requestAnimationFrame(() => {
             const list = messageListRef.current
             if (!list) return
@@ -1408,14 +1622,14 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
   const sendImage = async (file: File) => {
     if (!account || !selected || busy) return
     if (!file.type.startsWith('image/')) {
-      setComposerNotice('请选择 JPG、PNG、WEBP 等图片文件')
+      onNotice('请选择 JPG、PNG、WEBP 等图片文件')
       return
     }
     if (file.size > 8 * 1024 * 1024) {
-      setComposerNotice('图片不能超过 8MB')
+      onNotice('图片不能超过 8MB')
       return
     }
-    setBusy(true); setError(''); setComposerNotice('正在上传并发送图片…')
+    setBusy(true); setError(''); onNotice('正在上传并发送图片…')
     try {
       const imageData = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader()
@@ -1431,12 +1645,12 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
       })
       const message = await api.sendChatImage(account.id, selected.chatId, selected.otherUserId, file.name, file.type, imageData, width, height)
       setMessages((current) => [...current, message])
-      setComposerNotice('图片已发送')
+      onNotice('图片已发送')
       await refreshContacts(false)
       requestAnimationFrame(() => { const list = messageListRef.current; if (list) list.scrollTop = list.scrollHeight })
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
-      setComposerNotice('图片已发送失败')
+      onNotice('图片已发送失败')
     } finally { setBusy(false) }
   }
 
@@ -1446,20 +1660,20 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
     const itemId = parts[0] === 'SRC' && parts[1] === 'P' ? parts.slice(3).join('-') : ''
     if (!itemId) {
       setProductPickerOpen(false)
-      setComposerNotice('该商品还没有闲鱼商品 ID，请先同步账号商品')
+      onNotice('该商品还没有闲鱼商品 ID，请先同步账号商品')
       return
     }
-    setBusy(true); setError(''); setProductPickerOpen(false); setComposerNotice('正在发送商品卡…')
+    setBusy(true); setError(''); setProductPickerOpen(false); onNotice('正在发送商品卡…')
     try {
       const message = await api.sendChatProduct(account.id, selected.chatId, selected.otherUserId, itemId, product.title, product.imageUrl, product.price)
       setMessages((current) => [...current, message])
       setDraft('')
-      setComposerNotice('商品链接已发送')
+      onNotice('商品链接已发送')
       await refreshContacts(false)
       requestAnimationFrame(() => { const list = messageListRef.current; if (list) list.scrollTop = list.scrollHeight })
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
-      setComposerNotice('商品链接发送失败')
+      onNotice('商品链接发送失败')
     } finally { setBusy(false) }
   }
 
@@ -1474,7 +1688,7 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
     setQueuedReplyImages(reply.images)
     setQuickReplyOpen(false)
     setQuickReplyCommandOpen(false)
-    setComposerNotice(reply.images.length ? `已插入“${reply.title}”的图文内容` : `已插入“${reply.title}”`)
+    onNotice(reply.images.length ? `已插入“${reply.title}”的图文内容` : `已插入“${reply.title}”`)
   }
 
   const saveQuickReply = async (input: { title: string; content: string; shortCode: string; images: QuickReplyImage[] }) => {
@@ -1485,7 +1699,7 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
         : await api.createQuickReply(account.id, input.title, input.content, input.shortCode, input.images)
       setQuickReplies((current) => [reply, ...current.filter((item) => item.id !== reply.id)])
       setEditingQuickReply(reply)
-      setComposerNotice('快捷回复已保存')
+      onNotice('快捷回复已保存')
     } catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)) }
   }
 
@@ -1506,6 +1720,24 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
         return searchable.includes(autoSuggestQuery) || autoSuggestQuery.includes(reply.title.toLowerCase())
       })
       : []
+
+  const tradeActionState = (message: ChatMessage): TradeActionState | undefined => {
+    const card = tradeCardMeta(message)
+    if (!card?.action || !account) return undefined
+    const raw = (message.cardTitle || message.text).replace(/^\[|\]$/g, '').trim()
+    if (card.action === '去处理' && /退款成功|已退款|退款完成/.test(raw)) return { label: '已退款', disabled: true }
+    if (card.action === '去处理' && messages.some((item) => systemNoticeText(item) === '退款成功，钱款已原路退返')) return { label: '已退款', disabled: true }
+    if (card.action === '去发货' && messages.some((item) => systemNoticeText(item) === '您已发货')) return { label: '已发货', disabled: true }
+    const candidates = orders.filter((item) => item.accountId === account.id && (
+      (selected?.otherUserName && item.buyerMaskedName && (item.buyerMaskedName === selected.otherUserName || item.buyerMaskedName.includes(selected.otherUserName) || selected.otherUserName.includes(item.buyerMaskedName)))
+      || (selected?.itemId && item.itemId === selected.itemId)
+      || (selected?.itemTitle && item.productTitle && (item.productTitle === selected.itemTitle || item.productTitle.includes(selected.itemTitle) || selected.itemTitle.includes(item.productTitle)))
+    ))
+    if (card.action === '去发货' && candidates.some((item) => item.statusCode === 'SHIPPED' || item.statusCode === 'SUCCESS' || /已发货|待收货|交易成功|已完成/.test(item.status))) return { label: '已发货', disabled: true }
+    if (card.action === '修改价格' && (/待发货|已支付/.test(selected?.orderStatus || '') || candidates.some((item) => ['PAID', 'WAIT_SHIP', 'WAIT_SELLER_SEND_GOODS', 'WAIT_SEND_GOODS', 'WAIT_DELIVERY', 'SHIPPED', 'WAIT_BUYER_CONFIRM_GOODS', 'WAIT_BUYER_CONFIRM_RECEIVE', 'WAIT_RECEIVE', 'SUCCESS', 'TRADE_SUCCESS', 'COMPLETED'].includes(item.statusCode.toUpperCase()) || /待发货|已支付|已发货|交易成功|已完成/.test(item.status)))) return { label: '已支付', disabled: true }
+    if (card.action === '去处理' && candidates.some((item) => ['REFUNDED', 'REFUND_SUCCESS', 'REFUND_CLOSED'].includes(item.statusCode.toUpperCase()) || /退款成功|已退款|退款完成/.test(item.status))) return { label: '已退款', disabled: true }
+    return undefined
+  }
 
   return <div className="workbench">
     <section className="conversation-panel">
@@ -1531,15 +1763,16 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
               ? <AccountAvatar account={account} className="message-avatar" />
               : <span className="avatar account-avatar message-avatar"><span>{(message.senderUserName || '我').slice(0, 1)}</span></span>
             : <ContactAvatar contact={selected} />
-          const senderName = isOutgoing ? account?.displayName || message.senderUserName || '我' : message.senderUserName || selected.otherUserName
-          if (systemNotice) return <div className="system-event-group" key={message.id}><time>{formatEventTime(message.sentAt)}</time><div className="message-row system-notice-row"><div className="message-bubble system-notice-bubble"><MessageBody message={message} emojis={emojis} onProductPreview={openProductPreview} onTradeAction={(action) => void openTradeAction(action)} /></div></div></div>
-          if (evaluationPrompt) return <div className="system-event-group evaluation-event-group" key={message.id}><time>{formatEventTime(message.sentAt)}</time><div className="message-bubble trade-bubble evaluation-prompt"><MessageBody message={message} emojis={emojis} onProductPreview={openProductPreview} onTradeAction={(action) => void openTradeAction(action)} /></div></div>
+          const refundMessage = /退款/.test(message.cardTitle || message.text)
+          const senderName = refundMessage || (tradeCard && !isOutgoing) ? selected.otherUserName : isOutgoing ? account?.displayName || message.senderUserName || '我' : message.senderUserName || selected.otherUserName
+          if (systemNotice) return <div className="system-event-group" key={message.id}><time>{formatEventTime(message.sentAt)}</time><div className="message-row system-notice-row"><div className="message-bubble system-notice-bubble"><MessageBody message={message} emojis={emojis} onProductPreview={openProductPreview} onTradeAction={(action) => void openTradeAction(action)} tradeActionState={tradeActionState(message)} /></div></div></div>
+          if (evaluationPrompt) return <div className="system-event-group evaluation-event-group" key={message.id}><time>{formatEventTime(message.sentAt)}</time><div className="message-bubble trade-bubble evaluation-prompt"><MessageBody message={message} emojis={emojis} onProductPreview={openProductPreview} onTradeAction={(action) => void openTradeAction(action)} tradeActionState={tradeActionState(message)} /></div></div>
           const productShare = isProductShare(message)
           const linkTitle = productLinkTitle(message)
           const linkedProduct = products.find((item) => item.id === selected.itemId || item.title === linkTitle || item.title === message.cardTitle)
           const sameConversationProduct = Boolean(linkedProduct && selected.itemId && linkedProduct.id.endsWith(`-${selected.itemId}`))
           const productFallback = { title: linkedProduct?.title || linkTitle || selected.itemTitle || '', imageUrl: linkedProduct?.imageUrl || (sameConversationProduct ? selected.itemImageUrl : ''), price: linkedProduct ? String(linkedProduct.price) : '' }
-          return <div className={`message-row ${message.direction}`} key={message.id}>{!isOutgoing && senderAvatar}<div className="message-stack"><div className="message-sender-line"><span>{senderName}</span><time>{formatDate(message.sentAt)}</time></div><div className={`message-bubble ${message.contentKind === 'image' ? 'image-bubble' : ''} ${message.contentKind === 'expression' ? 'expression-bubble' : ''} ${productShare ? 'card-bubble product-share-bubble' : ''} ${tradeCard ? 'trade-bubble' : ''} ${evaluationPrompt ? 'evaluation-prompt' : ''} ${emphasizedTradeCard ? 'emphasized' : ''}`}><MessageBody message={message} emojis={emojis} onProductPreview={openProductPreview} onTradeAction={(action) => void openTradeAction(action)} productFallback={productFallback} /></div>{isOutgoing && receipt && <small className="message-receipt">{receipt}</small>}</div>{isOutgoing && senderAvatar}</div>
+          return <div className={`message-row ${message.direction}`} key={message.id}>{!isOutgoing && senderAvatar}<div className="message-stack"><div className="message-sender-line"><span>{senderName}</span><time>{formatChatDate(message.sentAt)}</time></div><div className={`message-bubble ${message.contentKind === 'image' ? 'image-bubble' : ''} ${message.contentKind === 'expression' ? 'expression-bubble' : ''} ${productShare ? 'card-bubble product-share-bubble' : ''} ${tradeCard ? 'trade-bubble' : ''} ${evaluationPrompt ? 'evaluation-prompt' : ''} ${emphasizedTradeCard ? 'emphasized' : ''}`}><MessageBody message={message} emojis={emojis} onProductPreview={openProductPreview} onTradeAction={(action) => void openTradeAction(action)} productFallback={productFallback} tradeActionState={tradeActionState(message)} /></div>{isOutgoing && receipt && <small className="message-receipt">{receipt}</small>}</div>{isOutgoing && senderAvatar}</div>
         }) : <div className="chat-blank"><MessageCircle size={38} /><h2>暂无历史消息</h2><p>点击左侧“同步”后会从闲鱼拉取最新会话。</p></div>}</div>
         <footer className="chat-composer">
           <input ref={imageInputRef} className="composer-file-input" type="file" accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; if (file) void sendImage(file); event.currentTarget.value = '' }} />
@@ -1563,7 +1796,6 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
               </div>
             </div>
           </div>
-          {composerNotice && <div className="composer-tool-notice">{composerNotice}</div>}
           {queuedReplyImages.length > 0 && <div className="queued-reply-images">{queuedReplyImages.map((image, index) => <span key={`${image.name}-${index}`}><img src={image.dataUrl} alt="快捷回复图片" /><button type="button" aria-label="移除快捷回复图片" onClick={() => setQueuedReplyImages((current) => current.filter((_, imageIndex) => imageIndex !== index))}>×</button></span>)}</div>}
           <div className="composer-input-row"><div className="composer-command-anchor" ref={quickReplyCommandRef}><textarea value={draft} onChange={(event) => { const next = event.target.value; setDraft(next); setQuickReplyCommandOpen(/(?:^|\s)\/[a-zA-Z0-9_-]*$/.test(next) || (quickReplyAutoSuggest && next.trim().length >= 2)) }} onPaste={(event) => { const image = Array.from(event.clipboardData.items).find((item) => item.kind === 'file' && item.type.startsWith('image/'))?.getAsFile(); if (!image) return; event.preventDefault(); void sendImage(image) }} onKeyDown={(event) => { if (event.key === 'Escape') { setQuickReplyCommandOpen(false); return } if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} placeholder={'通过设置启用「自动联想」或输入“/”唤起快捷回复\n「Command + V」可直接发送截图或复制的图片\n「Shift + Enter」进行内容换行'} />{quickReplyCommandOpen && <div className="quick-command-menu"><header><strong>{commandActive ? '快捷指令' : '自动联想'}</strong><small>{commandActive ? `输入 /${commandQuery} 筛选` : '根据输入匹配快捷回复'}</small></header>{matchingQuickReplies.length ? matchingQuickReplies.map((reply) => <button type="button" key={reply.id} onClick={() => insertQuickReply(reply, commandActive, !commandActive)}><span><strong>{reply.title}</strong><small>/{reply.shortCode}</small></span><em>{reply.images.length ? `${reply.images.length} 图` : '文字'}</em></button>) : <p>{commandActive ? '没有匹配的快捷回复' : '暂无联想结果'}</p>}</div>}</div><button className="primary" disabled={(!draft.trim() && !queuedReplyImages.length) || busy} onClick={() => void send()}><Send size={15} />{busy ? '处理中' : '发送'}</button></div>
         </footer>
@@ -1573,9 +1805,9 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
     {conversationMenu && createPortal(<div className="conversation-context-menu" style={{ left: Math.min(conversationMenu.x, window.innerWidth - 176), top: Math.min(conversationMenu.y, window.innerHeight - 104) }} onMouseDown={(event) => event.stopPropagation()}><button type="button" onClick={() => void toggleConversationPin(conversationMenu.contact)}><Pin size={15} />{pinnedChatIds.includes(conversationMenu.contact.chatId) ? '取消置顶' : '置顶'}</button><button type="button" className="danger" onClick={() => void deleteConversation(conversationMenu.contact)}><Trash2 size={15} />删除</button></div>, document.body)}
     {webProductPreviewUrl && <VirtualProductDetail url={webProductPreviewUrl} onClose={() => setWebProductPreviewUrl('')} />}
     {customerRemarkOpen && selected && <CustomerRemarkDialog value={customerProfile?.remark ?? ''} onClose={() => setCustomerRemarkOpen(false)} onSave={saveCustomerRemark} />}
-    {tradeDrawer?.kind === 'ship' && <ShipOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); setComposerNotice('已发货，订单状态已同步') }} />}
-    {tradeDrawer?.kind === 'cancel' && <CancelOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); setComposerNotice('订单已取消，状态已同步') }} />}
-    {tradeDrawer?.kind === 'refund' && <RefundOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); setComposerNotice('退款处理已提交，订单状态已同步') }} />}
+    {tradeDrawer?.kind === 'ship' && <ShipOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); onNotice('已发货，订单状态已同步') }} />}
+    {tradeDrawer?.kind === 'cancel' && <CancelOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); onNotice('订单已取消，状态已同步') }} />}
+    {tradeDrawer?.kind === 'refund' && <RefundOrderDrawer accountId={tradeDrawer.order.accountId} order={tradeDrawer.order} onClose={() => setTradeDrawer(null)} onDone={() => { setTradeDrawer(null); onOrderUpdated(); onNotice('退款处理已提交，订单状态已同步') }} />}
   </div>
 }
 
@@ -1587,11 +1819,7 @@ function ContactAvatar({ contact }: { contact: ChatContact }) {
 }
 
 function customerItemDate(value: string) {
-  if (!value) return ''
-  const timestamp = Number(value)
-  if (Number.isFinite(timestamp) && timestamp > 0) return formatRelativeTime(new Date(timestamp).toISOString())
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : formatRelativeTime(date.toISOString())
+  return value || ''
 }
 
 function customerCreditTone(value: string) {
@@ -1697,7 +1925,7 @@ function CustomerContextPanel({ contact, profile, inventory, orders, onOrderUpda
     <div className="customer-product-list">{products.length ? products.slice(0, 10).map((item, index) => activeTab === 'current'
       ? <article className="customer-current-item" key={`${item.itemId || item.title}-${index}`}><div className="customer-current-image">{item.imageUrl ? <img src={displayImageUrl(item.imageUrl)} alt="" loading="lazy" onError={(event) => event.currentTarget.parentElement?.classList.add('image-error')} /> : null}<Package size={21} />{item.status && <span>{item.status}</span>}</div><div className="customer-current-copy"><strong>{item.title || `商品 ${item.itemId}`}</strong><small>曝光：{item.exposureCount || '—'} <i>｜</i> 浏览：{item.viewCount || '—'} <i>｜</i> 想要：{item.wantCount || '—'}</small><b>{item.price && `¥${item.price.replace(/^¥/, '')}`}{item.fishCoin && <em>{item.price ? ' + ' : ''}{item.fishCoin}闲鱼币</em>}</b></div></article>
       : <article className="customer-footprint-item" key={`${item.itemId || item.title}-${index}`}><div className="customer-footprint-image">{item.imageUrl ? <img src={displayImageUrl(item.imageUrl)} alt={item.title || '商品图片'} loading="lazy" onError={(event) => event.currentTarget.parentElement?.classList.add('image-error')} /> : <Package size={17} />}{item.visitedAt && <small>{customerItemDate(item.visitedAt)}</small>}</div>{item.price && <b>¥{item.price.replace(/^¥/, '')}</b>}</article>) : <p>{tabEmptyCopy}</p>}</div>
-    <section className="related-orders"><div className="related-orders-head"><strong>关联订单</strong><small>{relatedOrdersSyncing ? '同步中…' : '⋯'}</small></div><div className="related-order-tabs">{orderTabs.map((tab) => <button type="button" className={orderFilter === tab ? 'active' : ''} key={tab} onClick={() => setOrderFilter(tab)}>{tab}</button>)}</div>{relatedOrders.length ? <div className="related-order-list">{relatedOrders.map((order) => { const product = inventory.find((item) => item.accountId === order.accountId && (item.id.endsWith(`-${order.itemId}`) || item.title === order.productTitle || item.title.includes(order.productTitle) || order.productTitle.includes(item.title))); const displayTitle = product?.title || order.productTitle || '未命名商品'; const meta = orderStatusMeta(order.status); const pendingShipment = order.status.includes('待发货'); return <article className={`related-order-card ${meta.closed ? 'closed' : ''} ${meta.success ? 'completed' : ''}`} key={order.id}><div className="related-order-meta"><span className={`related-order-status ${meta.success ? 'success' : ''}`}>{meta.label}</span><small>订单编号 {order.orderNo} <button type="button" className="copy-order-id" title="复制订单编号" onClick={() => void copyOrderNumber(order.orderNo)}><Clipboard size={11} /></button></small><button type="button" className="order-detail-link" onClick={() => setDetailOrder(order)}>详情</button></div><div className="related-order-date">下单 {order.createdAt ? formatDate(order.createdAt) : '时间未知'}{meta.success && ` 付款 ${order.createdAt ? formatDate(order.createdAt) : ''}`}</div><div className="related-order-title"><span className="related-order-image">{product?.imageUrl ? <img src={displayImageUrl(product.imageUrl)} alt={displayTitle} loading="lazy" onError={(event) => event.currentTarget.style.display = 'none'} /> : <Package size={18} />}</span><span className="related-order-copy"><strong>{displayTitle}</strong><small>规格：一天</small></span><b>¥{(product?.price ?? order.amount).toFixed(2)}<small>[共1件]</small></b></div><div className="related-order-details"><div><span>成交价</span><strong>¥{order.amount.toFixed(2)}{meta.closed && !meta.refunded && <em>（含运费）</em>}</strong></div><div><span>发货状态</span><span>{meta.shipped || meta.success || meta.refunded ? '已发货' : '未发货'}</span></div>{meta.shipped && <div><span>发货时间</span><span>{order.createdAt ? formatDate(order.createdAt) : '时间未知'}</span></div>}<div><span>{meta.closed ? '完结时间' : '下单时间'}</span><span>{order.createdAt ? formatDate(order.createdAt) : '时间未知'}</span></div><div className="order-note-row"><span>订单备注</span>{editingOrderId === order.id ? <span className="order-note-editor"><input value={orderNote} onChange={(event) => setOrderNote(event.target.value)} autoFocus /><button type="button" disabled={savingNote} onClick={() => void saveOrderNote(order)}>保存</button></span> : <button type="button" className="order-note-button" onClick={() => { setEditingOrderId(order.id); setOrderNote(order.note) }}>{order.note || '添加备注'} <Pencil size={11} /></button>}</div></div>{pendingShipment && <div className="related-order-actions"><button type="button" className="primary" onClick={() => void onOrderAction(order, '去发货')}>去发货</button><button type="button" className="secondary" onClick={() => void onOrderAction(order, '取消订单')}>取消订单</button></div>}{meta.shipped && !meta.success && !meta.refunded && <div className="related-order-actions"><button type="button" className="primary" onClick={() => void onOrderAction(order, '提醒收货')}>提醒收货</button></div>}{meta.success && !meta.refunded && <div className="related-order-actions"><button type="button">查看评价</button><button type="button">查看钱款</button></div>}{meta.refunded && <div className="refund-success-banner">退款成功 <b>›</b></div>}</article> })}</div> : <p className="related-orders-empty">当前筛选暂无订单</p>}</section>{detailOrder && <OrderDetailModal order={detailOrder} product={inventory.find((item) => item.accountId === detailOrder.accountId && (item.id.endsWith(`-${detailOrder.itemId}`) || item.title === detailOrder.productTitle || detailOrder.productTitle.includes(item.id.split("-").pop() || "")))} onClose={() => setDetailOrder(null)} onRefundAction={async () => { setDetailOrder(null); await onOrderAction(detailOrder, '去处理') }} />}
+    <section className="related-orders"><div className="related-orders-head"><strong>关联订单</strong><small>{relatedOrdersSyncing ? '同步中…' : '⋯'}</small></div><div className="related-order-tabs">{orderTabs.map((tab) => <button type="button" className={orderFilter === tab ? 'active' : ''} key={tab} onClick={() => setOrderFilter(tab)}>{tab}</button>)}</div>{relatedOrders.length ? <div className="related-order-list">{relatedOrders.map((order) => { const product = inventory.find((item) => item.accountId === order.accountId && (item.id.endsWith(`-${order.itemId}`) || item.title === order.productTitle || item.title.includes(order.productTitle) || order.productTitle.includes(item.title))); const displayTitle = product?.title || order.productTitle || '未命名商品'; const meta = orderStatusMeta(order.status); const pendingShipment = order.status.includes('待发货'); return <article className={`related-order-card ${meta.closed ? 'closed' : ''} ${meta.success ? 'completed' : ''}`} key={order.id}><div className="related-order-meta"><span className={`related-order-status ${meta.success ? 'success' : ''}`}>{meta.label}</span><small>订单编号 {order.orderNo} <button type="button" className="copy-order-id" title="复制订单编号" onClick={() => void copyOrderNumber(order.orderNo)}><Clipboard size={11} /></button></small><button type="button" className="order-detail-link" onClick={() => setDetailOrder(order)}>详情</button></div><div className="related-order-date">下单 {order.createdAt ? formatDate(order.createdAt) : '时间未知'}{meta.success && ` 付款 ${order.createdAt ? formatDate(order.createdAt) : ''}`}</div><div className="related-order-title"><span className="related-order-image">{product?.imageUrl ? <img src={displayImageUrl(product.imageUrl)} alt={displayTitle} loading="lazy" onError={(event) => event.currentTarget.style.display = 'none'} /> : <Package size={18} />}</span><span className="related-order-copy"><strong>{displayTitle}</strong><small>{order.specification || '规格：—'}</small></span><b>¥{(product?.price ?? order.amount).toFixed(2)}<small>[共1件]</small></b></div><div className="related-order-details"><div><span>成交价</span><strong>¥{order.amount.toFixed(2)}{meta.closed && !meta.refunded && <em>（含运费）</em>}</strong></div><div><span>发货状态</span><span>{meta.shipped || meta.success || meta.refunded ? '已发货' : '未发货'}</span></div>{meta.shipped && <div><span>发货时间</span><span>{order.createdAt ? formatDate(order.createdAt) : '时间未知'}</span></div>}<div><span>{meta.closed ? '完结时间' : '下单时间'}</span><span>{order.createdAt ? formatDate(order.createdAt) : '时间未知'}</span></div><div className="order-note-row"><span>订单备注</span>{editingOrderId === order.id ? <span className="order-note-editor"><input value={orderNote} onChange={(event) => setOrderNote(event.target.value)} autoFocus /><button type="button" disabled={savingNote} onClick={() => void saveOrderNote(order)}>保存</button></span> : <button type="button" className="order-note-button" onClick={() => { setEditingOrderId(order.id); setOrderNote(order.note) }}>{order.note || '添加备注'} <Pencil size={11} /></button>}</div></div>{pendingShipment && <div className="related-order-actions"><button type="button" className="primary" onClick={() => void onOrderAction(order, '去发货')}>去发货</button><button type="button" className="secondary" onClick={() => void onOrderAction(order, '取消订单')}>取消订单</button></div>}{meta.shipped && !meta.success && !meta.refunded && <div className="related-order-actions"><button type="button" className="primary" onClick={() => void onOrderAction(order, '提醒收货')}>提醒收货</button></div>}{meta.success && !meta.refunded && <div className="related-order-actions"><button type="button">查看评价</button><button type="button">查看钱款</button></div>}{meta.refunded && <div className="refund-success-banner">退款成功 <b>›</b></div>}</article> })}</div> : <p className="related-orders-empty">当前筛选暂无订单</p>}</section>{detailOrder && <OrderDetailModal order={detailOrder} product={inventory.find((item) => item.accountId === detailOrder.accountId && (item.id.endsWith(`-${detailOrder.itemId}`) || item.title === detailOrder.productTitle || detailOrder.productTitle.includes(item.id.split("-").pop() || "")))} onClose={() => setDetailOrder(null)} onRefundAction={async () => { setDetailOrder(null); await onOrderAction(detailOrder, '去处理') }} />}
     {(profile?.syncNote || error) && <p className="customer-sync-note">{profile?.syncNote || `客户资料同步失败：${error}`}</p>}
   </div>
 }
@@ -1864,7 +2092,7 @@ function LogManager({ onClose }: { onClose: () => void }) {
 
 type SettingsSection = 'general' | 'account' | 'service' | 'notifications' | 'data' | 'about'
 
-function SettingsPage({ quickReplyAutoSuggest, onQuickReplyAutoSuggestChange, onExport, onOpenLogs, onQrLogin }: { quickReplyAutoSuggest: boolean; onQuickReplyAutoSuggestChange: (value: boolean) => void; onExport: () => void; onOpenLogs: () => void; onQrLogin: () => void }) {
+function SettingsPage({ accounts, quickReplyAutoSuggest, onQuickReplyAutoSuggestChange, onExport, onOpenLogs, onQrLogin }: { accounts: Account[]; quickReplyAutoSuggest: boolean; onQuickReplyAutoSuggestChange: (value: boolean) => void; onExport: () => void; onOpenLogs: () => void; onQrLogin: () => void }) {
   const [section, setSection] = useState<SettingsSection>('general')
   const sections: Array<{ id: SettingsSection; label: string; icon: typeof Settings }> = [
     { id: 'general', label: '通用设置', icon: Settings },
@@ -1895,7 +2123,7 @@ function SettingsPage({ quickReplyAutoSuggest, onQuickReplyAutoSuggestChange, on
       </>}
       {section === 'account' && <SettingsGroup title="账号登录" description="通过扫码连接闲鱼账号，账号信息会加入当前工作台。"><div className="settings-row"><div className="settings-row-with-icon"><span className="settings-symbol"><UserRound size={18} /></span><div><h3>扫码登录闲鱼</h3><p>打开二维码后使用闲鱼 App 扫描，登录成功后自动保存本机会话。</p></div></div><button className="settings-action" onClick={onQrLogin}>前往扫码<ExternalLink size={15} /></button></div></SettingsGroup>}
       {section === 'service' && <SettingsGroup title="客服偏好" description="客服工作台会根据以下设置提供辅助。"><div className="settings-row"><div className="settings-row-with-icon"><span className="settings-symbol"><MessageCircle size={18} /></span><div><h3>快捷回复自动联想</h3><p>开启后，输入内容会自动匹配已有的话术，按需选择发送。</p></div></div><label className="settings-switch"><b>{quickReplyAutoSuggest ? '已开启' : '已关闭'}</b><input type="checkbox" checked={quickReplyAutoSuggest} onChange={(event) => onQuickReplyAutoSuggestChange(event.target.checked)} /><span aria-hidden="true" /></label></div></SettingsGroup>}
-      {section === 'notifications' && <NotificationSettings />}
+      {section === 'notifications' && <NotificationSettings accounts={accounts} />}
       {section === 'data' && <>
         <SettingsGroup title="本地备份" description="导出的文件可用于迁移和问题排查。"><div className="settings-row"><div className="settings-row-with-icon"><span className="settings-symbol"><Download size={18} /></span><div><h3>导出本地备份</h3><p>导出账号资料、商品和订单为 JSON 文件。</p></div></div><button className="settings-action" onClick={onExport}>导出备份<Download size={15} /></button></div></SettingsGroup>
         <SettingsGroup title="运行记录" description="查看连接、同步和错误日志，便于定位问题。"><div className="settings-row"><div className="settings-row-with-icon"><span className="settings-symbol"><History size={18} /></span><div><h3>日志管理</h3><p>日志会自动刷新并跟随最新记录。</p></div></div><button className="settings-action" onClick={onOpenLogs}>查看日志<ExternalLink size={15} /></button></div></SettingsGroup>
@@ -1909,34 +2137,48 @@ function SettingsGroup({ title, description, children }: { title: string; descri
 
 type CustomNotificationSound = { name: string; duration: number }
 
-function NotificationSettings() {
-  const [selectedSound, setSelectedSound] = useState<NotificationSoundId>(() => selectedNotificationSoundId())
+function NotificationSettings({ accounts }: { accounts: Account[] }) {
+  const [selectedAccountId, setSelectedAccountId] = useState(() => accounts[0]?.id || '')
+  const [selectedSound, setSelectedSound] = useState<NotificationSoundId>(() => selectedNotificationSoundId(accounts[0]?.id))
   const [customSound, setCustomSound] = useState<CustomNotificationSound | null>(() => {
-    try { return JSON.parse(localStorage.getItem(notificationCustomSoundStorageKey.replace('sound', 'meta')) || 'null') as CustomNotificationSound | null } catch { return null }
+    return notificationSettingsForAccount(accounts[0]?.id).customSound
   })
   const [uploadError, setUploadError] = useState('')
   const [uploading, setUploading] = useState(false)
-  const [notificationToggles, setNotificationToggles] = useState<Record<string, boolean>>(() => {
-    try { return { chat: true, order: true, system: true, offline: false, ...JSON.parse(localStorage.getItem('shark-butler-notification-toggles') || '{}') as Record<string, boolean> } } catch { return { chat: true, order: true, system: true, offline: false } }
-  })
+  const [notificationToggles, setNotificationToggles] = useState<NotificationToggles>(() => notificationSettingsForAccount(accounts[0]?.id).toggles)
   const fileRef = useRef<HTMLInputElement>(null)
 
-  const updateToggle = (key: string, value: boolean) => {
+  useEffect(() => {
+    const nextAccountId = accounts.some((account) => account.id === selectedAccountId) ? selectedAccountId : accounts[0]?.id || ''
+    if (nextAccountId !== selectedAccountId) setSelectedAccountId(nextAccountId)
+    const settings = notificationSettingsForAccount(nextAccountId)
+    setSelectedSound(settings.sound)
+    setCustomSound(settings.customSound)
+    setNotificationToggles(settings.toggles)
+  }, [accounts, selectedAccountId])
+
+  const updateAccountSettings = (patch: Partial<AccountNotificationSettings>) => {
+    if (!selectedAccountId) return
+    const current = notificationSettingsForAccount(selectedAccountId)
+    saveNotificationSettingsForAccount(selectedAccountId, { ...current, ...patch })
+  }
+
+  const updateToggle = (key: keyof NotificationToggles, value: boolean) => {
     setNotificationToggles((current) => {
       const next = { ...current, [key]: value }
-      localStorage.setItem('shark-butler-notification-toggles', JSON.stringify(next))
+      updateAccountSettings({ toggles: next })
       return next
     })
   }
 
   const selectSound = (id: NotificationSoundId) => {
     setSelectedSound(id)
-    localStorage.setItem(notificationSoundStorageKey, id)
+    updateAccountSettings({ sound: id })
   }
 
   const previewSound = async (id: NotificationSoundId) => {
     if (id === 'custom') {
-      const dataUrl = localStorage.getItem(notificationCustomSoundStorageKey)
+      const dataUrl = notificationSettingsForAccount(selectedAccountId).customSoundDataUrl
       if (dataUrl) { const audio = new Audio(dataUrl); audio.volume = .85; void audio.play().catch(() => undefined); }
       return
     }
@@ -1968,10 +2210,9 @@ function NotificationSettings() {
         reader.onerror = () => reject(new Error('音频读取失败。'))
         reader.readAsDataURL(file)
       })
-      localStorage.setItem(notificationCustomSoundStorageKey, dataUrl)
-      localStorage.setItem(notificationCustomSoundStorageKey.replace('sound', 'meta'), JSON.stringify({ name: file.name, duration }))
-      localStorage.setItem(notificationSoundStorageKey, 'custom')
-      setCustomSound({ name: file.name, duration })
+      const nextCustomSound = { name: file.name, duration }
+      updateAccountSettings({ sound: 'custom', customSoundDataUrl: dataUrl, customSound: nextCustomSound })
+      setCustomSound(nextCustomSound)
       setSelectedSound('custom')
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : '音频处理失败，请换一个文件重试。')
@@ -1981,7 +2222,12 @@ function NotificationSettings() {
     }
   }
 
+  if (!accounts.length) return <SettingsGroup title="账号提示音" description="提示音按账号分别保存。"><p className="notification-empty-state">请先登录至少一个闲鱼账号，再为账号配置通知提醒。</p></SettingsGroup>
+
   return <>
+    <SettingsGroup title="账号提示音" description="先选择账号，下面的开关和提示音只会作用于该账号。">
+      <div className="settings-row notification-account-row"><div><h3>当前配置账号</h3><p>多个账号可以使用不同的提示音和通知开关。</p></div><label className="notification-account-select"><span className="sr-only">选择配置账号</span><select value={selectedAccountId} onChange={(event) => setSelectedAccountId(event.target.value)}>{accounts.map((account) => <option value={account.id} key={account.id}>{account.displayName}</option>)}</select><ChevronDown size={14} /></label></div>
+    </SettingsGroup>
     <SettingsGroup title="通知开关" description="控制店铺消息和系统状态的提示提醒。">
       <div className="notification-toggle-list">
         {[
@@ -1989,7 +2235,7 @@ function NotificationSettings() {
           ['订单消息', '新订单、付款和售后消息使用同一提示音。'],
           ['系统消息', '同步完成、连接异常等系统事件提醒。'],
           ['离线提示', '应用切到后台后仍保留消息提醒。'],
-        ].map(([label, description], index) => { const key = ['chat', 'order', 'system', 'offline'][index]; return <label className="notification-toggle" key={label}><span><b>{label}</b><small>{description}</small></span><input type="checkbox" checked={Boolean(notificationToggles[key])} onChange={(event) => updateToggle(key, event.target.checked)} /><i aria-hidden="true" /></label> })}
+        ].map(([label, description], index) => { const key = ['chat', 'order', 'system', 'offline'][index] as keyof NotificationToggles; return <label className="notification-toggle" key={label}><span><b>{label}</b><small>{description}</small></span><input type="checkbox" checked={notificationToggles[key]} onChange={(event) => updateToggle(key, event.target.checked)} /><i aria-hidden="true" /></label> })}
       </div>
     </SettingsGroup>
     <SettingsGroup title="提示音" description="选择一个内置提示音，或上传 1～3 秒的自定义音频。">

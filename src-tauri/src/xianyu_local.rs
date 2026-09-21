@@ -1,3 +1,9 @@
+//! 闲鱼接口适配层。
+//!
+//! 本模块只负责与闲鱼服务端通信：构造 MTop 请求、维护 Cookie、处理接口重试，
+//! 并将商品、订单、退款等官方响应提取为稳定的 JSON 数据。Tauri 命令层不应
+//! 自行拼接闲鱼 URL、签名或请求头，新增接口优先在本模块增加带注释的封装函数。
+
 use base64::Engine as _;
 use reqwest::header::{HeaderMap, ACCEPT, COOKIE, ORIGIN, REFERER, SET_COOKIE, USER_AGENT};
 use serde_json::Value;
@@ -9,6 +15,19 @@ use std::{
 use uuid::Uuid;
 
 const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+// Carries the short-lived Baxia/punish URL to the IM listener. The listener
+// consumes it before writing an application log, keeping the signed URL out
+// of persistent logs.
+const IM_VALIDATION_ERROR_PREFIX: &str = "__XY_IM_VALIDATION_URL__:";
+
+pub(crate) fn im_validation_url(error: &str) -> Option<&str> {
+    error.strip_prefix(IM_VALIDATION_ERROR_PREFIX)
+}
+
+pub(crate) fn web_user_agent() -> &'static str {
+    USER_AGENT_VALUE
+}
 
 #[derive(Debug, Clone)]
 struct QrSession {
@@ -585,7 +604,7 @@ pub async fn poll_qr(session_id: &str) -> Result<QrPoll, String> {
         .unwrap_or_default()
         .trim()
         .to_owned();
-    let (status, message) = match raw {
+    let (status, initial_message) = match raw {
         "NEW" => ("waiting", "请使用闲鱼 App 扫描二维码"),
         "SCANED" => ("scanned", "已扫码，请在手机端确认登录"),
         "EXPIRED" => ("expired", "二维码已过期，请重新生成"),
@@ -608,6 +627,7 @@ pub async fn poll_qr(session_id: &str) -> Result<QrPoll, String> {
         "CANCELED" | "CANCELLED" => ("cancelled", "已取消扫码登录"),
         _ => ("waiting", "等待扫码确认"),
     };
+    let mut message = initial_message.to_owned();
     let account_id = cookies
         .get("unb")
         .or_else(|| cookies.get("tracknick"))
@@ -621,8 +641,13 @@ pub async fn poll_qr(session_id: &str) -> Result<QrPoll, String> {
                 face_htoken = result.0;
                 verification_qr_url = result.2;
             }
-            Err(_) => {
-                verification_qr_url = qr_svg_data_url(&verification_url)?;
+            Err(error) => {
+                // The iframe redirect URL is an intermediate server page, not
+                // the QR payload accepted by the mobile identity verifier.
+                // Surface the extraction error and retry on the next poll
+                // instead of showing a QR code that cannot complete login.
+                verification_qr_url.clear();
+                message = format!("身份验证二维码生成失败：{error}");
             }
         }
     }
@@ -634,7 +659,7 @@ pub async fn poll_qr(session_id: &str) -> Result<QrPoll, String> {
         };
     let updated = QrSession {
         status: status.to_owned(),
-        message: message.to_owned(),
+        message: message.clone(),
         params: session.params,
         cookies: cookies.clone(),
         created_at_ms,
@@ -648,7 +673,7 @@ pub async fn poll_qr(session_id: &str) -> Result<QrPoll, String> {
         .insert(session_id.to_owned(), updated);
     Ok(QrPoll {
         status: status.to_owned(),
-        message: message.to_owned(),
+        message,
         verification_url,
         verification_qr_url,
         account_id,
@@ -671,6 +696,47 @@ fn json_string(value: Option<&Value>) -> String {
         .unwrap_or_default()
 }
 
+fn nested_json_string(value: &Value, names: &[&str]) -> String {
+    match value {
+        Value::Object(map) => {
+            for name in names {
+                if let Some(candidate) = map.get(*name) {
+                    let text = json_string(Some(candidate));
+                    if !text.trim().is_empty() {
+                        return text.trim().to_owned();
+                    }
+                }
+            }
+            map.values()
+                .map(|child| nested_json_string(child, names))
+                .find(|text| !text.is_empty())
+                .unwrap_or_default()
+        }
+        Value::Array(items) => items
+            .iter()
+            .map(|child| nested_json_string(child, names))
+            .find(|text| !text.is_empty())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn first_order_value(values: &[String]) -> String {
+    values.iter().find(|value| !value.trim().is_empty()).cloned().unwrap_or_default()
+}
+
+fn order_contact_value(item: &Value, names: &[&str]) -> String {
+    for container_name in ["receiverInfoVO", "receiverInfo", "deliveryInfoVO", "deliveryInfo", "addressInfo", "logisticsInfoVO", "buyerInfoVO"] {
+        if let Some(container) = item.get(container_name) {
+            let value = nested_json_string(container, names);
+            if !value.is_empty() {
+                return value;
+            }
+        }
+    }
+    nested_json_string(item, names)
+}
+
 fn json_i64(value: Option<&Value>) -> i64 {
     value
         .and_then(|item| {
@@ -690,9 +756,9 @@ fn json_bool(value: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
-fn merchant_order_status(item: &Value) -> String {
+fn merchant_order_statuses(item: &Value) -> Vec<String> {
     let Some(columns) = item.get("columnVOList").and_then(Value::as_array) else {
-        return String::new();
+        return Vec::new();
     };
     columns
         .iter()
@@ -705,8 +771,12 @@ fn merchant_order_status(item: &Value) -> String {
         .flatten()
         .flat_map(|content| [content.get("value"), content.get("key")])
         .map(|value| json_string(value.and_then(|value| value.get("text")).or(value)))
-        .find(|value| !value.trim().is_empty())
-        .unwrap_or_default()
+        .filter(|value| !value.trim().is_empty())
+        .collect()
+}
+
+fn merchant_order_status(item: &Value) -> String {
+    merchant_order_statuses(item).into_iter().next().unwrap_or_default()
 }
 
 fn merchant_order_status_code(raw: &str, display: &str, in_refund: bool) -> String {
@@ -731,6 +801,11 @@ fn merchant_order_status_code(raw: &str, display: &str, in_refund: bool) -> Stri
     }
 }
 
+/// 调用闲鱼 MTop 接口并返回响应体与服务端续期后的 Cookie。
+///
+/// 闲鱼接口使用 `_m_h5_tk` 参与签名；当服务端返回 token 过期且下发了新
+/// Cookie 时，本函数会自动重试一次。所有卖家交易接口统一携带 COMMONPRO
+/// 站点上下文，避免在业务代码中重复维护请求头。
 pub(crate) async fn mtop_call(
     cookie: &str,
     api_name: &str,
@@ -816,6 +891,16 @@ pub(crate) async fn mtop_call(
         if ret.contains("SESSION_EXPIRED") || ret.contains("Session过期") {
             return Err("闲鱼登录已过期，请重新扫码登录".to_owned());
         }
+        if ret.contains("FAIL_SYS_USER_VALIDATE")
+            || ret.contains("RGV587")
+            || ret.contains("WUA_IS_MACHINE")
+        {
+            let verification_url = body
+                .pointer("/data/url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return Err(format!("{IM_VALIDATION_ERROR_PREFIX}{verification_url}"));
+        }
         return Err(if ret.is_empty() {
             "闲鱼接口调用失败".to_owned()
         } else {
@@ -825,6 +910,7 @@ pub(crate) async fn mtop_call(
     Err("闲鱼接口重试次数过多".to_owned())
 }
 
+/// 分页读取当前账号的在售商品，并补充商品详情中的图片和库存信息。
 pub async fn fetch_products(cookie: &str) -> Result<(Vec<Value>, String), String> {
     let user_id = cookie_parse(cookie).get("unb").cloned().unwrap_or_default();
     let mut current_cookie = cookie.to_owned();
@@ -907,6 +993,7 @@ pub async fn fetch_products(cookie: &str) -> Result<(Vec<Value>, String), String
     Ok((result, current_cookie))
 }
 
+/// 分页读取卖家订单列表，保留官方原始时间字符串和商品规格字段。
 pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> {
     let mut current_cookie = cookie.to_owned();
     let mut result = Vec::new();
@@ -935,7 +1022,8 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
             let buyer = item.get("buyerInfoVO").unwrap_or(&Value::Null);
             let price = item.get("priceVO").unwrap_or(&Value::Null);
             let product = item
-                .get("itemInfoVO")
+                .get("merchantItemVO")
+                .or_else(|| item.get("itemInfoVO"))
                 .or_else(|| item.get("itemInfo"))
                 .or_else(|| item.get("itemVO"))
                 .unwrap_or(&Value::Null);
@@ -977,13 +1065,43 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
             ]
             .iter()
             .map(|value| json_string(*value))
+                .find(|value| !value.is_empty())
+                .unwrap_or_default();
+            let specification = product
+                .get("itemInfoLines")
+                .and_then(Value::as_array)
+                .map(|lines| lines.iter().filter_map(|line| {
+                    let key = json_string(line.get("key"));
+                    let value = json_string(line.get("value"));
+                    if key.is_empty() && value.is_empty() { None } else if key.is_empty() { Some(value) } else if value.is_empty() { Some(key) } else { Some(format!("{key}：{value}")) }
+                }).collect::<Vec<_>>().join(" / "))
+                .unwrap_or_default();
+            let item_image_url = [
+                product.get("itemPicUrl"), product.get("picUrl"), product.get("imageUrl"),
+                common.get("itemPicUrl"), item.get("itemPicUrl"),
+            ]
+            .iter()
+            .map(|value| json_string(*value))
             .find(|value| !value.is_empty())
             .unwrap_or_default();
+            let shipping_refund_status = merchant_order_statuses(item).join(" / ");
             result.push(serde_json::json!({
-                "order_id": order_id, "item_id": item_id, "item_title": if item_title.is_empty() { format!("商品 {item_id}") } else { item_title },
-                "buyer_nick": json_string(buyer.get("userNick")), "buyer_id": json_string(buyer.get("buyerId")),
+                "order_id": order_id, "item_id": item_id, "item_image_url": item_image_url, "item_title": if item_title.is_empty() { format!("商品 {item_id}") } else { item_title },
+                "specification": specification,
+                "buyer_nick": first_order_value(&[
+                    json_string(buyer.get("userNick")),
+                    nested_json_string(item, &["buyerNick", "buyerNickname", "buyerName", "userNick"]),
+                ]),
+                "buyer_id": first_order_value(&[
+                    json_string(buyer.get("buyerId")),
+                    json_string(buyer.get("userId")),
+                    nested_json_string(item, &["buyerId", "buyerUserId", "buyerUserIdStr", "userId", "userIdStr"]),
+                ]),
+                "receiver_name": order_contact_value(item, &["receiverName", "receiver_name", "consignee", "consigneeName", "收货人", "buyerName"]),
+                "receiver_mobile": order_contact_value(item, &["receiverMobile", "receiver_mobile", "mobile", "phone", "tel", "consigneeMobile", "收货人电话"]),
+                "receiver_address": order_contact_value(item, &["receiverAddress", "receiver_address", "address", "detailAddress", "consigneeAddress", "收货地址"]),
                 "amount": json_string(price.get("totalPrice")), "quantity": json_i64(price.get("buyNum")).max(1),
-                "status_code": status_code, "status": status, "created_at": json_string(common.get("createTime"))
+                "status_code": status_code, "status": status, "shipping_refund_status": shipping_refund_status, "created_at": json_string(common.get("createTime"))
             }));
         }
         let next_page = module
@@ -999,6 +1117,7 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
 /// Fetch one seller order from the same official seller order endpoint used by
 /// the order synchronizer. The detail drawer calls this once when it opens so
 /// timestamps and fee fields are not fabricated from the local order row.
+/// 读取单笔订单的官方详情，用于时间、服务费和商品规格展示。
 pub async fn fetch_order_detail(cookie: &str, order_no: &str) -> Result<(Value, String), String> {
     let data = serde_json::json!({
         "pageNumber": 1,
@@ -1041,6 +1160,7 @@ pub async fn fetch_order_detail(cookie: &str, order_no: &str) -> Result<(Value, 
 /// same refund list endpoint as the official refund-management page; keeping
 /// this in the local session layer means the drawer and the future refund
 /// management page share cookies, signing and renewal behavior.
+/// 读取单笔订单的退款详情及售后服务记录。
 pub async fn fetch_refund_detail(cookie: &str, order_no: &str) -> Result<(Value, String), String> {
     let mut current_cookie = cookie.to_owned();
     for dispute_status in ["1", "2", "3", "5"] {

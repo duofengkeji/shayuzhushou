@@ -13,6 +13,7 @@ export interface Account {
   remoteAccountId: string
   conversationName: string
   avatarUrl: string
+  memberName: string
 }
 
 export interface Product {
@@ -48,13 +49,46 @@ export interface Order {
   accountId: string
   orderNo: string
   itemId: string
+  itemImageUrl: string
   productTitle: string
+  specification: string
   buyerMaskedName: string
   amount: number
   statusCode: string
   status: string
+  shippingRefundStatus: string
+  refundAmount: number
   createdAt: string
   note: string
+}
+
+export interface Member {
+  id: string
+  accountId: string
+  buyerId: string
+  displayName: string
+  phoneMasked: string
+  addressMasked: string
+  phoneAvailable: boolean
+  addressAvailable: boolean
+  firstOrderAt: string
+  lastOrderAt: string
+  orderCount: number
+  paidOrderCount: number
+  totalSpend: number
+  averageOrderValue: number
+  lastOrderStatus: string
+  remark: string
+  tags: string[]
+  status: string
+  createdAt: string
+  updatedAt: string
+  lastSyncedAt: string
+}
+
+export interface MemberOrder {
+  order: Order
+  matchedBy: string
 }
 
 export interface OrderDetail {
@@ -64,6 +98,7 @@ export interface OrderDetail {
   completedAt: string
   closedAt: string
   serviceFee?: number
+  refundAmount?: number
 }
 
 export interface DashboardStats {
@@ -71,6 +106,10 @@ export interface DashboardStats {
   healthyAccounts: number
   activeProducts: number
   pendingOrders: number
+}
+
+export interface ImVerificationState {
+  required: boolean
 }
 
 export interface SyncResult {

@@ -18,6 +18,8 @@ struct AppState {
     chat_listeners: Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
     im_request_senders: Mutex<HashMap<String, xianyu_im_local::ImRequestSender>>,
     im_statuses: Mutex<HashMap<String, String>>,
+    im_validation_urls: Mutex<HashMap<String, String>>,
+    im_validation_cookies: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +36,12 @@ struct ImStatusEvent {
     account_id: String,
     status: String,
     message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImVerificationState {
+    required: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +106,47 @@ fn update_im_status(app: &tauri::AppHandle, account_id: &str, status: &str, mess
     );
 }
 
+/// Removes a listener that has terminated permanently.  Keeping its completed
+/// JoinHandle in the registry makes later `start_chat_listener` calls think
+/// the account is still connected, which prevents IM from restarting after a
+/// fresh QR login.
+fn clear_terminated_chat_listener(app: &tauri::AppHandle, account_id: &str) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    if let Ok(mut listeners) = state.chat_listeners.lock() {
+        listeners.remove(account_id);
+    }
+    if let Ok(mut senders) = state.im_request_senders.lock() {
+        senders.remove(account_id);
+    };
+}
+
+fn validation_window_label(account_id: &str) -> String {
+    format!(
+        "im-verification-{}",
+        account_id.replace(|value: char| !value.is_ascii_alphanumeric(), "-")
+    )
+}
+
+fn is_xianyu_official_url(url: &reqwest::Url) -> bool {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    url.scheme() == "https"
+        && (host == "goofish.com"
+            || host.ends_with(".goofish.com")
+            || host == "taobao.com"
+            || host.ends_with(".taobao.com"))
+}
+
+fn session_cookie_entries(cookie: &str) -> Vec<(String, String)> {
+    cookie
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .filter(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
+        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+        .collect()
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Account {
@@ -113,11 +162,13 @@ struct Account {
     remote_account_id: String,
     conversation_name: String,
     avatar_url: String,
+    member_name: String,
 }
 
 #[derive(Debug, Clone, Default)]
 struct AccountProfile {
     nickname: String,
+    member_name: String,
     avatar_url: String,
     cookie: String,
 }
@@ -163,13 +214,50 @@ struct Order {
     account_id: String,
     order_no: String,
     item_id: String,
+    item_image_url: String,
     product_title: String,
+    specification: String,
     buyer_masked_name: String,
     amount: f64,
     status_code: String,
     status: String,
+    shipping_refund_status: String,
+    refund_amount: f64,
     created_at: String,
     note: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Member {
+    id: String,
+    account_id: String,
+    buyer_id: String,
+    display_name: String,
+    phone_masked: String,
+    address_masked: String,
+    phone_available: bool,
+    address_available: bool,
+    first_order_at: String,
+    last_order_at: String,
+    order_count: i64,
+    paid_order_count: i64,
+    total_spend: f64,
+    average_order_value: f64,
+    last_order_status: String,
+    remark: String,
+    tags: Vec<String>,
+    status: String,
+    created_at: String,
+    updated_at: String,
+    last_synced_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberOrder {
+    order: Order,
+    matched_by: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +269,7 @@ struct OrderDetail {
     completed_at: String,
     closed_at: String,
     service_fee: Option<f64>,
+    refund_amount: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -403,6 +492,71 @@ fn decrypt_secret(secret_key: &[u8; 32], value: &str) -> Result<String, String> 
     String::from_utf8(decrypted).map_err(|_| "本机会话内容无效".to_owned())
 }
 
+fn mask_phone(value: &str) -> String {
+    let digits: String = value.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    if digits.len() >= 7 { format!("{}****{}", &digits[..3], &digits[digits.len() - 4..]) } else if value.is_empty() { String::new() } else { "已保存".to_owned() }
+}
+
+fn mask_address(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.is_empty() { return String::new(); }
+    if chars.len() <= 8 { return format!("{}******", chars.iter().take(2).collect::<String>()); }
+    format!("{}******{}", chars.iter().take(4).collect::<String>(), chars.iter().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect::<String>())
+}
+
+fn member_load(conn: &Connection, id: &str, secret_key: &[u8; 32], reveal: bool) -> Result<Member, String> {
+    conn.query_row(
+        "SELECT id, account_id, buyer_id, display_name, phone_ciphertext, address_ciphertext, first_order_at, last_order_at, order_count, paid_order_count, total_spend, average_order_value, last_order_status, remark, tags, status, created_at, updated_at, last_synced_at FROM members WHERE id = ?1",
+        [id],
+        |row| {
+            let phone: String = row.get(4)?;
+            let address: String = row.get(5)?;
+            let tags_text: String = row.get(14)?;
+            let tags = serde_json::from_str::<Vec<String>>(&tags_text).unwrap_or_default();
+            let phone_value = if reveal { decrypt_secret(secret_key, &phone).unwrap_or_default() } else { String::new() };
+            let address_value = if reveal { decrypt_secret(secret_key, &address).unwrap_or_default() } else { String::new() };
+            Ok(Member {
+                id: row.get(0)?, account_id: row.get(1)?, buyer_id: row.get(2)?, display_name: row.get(3)?,
+                phone_masked: if reveal { phone_value } else { mask_phone(&decrypt_secret(secret_key, &phone).unwrap_or_default()) },
+                address_masked: if reveal { address_value } else { mask_address(&decrypt_secret(secret_key, &address).unwrap_or_default()) },
+                phone_available: !phone.is_empty(), address_available: !address.is_empty(),
+                first_order_at: row.get(6)?, last_order_at: row.get(7)?, order_count: row.get(8)?, paid_order_count: row.get(9)?,
+                total_spend: row.get(10)?, average_order_value: row.get(11)?, last_order_status: row.get(12)?, remark: row.get(13)?, tags,
+                status: row.get(15)?, created_at: row.get(16)?, updated_at: row.get(17)?, last_synced_at: row.get(18)?,
+            })
+        },
+    ).map_err(to_error)
+}
+
+fn sync_member_from_order(conn: &Connection, secret_key: &[u8; 32], account_id: &str, order_id: &str, order: &Value, display_name: &str, status: &str, created_at: &str) -> Result<(), String> {
+    let buyer_id = value_string(order, &["buyer_id", "buyerId", "buyer_user_id", "user_id", "userId"]);
+    let phone = nested_value(order, &["receiver_mobile", "receiverMobile", "mobile", "phone", "buyer_phone", "buyerPhone", "tel"]);
+    let address = nested_value(order, &["receiver_address", "receiverAddress", "address", "buyer_address", "buyerAddress", "delivery_address"]);
+    let name = first_nonempty(nested_value(order, &["receiver_name", "receiverName", "consignee", "receiver", "buyer_name", "buyerName"]), display_name.to_owned());
+    if buyer_id.is_empty() && phone.is_empty() && (name.is_empty() || address.is_empty()) { return Ok(()); }
+    let mut found: Option<(String, String, String)> = None;
+    let mut stmt = conn.prepare("SELECT id, phone_ciphertext, address_ciphertext FROM members WHERE account_id = ?1 AND status <> '隐藏'").map_err(to_error)?;
+    let candidates = stmt.query_map([account_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).map_err(to_error)?;
+    for candidate in candidates.flatten() {
+        let (id, saved_phone, saved_address) = candidate;
+        let phone_match = !phone.is_empty() && decrypt_secret(secret_key, &saved_phone).unwrap_or_default() == phone;
+        let address_match = !name.is_empty() && !address.is_empty() && decrypt_secret(secret_key, &saved_address).unwrap_or_default() == address;
+        let id_match = !buyer_id.is_empty() && conn.query_row("SELECT buyer_id FROM members WHERE id = ?1", [&id], |row| row.get::<_, String>(0)).unwrap_or_default() == buyer_id;
+        if id_match { found = Some((id, "buyer_id".to_owned(), saved_phone)); break; }
+        if phone_match { found = Some((id, "phone".to_owned(), saved_phone)); break; }
+        if address_match { found = Some((id, "name_address".to_owned(), saved_phone)); break; }
+    }
+    let now = Utc::now().to_rfc3339();
+    let (member_id, matched_by, existing_phone) = found.unwrap_or_else(|| (Uuid::new_v4().to_string(), if !buyer_id.is_empty() { "buyer_id".to_owned() } else if !phone.is_empty() { "phone".to_owned() } else { "name_address".to_owned() }, String::new()));
+    let phone_cipher = if phone.is_empty() { existing_phone } else { encrypt_secret(secret_key, &phone)? };
+    let address_cipher = if address.is_empty() { String::new() } else { encrypt_secret(secret_key, &address)? };
+    conn.execute("INSERT INTO members (id, account_id, buyer_id, display_name, phone_ciphertext, address_ciphertext, first_order_at, last_order_at, last_order_status, created_at, updated_at, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?9, ?9) ON CONFLICT(id) DO UPDATE SET buyer_id = CASE WHEN excluded.buyer_id <> '' THEN excluded.buyer_id ELSE members.buyer_id END, display_name = CASE WHEN excluded.display_name <> '' THEN excluded.display_name ELSE members.display_name END, phone_ciphertext = CASE WHEN excluded.phone_ciphertext <> '' THEN excluded.phone_ciphertext ELSE members.phone_ciphertext END, address_ciphertext = CASE WHEN excluded.address_ciphertext <> '' THEN excluded.address_ciphertext ELSE members.address_ciphertext END, last_order_at = CASE WHEN excluded.last_order_at > members.last_order_at THEN excluded.last_order_at ELSE members.last_order_at END, last_order_status = excluded.last_order_status, updated_at = excluded.updated_at, last_synced_at = excluded.last_synced_at", params![member_id, account_id, buyer_id, name, phone_cipher, address_cipher, created_at, status, now]).map_err(to_error)?;
+    conn.execute("INSERT OR IGNORE INTO member_order_links (member_id, order_id, matched_by, created_at) VALUES (?1, ?2, ?3, ?4)", params![member_id, order_id, matched_by, now]).map_err(to_error)?;
+    let (order_count, paid_count, total): (i64, i64, f64) = conn.query_row("SELECT COUNT(*), SUM(CASE WHEN o.status NOT IN ('待付款','待支付','交易关闭','已关闭','退款关闭','已取消') THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN o.status NOT IN ('待付款','待支付','交易关闭','已关闭','退款关闭','已取消') THEN MAX(o.amount - o.refund_amount, 0) ELSE 0 END), 0) FROM member_order_links l JOIN orders o ON o.id = l.order_id WHERE l.member_id = ?1", [&member_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(to_error)?;
+    conn.execute("UPDATE members SET order_count = ?1, paid_order_count = ?2, total_spend = ?3, average_order_value = CASE WHEN ?2 > 0 THEN ?3 / ?2 ELSE 0 END WHERE id = ?4", params![order_count, paid_count, total, member_id]).map_err(to_error)?;
+    Ok(())
+}
+
 fn value_string(value: &Value, names: &[&str]) -> String {
     names
         .iter()
@@ -457,24 +611,24 @@ fn value_i64(value: &Value, names: &[&str]) -> i64 {
 }
 
 async fn fetch_account_profile(cookie: &str) -> Result<AccountProfile, String> {
-    // The seller workbench uses this member/navigation endpoint for the
-    // currently logged-in account. It returns `data.module.base.displayName`
-    // and `displayNick`; no conversation/session ID is involved.
+    // This is the seller account profile endpoint used after QR login and
+    // during sync. It returns the display name, member name and avatar for
+    // the currently authenticated account.
     let (body, renewed_cookie) = xianyu_local::mtop_call(
         cookie,
-        "mtop.idle.web.user.page.nav",
+        "mtop.alibaba.idle.seller.platform.query.login.merchant.info",
         "1.0",
         "originaljson",
         &serde_json::json!({}),
     )
     .await?;
-    let module = body.pointer("/data/module").unwrap_or(&body);
-    let base = module.pointer("/base").unwrap_or(module);
+    let base = body
+        .pointer("/data/data/base")
+        .or_else(|| body.pointer("/data/base"))
+        .unwrap_or(&body);
     let profile = AccountProfile {
-        nickname: first_nonempty(
-            nested_value(base, &["displayName"]),
-            nested_value(base, &["displayNick", "nick", "nickname"]),
-        ),
+        nickname: nested_value(base, &["displayName"]),
+        member_name: nested_value(base, &["displayNick", "nick", "nickname"]),
         avatar_url: nested_value(base, &["avatar", "avatarUrl", "logo"]).replace("http://", "https://"),
         cookie: renewed_cookie,
     };
@@ -491,8 +645,8 @@ fn save_account_profile(
 ) -> Result<(), String> {
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO account_profiles (account_id, nickname, avatar_url, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(account_id) DO UPDATE SET nickname = CASE WHEN excluded.nickname <> '' THEN excluded.nickname ELSE account_profiles.nickname END, avatar_url = CASE WHEN excluded.avatar_url <> '' THEN excluded.avatar_url ELSE account_profiles.avatar_url END, updated_at = excluded.updated_at",
-        params![account_id, profile.nickname, profile.avatar_url, now],
+        "INSERT INTO account_profiles (account_id, nickname, member_name, avatar_url, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(account_id) DO UPDATE SET nickname = CASE WHEN excluded.nickname <> '' THEN excluded.nickname ELSE account_profiles.nickname END, member_name = CASE WHEN excluded.member_name <> '' THEN excluded.member_name ELSE account_profiles.member_name END, avatar_url = CASE WHEN excluded.avatar_url <> '' THEN excluded.avatar_url ELSE account_profiles.avatar_url END, updated_at = excluded.updated_at",
+        params![account_id, profile.nickname, profile.member_name, profile.avatar_url, now],
     )
     .map_err(to_error)?;
     if !profile.nickname.is_empty() {
@@ -556,6 +710,24 @@ fn nested_value(value: &Value, names: &[&str]) -> String {
             .map(|value| nested_value(value, names))
             .find(|value| !value.is_empty())
             .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn item_specification(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            if let Some(lines) = map.get("itemInfoLines").and_then(Value::as_array) {
+                let text = lines.iter().filter_map(|line| {
+                    let key = nested_value(line, &["key"]);
+                    let value = nested_value(line, &["value"]);
+                    if key.is_empty() && value.is_empty() { None } else if key.is_empty() { Some(value) } else if value.is_empty() { Some(key) } else { Some(format!("{key}：{value}")) }
+                }).collect::<Vec<_>>().join(" / ");
+                if !text.is_empty() { return text; }
+            }
+            map.values().map(item_specification).find(|text| !text.is_empty()).unwrap_or_default()
+        }
+        Value::Array(items) => items.iter().map(item_specification).find(|text| !text.is_empty()).unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -723,12 +895,12 @@ fn count_for(conn: &Connection, table: &str, account_id: &str) -> rusqlite::Resu
 
 fn get_account(conn: &Connection, account_id: &str) -> rusqlite::Result<Account> {
     let account = conn.query_row(
-        "SELECT a.id, a.display_name, a.alias, a.platform, a.status, a.last_sync_at, COALESCE(s.source_url, ''), COALESCE(s.remote_account_id, ''), COALESCE(CASE WHEN p.avatar_source = 'im_message' THEN p.avatar_url ELSE '' END, '') FROM accounts a LEFT JOIN account_sources s ON s.account_id = a.id LEFT JOIN account_profiles p ON p.account_id = a.id WHERE a.id = ?1",
+        "SELECT a.id, a.display_name, a.alias, a.platform, a.status, a.last_sync_at, COALESCE(s.source_url, ''), COALESCE(s.remote_account_id, ''), COALESCE(p.avatar_url, ''), COALESCE(p.member_name, '') FROM accounts a LEFT JOIN account_sources s ON s.account_id = a.id LEFT JOIN account_profiles p ON p.account_id = a.id WHERE a.id = ?1",
         [account_id],
         |row| {
             Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?,
+                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?, row.get::<_, String>(9)?,
             ))
         },
     )?;
@@ -752,6 +924,7 @@ fn get_account(conn: &Connection, account_id: &str) -> rusqlite::Result<Account>
         remote_account_id: account.7,
         conversation_name,
         avatar_url: account.8,
+        member_name: account.9,
     })
 }
 
@@ -771,10 +944,28 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE TABLE IF NOT EXISTS orders (
           id TEXT PRIMARY KEY, account_id TEXT NOT NULL, order_no TEXT NOT NULL,
-          item_id TEXT NOT NULL DEFAULT '',
+          item_id TEXT NOT NULL DEFAULT '', item_image_url TEXT NOT NULL DEFAULT '',
           buyer_id TEXT NOT NULL DEFAULT '',
-          product_title TEXT NOT NULL, buyer_masked_name TEXT NOT NULL,
-          amount REAL NOT NULL, status_code TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at TEXT NOT NULL, note TEXT NOT NULL
+          product_title TEXT NOT NULL, specification TEXT NOT NULL DEFAULT '', buyer_masked_name TEXT NOT NULL,
+          amount REAL NOT NULL, refund_amount REAL NOT NULL DEFAULT 0, status_code TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, shipping_refund_status TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, note TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS members (
+          id TEXT PRIMARY KEY, account_id TEXT NOT NULL, buyer_id TEXT NOT NULL DEFAULT '',
+          display_name TEXT NOT NULL DEFAULT '', phone_ciphertext TEXT NOT NULL DEFAULT '',
+          address_ciphertext TEXT NOT NULL DEFAULT '', first_order_at TEXT NOT NULL DEFAULT '',
+          last_order_at TEXT NOT NULL DEFAULT '', order_count INTEGER NOT NULL DEFAULT 0,
+          paid_order_count INTEGER NOT NULL DEFAULT 0, total_spend REAL NOT NULL DEFAULT 0,
+          average_order_value REAL NOT NULL DEFAULT 0, last_order_status TEXT NOT NULL DEFAULT '',
+          remark TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT '正常',
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_synced_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS member_order_links (
+          member_id TEXT NOT NULL, order_id TEXT NOT NULL, matched_by TEXT NOT NULL,
+          created_at TEXT NOT NULL, PRIMARY KEY (member_id, order_id)
+        );
+        CREATE TABLE IF NOT EXISTS member_audit_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, member_id TEXT NOT NULL, action TEXT NOT NULL,
+          occurred_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS sync_jobs (
           id TEXT PRIMARY KEY, account_id TEXT NOT NULL, resource TEXT NOT NULL,
@@ -787,7 +978,7 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
           account_id TEXT PRIMARY KEY, cookie TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS account_profiles (
-          account_id TEXT PRIMARY KEY, nickname TEXT NOT NULL DEFAULT '',
+          account_id TEXT PRIMARY KEY, nickname TEXT NOT NULL DEFAULT '', member_name TEXT NOT NULL DEFAULT '',
           avatar_url TEXT NOT NULL DEFAULT '', avatar_source TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS chat_contacts (
@@ -847,6 +1038,15 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
     if !has_avatar_source {
         conn.execute("ALTER TABLE account_profiles ADD COLUMN avatar_source TEXT NOT NULL DEFAULT ''", [])?;
     }
+    let has_member_name = conn
+        .prepare("PRAGMA table_info(account_profiles)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|column| column == "member_name");
+    if !has_member_name {
+        conn.execute("ALTER TABLE account_profiles ADD COLUMN member_name TEXT NOT NULL DEFAULT ''", [])?;
+    }
     let _ = conn.execute(
         "ALTER TABLE products ADD COLUMN image_url TEXT NOT NULL DEFAULT ''",
         [],
@@ -860,9 +1060,32 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
         [],
     );
     let _ = conn.execute(
+        "ALTER TABLE orders ADD COLUMN item_image_url TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
         "ALTER TABLE orders ADD COLUMN status_code TEXT NOT NULL DEFAULT ''",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE orders ADD COLUMN specification TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE orders ADD COLUMN shipping_refund_status TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE orders ADD COLUMN refund_amount REAL NOT NULL DEFAULT 0",
+        [],
+    );
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_members_account ON members(account_id, updated_at DESC)", [])?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_member_links_order ON member_order_links(order_id)", [])?;
+    // Older builds did not remove member rows when an account was deleted.
+    // Drop those orphaned rows during startup so the UI cannot show an unknown shop.
+    conn.execute("DELETE FROM member_order_links WHERE member_id IN (SELECT id FROM members WHERE account_id NOT IN (SELECT id FROM accounts))", [])?;
+    conn.execute("DELETE FROM member_audit_logs WHERE member_id IN (SELECT id FROM members WHERE account_id NOT IN (SELECT id FROM accounts))", [])?;
+    conn.execute("DELETE FROM members WHERE account_id NOT IN (SELECT id FROM accounts)", [])?;
     // One-time backfill for local records created before status_code existed.
     // Subsequent account syncs overwrite this with the official order status ID.
     conn.execute(
@@ -1122,7 +1345,7 @@ fn list_orders(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<Order>, String> {
     let conn = state.db.lock().map_err(to_error)?;
-    let query = "SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE (?1 IS NULL OR account_id = ?1) ORDER BY created_at DESC";
+    let query = "SELECT id, account_id, order_no, item_id, item_image_url, product_title, specification, buyer_masked_name, amount, refund_amount, status_code, status, shipping_refund_status, created_at, note FROM orders WHERE (?1 IS NULL OR account_id = ?1) ORDER BY created_at DESC";
     let mut statement = conn.prepare(query).map_err(to_error)?;
     let rows = statement
         .query_map([account_id], |row| {
@@ -1131,16 +1354,54 @@ fn list_orders(
                 account_id: row.get(1)?,
                 order_no: row.get(2)?,
                 item_id: row.get(3)?,
-                product_title: row.get(4)?,
-                buyer_masked_name: row.get(5)?,
-                amount: row.get(6)?,
-                status_code: row.get(7)?,
-                status: row.get(8)?,
-                created_at: row.get(9)?,
-                note: row.get(10)?,
+                item_image_url: row.get(4)?,
+                product_title: row.get(5)?,
+                specification: row.get(6)?,
+                buyer_masked_name: row.get(7)?,
+                amount: row.get(8)?,
+                refund_amount: row.get(9)?,
+                status_code: row.get(10)?,
+                status: row.get(11)?,
+                shipping_refund_status: row.get(12)?,
+                created_at: row.get(13)?,
+                note: row.get(14)?,
             })
         })
         .map_err(to_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
+}
+
+#[tauri::command]
+fn list_members(account_id: Option<String>, state: tauri::State<'_, AppState>) -> Result<Vec<Member>, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    let mut statement = conn.prepare("SELECT m.id FROM members m JOIN accounts a ON a.id = m.account_id WHERE (?1 IS NULL OR m.account_id = ?1) ORDER BY m.last_order_at DESC, m.updated_at DESC").map_err(to_error)?;
+    let ids = statement.query_map([account_id], |row| row.get::<_, String>(0)).map_err(to_error)?.collect::<Result<Vec<_>, _>>().map_err(to_error)?;
+    ids.iter().map(|id| member_load(&conn, id, &state.secret_key, false)).collect()
+}
+
+#[tauri::command]
+fn reveal_member(id: String, state: tauri::State<'_, AppState>) -> Result<Member, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute("INSERT INTO member_audit_logs (member_id, action, occurred_at) VALUES (?1, '查看敏感信息', ?2)", params![id, now]).map_err(to_error)?;
+    member_load(&conn, &id, &state.secret_key, true)
+}
+
+#[tauri::command]
+fn update_member(id: String, remark: String, tags: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Member, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    let now = Utc::now().to_rfc3339();
+    let tags_json = serde_json::to_string(&tags).map_err(to_error)?;
+    let changed = conn.execute("UPDATE members SET remark = ?1, tags = ?2, updated_at = ?3 WHERE id = ?4", params![remark.trim(), tags_json, now, id]).map_err(to_error)?;
+    if changed == 0 { return Err("会员不存在".to_owned()); }
+    member_load(&conn, &id, &state.secret_key, false)
+}
+
+#[tauri::command]
+fn member_orders(id: String, state: tauri::State<'_, AppState>) -> Result<Vec<MemberOrder>, String> {
+    let conn = state.db.lock().map_err(to_error)?;
+    let mut statement = conn.prepare("SELECT o.id, o.account_id, o.order_no, o.item_id, o.item_image_url, o.product_title, o.specification, o.buyer_masked_name, o.amount, o.refund_amount, o.status_code, o.status, o.shipping_refund_status, o.created_at, o.note, l.matched_by FROM member_order_links l JOIN orders o ON o.id = l.order_id WHERE l.member_id = ?1 ORDER BY o.created_at DESC").map_err(to_error)?;
+    let rows = statement.query_map([id], |row| Ok(MemberOrder { order: Order { id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, item_image_url: row.get(4)?, product_title: row.get(5)?, specification: row.get(6)?, buyer_masked_name: row.get(7)?, amount: row.get(8)?, refund_amount: row.get(9)?, status_code: row.get(10)?, status: row.get(11)?, shipping_refund_status: row.get(12)?, created_at: row.get(13)?, note: row.get(14)? }, matched_by: row.get(15)? })).map_err(to_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
 }
 
@@ -1160,16 +1421,21 @@ async fn order_detail(
     };
     let (raw, renewed_cookie) = xianyu_local::fetch_order_detail(&cookie, &order_no).await?;
     let conn = state.db.lock().map_err(to_error)?;
-    let order = conn.query_row(
-        "SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE account_id = ?1 AND order_no = ?2",
+    let mut order = conn.query_row(
+        "SELECT id, account_id, order_no, item_id, item_image_url, product_title, specification, buyer_masked_name, amount, refund_amount, status_code, status, shipping_refund_status, created_at, note FROM orders WHERE account_id = ?1 AND order_no = ?2",
         params![account_id, order_no],
         |row| Ok(Order {
             id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?,
-            product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?,
-            status_code: row.get(7)?, status: row.get(8)?, created_at: row.get(9)?, note: row.get(10)?,
+            item_image_url: row.get(4)?, product_title: row.get(5)?, specification: row.get(6)?, buyer_masked_name: row.get(7)?, amount: row.get(8)?,
+            refund_amount: row.get(9)?, status_code: row.get(10)?, status: row.get(11)?, shipping_refund_status: row.get(12)?, created_at: row.get(13)?, note: row.get(14)?,
         }),
     ).map_err(|_| "本地没有找到该订单，请先同步订单".to_owned())?;
     save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+    let specification = item_specification(&raw);
+    if !specification.is_empty() {
+        order.specification = specification;
+        conn.execute("UPDATE orders SET specification = ?1 WHERE account_id = ?2 AND order_no = ?3", params![order.specification.clone(), account_id, order_no]).map_err(to_error)?;
+    }
 
     let parse_number = |names: &[&str]| {
         let value = nested_value(&raw, names);
@@ -1178,11 +1444,12 @@ async fn order_detail(
     let time = |names: &[&str]| nested_value(&raw, names);
     Ok(OrderDetail {
         order,
-        paid_at: time(&["payTime", "paidTime", "paymentTime", "payDate"]),
-        shipped_at: time(&["sendTime", "shippingTime", "deliveryTime", "deliverTime", "consignTime"]),
-        completed_at: time(&["successTime", "completeTime", "completedTime", "finishTime", "dealTime"]),
-        closed_at: time(&["closeTime", "closedTime", "交易关闭时间"]),
+        paid_at: time(&["paySuccessTime", "payTime", "paidTime", "paymentTime", "payDate", "payTimeStr", "paidTimeStr", "paymentTimeStr", "payDateStr", "paidAt"]),
+        shipped_at: time(&["sendTime", "shippingTime", "deliveryTime", "deliverTime", "consignTime", "sendTimeStr", "shippingTimeStr", "deliveryTimeStr"]),
+        completed_at: time(&["successTime", "completeTime", "completedTime", "finishTime", "dealTime", "successTimeStr", "completeTimeStr", "finishTimeStr"]),
+        closed_at: time(&["closeTime", "closedTime", "closeTimeStr", "closedTimeStr", "交易关闭时间"]),
         service_fee: parse_number(&["softwareServiceFee", "serviceFee", "sellerServiceFee", "platformServiceFee", "platformFee", "idleServiceFee", "commissionFee", "serviceCharge"]),
+        refund_amount: parse_number(&["refundAmount", "refundMoney", "refundFee", "refundPrice", "refundInfoVO.refundAmount", "refundInfo.refundAmount"]),
     })
 }
 
@@ -1317,9 +1584,9 @@ fn list_related_orders(
     // different buyer's order when several people purchased the same item.
     // Item matching is retained only for old contacts that have no buyer ID
     // or name at all.
-    let mut statement = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE account_id = ?1 AND ((?3 <> '' AND buyer_id = ?3) OR (?3 = '' AND ?2 <> '' AND buyer_masked_name = ?2) OR (?3 = '' AND ?2 = '' AND ?4 <> '' AND item_id = ?4)) ORDER BY created_at DESC").map_err(to_error)?;
+    let mut statement = conn.prepare("SELECT id, account_id, order_no, item_id, item_image_url, product_title, specification, buyer_masked_name, amount, refund_amount, status_code, status, shipping_refund_status, created_at, note FROM orders WHERE account_id = ?1 AND ((?3 <> '' AND buyer_id = ?3) OR (?3 = '' AND ?2 <> '' AND buyer_masked_name = ?2) OR (?3 = '' AND ?2 = '' AND ?4 <> '' AND item_id = ?4)) ORDER BY created_at DESC").map_err(to_error)?;
     let rows = statement.query_map(params![account_id, buyer_name, buyer_id, item_id], |row| Ok(Order {
-        id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?, status_code: row.get(7)?, status: row.get(8)?, created_at: row.get(9)?, note: row.get(10)?,
+        id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, item_image_url: row.get(4)?, product_title: row.get(5)?, specification: row.get(6)?, buyer_masked_name: row.get(7)?, amount: row.get(8)?, refund_amount: row.get(9)?, status_code: row.get(10)?, status: row.get(11)?, shipping_refund_status: row.get(12)?, created_at: row.get(13)?, note: row.get(14)?,
     })).map_err(to_error)?;
     let orders = rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?;
     let filtered = orders.into_iter().filter(|order| {
@@ -1503,6 +1770,15 @@ fn delete_account_records(conn: &mut Connection, id: &str) -> Result<(), String>
         .map_err(to_error)?;
     transaction
         .execute("DELETE FROM orders WHERE account_id = ?1", [&id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM member_order_links WHERE member_id IN (SELECT id FROM members WHERE account_id = ?1)", [&id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM member_audit_logs WHERE member_id IN (SELECT id FROM members WHERE account_id = ?1)", [&id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM members WHERE account_id = ?1", [&id])
         .map_err(to_error)?;
     transaction
         .execute("DELETE FROM sync_jobs WHERE account_id = ?1", [&id])
@@ -2258,11 +2534,23 @@ async fn start_chat_listener(
         .map_err(to_error)?
         .insert(account_id.clone(), request_sender);
     update_im_status(&app, &account_id, "connecting", "正在连接闲鱼 IM");
+    #[cfg(debug_assertions)]
+    eprintln!("[im] account={} starting listener", account_id);
     let listener_account_id = account_id.clone();
     let handle = tauri::async_runtime::spawn(async move {
         let mut cookie = cookie;
         let mut reconnect_attempt = 0_u32;
         loop {
+            // Match the web service behavior: every reconnect starts from the
+            // latest persisted session. Token and verification requests can
+            // rotate cookies while this task is alive.
+            if let Some(state) = app.try_state::<AppState>() {
+                if let Ok(conn) = state.db.lock() {
+                    if let Ok(latest_cookie) = local_session(&conn, &listener_account_id, &state.secret_key) {
+                        cookie = latest_cookie;
+                    }
+                }
+            }
             let connecting_message = if reconnect_attempt == 0 {
                 "正在连接闲鱼 IM".to_owned()
             } else {
@@ -2279,6 +2567,8 @@ async fn start_chat_listener(
             let connection_started_at = std::time::Instant::now();
             match xianyu_im_local::listen_for_push(&cookie, move || {
                 update_im_status(&connected_app, &connected_account_id, "connected", "闲鱼 IM 已连接");
+                #[cfg(debug_assertions)]
+                eprintln!("[im] account={} connected", connected_account_id);
             }, move |value| {
                 let message_refs = xianyu_im_local::push_message_refs(value);
                 let typing_chat_ids = xianyu_im_local::parse_typing_push_chat_ids(value);
@@ -2299,12 +2589,71 @@ async fn start_chat_listener(
             }, &mut request_receiver).await {
                 Ok(renewed_cookie) => {
                     cookie = renewed_cookie;
+                    let persist_error = if let Some(state) = app.try_state::<AppState>() {
+                        state.db.lock().ok().and_then(|conn| {
+                            save_renewed_session(
+                                &conn,
+                                &listener_account_id,
+                                &cookie,
+                                &state.secret_key,
+                            )
+                            .err()
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(error) = persist_error {
+                        append_app_log(
+                            &app,
+                            "warn",
+                            "IM",
+                            &listener_account_id,
+                            &format!("IM 会话 Cookie 持久化失败：{error}"),
+                        );
+                    }
                     reconnect_attempt = if connection_started_at.elapsed() >= std::time::Duration::from_secs(60) { 1 } else { reconnect_attempt.saturating_add(1) };
                     update_im_status(&app, &listener_account_id, "connecting", "闲鱼 IM 连接已结束，正在重连");
                 }
                 Err(error) => {
+                    if let Some(verification_url) = xianyu_local::im_validation_url(&error) {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[im] account={} requires user validation", listener_account_id);
+                        // The token request may have rotated session cookies
+                        // via Set-Cookie immediately before returning the
+                        // validation URL. Pair that fresh cookie with the URL;
+                        // submitting the challenge with the previous cookie
+                        // produces a generic slider failure page.
+                        let verification_cookie = xianyu_im_local::take_renewed_cookie(&listener_account_id)
+                            .unwrap_or_else(|| cookie.clone());
+                        if let Some(state) = app.try_state::<AppState>() {
+                            if let Ok(conn) = state.db.lock() {
+                                let _ = save_renewed_session(
+                                    &conn,
+                                    &listener_account_id,
+                                    &verification_cookie,
+                                    &state.secret_key,
+                                );
+                            }
+                        }
+                        if let Some(state) = app.try_state::<AppState>() {
+                            if let Ok(mut urls) = state.im_validation_urls.lock() {
+                                urls.insert(listener_account_id.clone(), verification_url.to_owned());
+                            }
+                            if let Ok(mut cookies) = state.im_validation_cookies.lock() {
+                                cookies.insert(listener_account_id.clone(), verification_cookie);
+                            }
+                        }
+                        update_im_status(&app, &listener_account_id, "verification_required", "闲鱼 IM 需要完成风控验证");
+                        clear_terminated_chat_listener(&app, &listener_account_id);
+                        break;
+                    }
                     #[cfg(debug_assertions)]
                     eprintln!("[im] account={} disconnected: {}", listener_account_id, error);
+                    if error.contains("AUTH_TOKEN_ILLEGAL") || error.contains("SESSION_EXPIRED") {
+                        update_im_status(&app, &listener_account_id, "not_logged_in", "闲鱼登录会话已失效，请重新扫码登录");
+                        clear_terminated_chat_listener(&app, &listener_account_id);
+                        break;
+                    }
                     reconnect_attempt = if connection_started_at.elapsed() >= std::time::Duration::from_secs(60) { 1 } else { reconnect_attempt.saturating_add(1) };
                     update_im_status(&app, &listener_account_id, "connecting", &format!("{error}；正在重连"));
                 }
@@ -2337,6 +2686,137 @@ fn stop_chat_listener(account_id: String, state: tauri::State<'_, AppState>) -> 
 #[tauri::command]
 fn get_im_statuses(state: tauri::State<'_, AppState>) -> Result<HashMap<String, String>, String> {
     state.im_statuses.lock().map(|statuses| statuses.clone()).map_err(to_error)
+}
+
+#[tauri::command]
+fn get_im_verification_state(
+    account_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ImVerificationState, String> {
+    let required = state
+        .im_validation_urls
+        .lock()
+        .map_err(to_error)?
+        .contains_key(&account_id);
+    Ok(ImVerificationState { required })
+}
+
+#[tauri::command]
+fn open_im_verification(
+    account_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let verification_url = state
+        .im_validation_urls
+        .lock()
+        .map_err(to_error)?
+        .get(&account_id)
+        .cloned()
+        .filter(|url| !url.is_empty())
+        .ok_or("验证地址已失效。请先重新连接 IM，以获取新的验证请求。")?;
+    let cookie = state
+        .im_validation_cookies
+        .lock()
+        .map_err(to_error)?
+        .get(&account_id)
+        .cloned()
+        .map(Ok)
+        .unwrap_or_else(|| {
+            let conn = state.db.lock().map_err(to_error)?;
+            local_session(&conn, &account_id, &state.secret_key)
+        })?;
+    let target = reqwest::Url::parse(&verification_url)
+        .map_err(|_| "闲鱼返回的验证地址无效".to_owned())?;
+    if !is_xianyu_official_url(&target) {
+        return Err("只允许打开闲鱼官方风控验证地址".to_owned());
+    }
+    let label = validation_window_label(&account_id);
+    if let Some(window) = app.get_webview_window(&label) {
+        window.set_focus().map_err(to_error)?;
+        return Ok(());
+    }
+    let bootstrap_url = reqwest::Url::parse("https://passport.goofish.com/")
+        .map_err(to_error)?;
+    let window = tauri::WebviewWindowBuilder::new(
+        &app,
+        label,
+        tauri::WebviewUrl::External(bootstrap_url),
+    )
+    .title("闲鱼安全验证")
+    .inner_size(480.0, 760.0)
+    .min_inner_size(420.0, 640.0)
+    .center()
+    .focused(true)
+    .user_agent(xianyu_local::web_user_agent())
+    .build()
+    .map_err(to_error)?;
+    let target_host = target.host_str().unwrap_or("passport.goofish.com");
+    for (name, value) in session_cookie_entries(&cookie) {
+        for domain in [target_host, ".goofish.com"] {
+            let cookie = tauri::webview::Cookie::build((name.clone(), value.clone()))
+                .domain(domain)
+                .path("/")
+                .secure(true)
+                .http_only(true)
+                .same_site(tauri::webview::cookie::SameSite::None)
+                .build();
+            window.set_cookie(cookie).map_err(to_error)?;
+        }
+    }
+    window.navigate(target).map_err(to_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn complete_im_verification(
+    account_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let label = validation_window_label(&account_id);
+    let window = app
+        .get_webview_window(&label)
+        .ok_or("验证窗口未打开。请先打开验证页并完成闲鱼安全验证。")?;
+    let x5_cookies = window
+        .cookies()
+        .map_err(to_error)?
+        .into_iter()
+        .filter_map(|cookie| {
+            let name = cookie.name().to_owned();
+            name.to_ascii_lowercase()
+                .starts_with("x5")
+                .then(|| (name, cookie.value().to_owned()))
+        })
+        .collect::<Vec<_>>();
+    if x5_cookies.is_empty() {
+        return Err("尚未检测到 x5sec 风控 Cookie。请先在验证窗口完成挑战后再继续。".to_owned());
+    }
+    {
+        let conn = state.db.lock().map_err(to_error)?;
+        let current_cookie = local_session(&conn, &account_id, &state.secret_key)?;
+        let mut cookies = session_cookie_entries(&current_cookie)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        for (name, value) in x5_cookies {
+            cookies.insert(name, value);
+        }
+        let merged_cookie = cookies
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        save_renewed_session(&conn, &account_id, &merged_cookie, &state.secret_key)?;
+    }
+    if let Ok(mut urls) = state.im_validation_urls.lock() {
+        urls.remove(&account_id);
+    }
+    if let Ok(mut cookies) = state.im_validation_cookies.lock() {
+        cookies.remove(&account_id);
+    }
+    let _ = window.close();
+    stop_chat_listener(account_id.clone(), state.clone())?;
+    start_chat_listener(account_id, app, state).await
 }
 
 fn account_im_sender(
@@ -3139,7 +3619,7 @@ fn create_order(input: OrderInput, state: tauri::State<'_, AppState>) -> Result<
     );
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO orders (id, account_id, order_no, item_id, buyer_id, product_title, buyer_masked_name, amount, status, created_at, note) VALUES (?1, ?2, ?3, '', '', ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO orders (id, account_id, order_no, item_id, item_image_url, buyer_id, product_title, specification, buyer_masked_name, amount, refund_amount, status, shipping_refund_status, created_at, note) VALUES (?1, ?2, ?3, '', '', '', ?4, '', ?5, ?6, 0, ?7, '', ?8, ?9)",
         params![id, input.account_id, order_no, input.product_title.trim(), input.buyer_masked_name.trim(), input.amount, input.status, now, input.note.trim()],
     ).map_err(to_error)?;
     Ok(Order {
@@ -3147,11 +3627,14 @@ fn create_order(input: OrderInput, state: tauri::State<'_, AppState>) -> Result<
         account_id: input.account_id,
         order_no,
         item_id: String::new(),
+        item_image_url: String::new(),
         product_title: input.product_title.trim().to_owned(),
+        specification: String::new(),
         buyer_masked_name: input.buyer_masked_name.trim().to_owned(),
         amount: input.amount,
         status_code: String::new(),
         status: input.status,
+        refund_amount: 0.0, shipping_refund_status: String::new(),
         created_at: now,
         note: input.note.trim().to_owned(),
     })
@@ -3175,8 +3658,8 @@ fn update_order(
         return Err("订单不存在或已被删除".to_owned());
     }
     conn.query_row(
-        "SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders WHERE id = ?1", [id],
-        |row| Ok(Order { id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, product_title: row.get(4)?, buyer_masked_name: row.get(5)?, amount: row.get(6)?, status_code: row.get(7)?, status: row.get(8)?, created_at: row.get(9)?, note: row.get(10)? }),
+        "SELECT id, account_id, order_no, item_id, item_image_url, product_title, specification, buyer_masked_name, amount, refund_amount, status_code, status, shipping_refund_status, created_at, note FROM orders WHERE id = ?1", [id],
+        |row| Ok(Order { id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, item_image_url: row.get(4)?, product_title: row.get(5)?, specification: row.get(6)?, buyer_masked_name: row.get(7)?, amount: row.get(8)?, refund_amount: row.get(9)?, status_code: row.get(10)?, status: row.get(11)?, shipping_refund_status: row.get(12)?, created_at: row.get(13)?, note: row.get(14)? }),
     ).map_err(to_error)
 }
 
@@ -3258,7 +3741,7 @@ fn export_backup(state: tauri::State<'_, AppState>) -> Result<BackupData, String
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_error)?;
 
-    let mut order_statement = conn.prepare("SELECT id, account_id, order_no, item_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note FROM orders ORDER BY created_at DESC").map_err(to_error)?;
+    let mut order_statement = conn.prepare("SELECT id, account_id, order_no, item_id, item_image_url, product_title, specification, buyer_masked_name, amount, refund_amount, status_code, status, shipping_refund_status, created_at, note FROM orders ORDER BY created_at DESC").map_err(to_error)?;
     let orders = order_statement
         .query_map([], |row| {
             Ok(Order {
@@ -3266,13 +3749,17 @@ fn export_backup(state: tauri::State<'_, AppState>) -> Result<BackupData, String
                 account_id: row.get(1)?,
                 order_no: row.get(2)?,
                 item_id: row.get(3)?,
-                product_title: row.get(4)?,
-                buyer_masked_name: row.get(5)?,
-                amount: row.get(6)?,
-                status_code: row.get(7)?,
-                status: row.get(8)?,
-                created_at: row.get(9)?,
-                note: row.get(10)?,
+                item_image_url: row.get(4)?,
+                product_title: row.get(5)?,
+                specification: row.get(6)?,
+                buyer_masked_name: row.get(7)?,
+                amount: row.get(8)?,
+                refund_amount: row.get(9)?,
+                status_code: row.get(10)?,
+                status: row.get(11)?,
+                shipping_refund_status: row.get(12)?,
+                created_at: row.get(13)?,
+                note: row.get(14)?,
             })
         })
         .map_err(to_error)?
@@ -3406,10 +3893,15 @@ async fn sync_account(
         }
         let order_no = value_string(order, &["order_no", "orderNo", "order_id", "id"]);
         let id = format!("SRC-O-{}-{}", &account_id[..8], remote_id);
+        let order_status = normalize_order_status(value_string(order, &["status", "order_status", "orderStatus", "orderStatusDesc", "statusDesc"]));
+        let order_created_at = value_string(order, &["created_at", "createdAt", "create_time", "createTime"]);
+        let order_amount = value_number(order, &["actual_amount", "amount", "price", "payment"]);
+        let order_refund = value_number(order, &["refund_amount", "refundAmount", "refund_money", "refundMoney", "refund_fee", "refundFee"]);
         orders_changed += conn.execute(
-            "INSERT INTO orders (id, account_id, order_no, item_id, buyer_id, product_title, buyer_masked_name, amount, status_code, status, created_at, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(id) DO UPDATE SET order_no = excluded.order_no, item_id = excluded.item_id, buyer_id = excluded.buyer_id, product_title = excluded.product_title, buyer_masked_name = excluded.buyer_masked_name, amount = excluded.amount, status_code = excluded.status_code, status = excluded.status, created_at = excluded.created_at, note = excluded.note",
-            params![id, account_id, order_no, value_string(order, &["item_id", "itemId"]), value_string(order, &["buyer_id", "buyerId"]), value_string(order, &["item_title", "product_title", "productTitle", "title"]), value_string(order, &["buyer_fish_nick", "buyer_nick", "buyer_nickname", "buyer_name", "buyer_id"]), value_number(order, &["actual_amount", "amount", "price", "payment"]), value_string(order, &["status_code", "statusCode", "order_status_code"]), normalize_order_status(value_string(order, &["status", "order_status", "orderStatus", "orderStatusDesc", "statusDesc"])), value_string(order, &["created_at", "createdAt", "create_time", "createTime"]), value_string(order, &["note", "remark", "message"])],
+            "INSERT INTO orders (id, account_id, order_no, item_id, item_image_url, buyer_id, product_title, specification, buyer_masked_name, amount, refund_amount, status_code, status, shipping_refund_status, created_at, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) ON CONFLICT(id) DO UPDATE SET order_no = excluded.order_no, item_id = excluded.item_id, item_image_url = excluded.item_image_url, buyer_id = excluded.buyer_id, product_title = excluded.product_title, specification = excluded.specification, buyer_masked_name = excluded.buyer_masked_name, amount = excluded.amount, refund_amount = excluded.refund_amount, status_code = excluded.status_code, status = excluded.status, shipping_refund_status = excluded.shipping_refund_status, created_at = excluded.created_at, note = excluded.note",
+            params![id, account_id, order_no, value_string(order, &["item_id", "itemId"]), value_string(order, &["item_image_url", "itemImageUrl"]), value_string(order, &["buyer_id", "buyerId"]), value_string(order, &["item_title", "product_title", "productTitle", "title"]), value_string(order, &["specification", "spec"]), value_string(order, &["buyer_fish_nick", "buyer_nick", "buyer_nickname", "buyer_name", "buyer_id"]), order_amount, order_refund, value_string(order, &["status_code", "statusCode", "order_status_code"]), order_status, value_string(order, &["shipping_refund_status", "shippingRefundStatus"]), order_created_at, value_string(order, &["note", "remark", "message"])],
         ).map_err(to_error)?;
+        sync_member_from_order(&conn, &state.secret_key, &account_id, &id, order, &value_string(order, &["buyer_fish_nick", "buyer_nick", "buyer_nickname", "buyer_name", "buyer_id"]), &order_status, &order_created_at)?;
     }
     conn.execute(
         "UPDATE accounts SET last_sync_at = ?1 WHERE id = ?2",
@@ -3454,6 +3946,8 @@ pub fn run() {
                 chat_listeners: Mutex::new(HashMap::new()),
                 im_request_senders: Mutex::new(HashMap::new()),
                 im_statuses: Mutex::new(HashMap::new()),
+                im_validation_urls: Mutex::new(HashMap::new()),
+                im_validation_cookies: Mutex::new(HashMap::new()),
             });
             Ok(())
         })
@@ -3462,6 +3956,10 @@ pub fn run() {
             update_conversation_name,
             list_products,
             list_orders,
+            list_members,
+            reveal_member,
+            update_member,
+            member_orders,
             order_detail,
             refund_detail,
             refund_verification,
@@ -3480,6 +3978,9 @@ pub fn run() {
             update_customer_remark,
             chat_unread_totals,
             get_im_statuses,
+            get_im_verification_state,
+            open_im_verification,
+            complete_im_verification,
             list_app_logs,
             start_chat_listener,
             stop_chat_listener,

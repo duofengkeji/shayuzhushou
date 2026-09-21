@@ -1,5 +1,12 @@
+/**
+ * Tauri API facade used by the web UI.
+ *
+ * The UI calls this module instead of invoking command names directly. Keep
+ * status-code mapping and request argument normalization here so the Rust
+ * command layer remains the single integration boundary for Xianyu APIs.
+ */
 import { invoke } from '@tauri-apps/api/core'
-import type { Account, AccountInput, AppLog, BackupData, ChatContact, ChatContactsPage, ChatEmoji, ChatMessage, ChatMessagesPage, CustomerProfile, DashboardStats, Order, OrderDetail, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, RefundDetail, RefundVerification, SyncJob, SyncResult } from './types'
+import type { Account, AccountInput, AppLog, BackupData, ChatContact, ChatContactsPage, ChatEmoji, ChatMessage, ChatMessagesPage, CustomerProfile, DashboardStats, ImVerificationState, Member, MemberOrder, Order, OrderDetail, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, RefundDetail, RefundVerification, SyncJob, SyncResult } from './types'
 
 const relatedOrderStatusIds: Record<string, string> = {
   '全部': 'ALL',
@@ -16,6 +23,10 @@ export const api = {
   accounts: () => invoke<Account[]>('list_accounts'),
   products: (accountId?: string) => invoke<Product[]>('list_products', { accountId }),
   orders: (accountId?: string) => invoke<Order[]>('list_orders', { accountId }),
+  members: (accountId?: string) => invoke<Member[]>('list_members', { accountId }),
+  revealMember: (id: string) => invoke<Member>('reveal_member', { id }),
+  updateMember: (id: string, remark: string, tags: string[]) => invoke<Member>('update_member', { id, remark, tags }),
+  memberOrders: (id: string) => invoke<MemberOrder[]>('member_orders', { id }),
   orderDetail: (accountId: string, orderNo: string) => invoke<OrderDetail>('order_detail', { accountId, orderNo }),
   refundDetail: (accountId: string, orderNo: string) => invoke<RefundDetail>('refund_detail', { accountId, orderNo }),
   refundVerification: (accountId: string, refundId: string) => invoke<RefundVerification>('refund_verification', { accountId, refundId }),
@@ -34,6 +45,9 @@ export const api = {
   updateCustomerRemark: (accountId: string, chatId: string, remark: string) => invoke<string>('update_customer_remark', { accountId, chatId, remark }),
   chatUnreadTotals: () => invoke<Record<string, number>>('chat_unread_totals'),
   imStatuses: () => invoke<Record<string, string>>('get_im_statuses'),
+  imVerificationState: (accountId: string) => invoke<ImVerificationState>('get_im_verification_state', { accountId }),
+  openImVerification: (accountId: string) => invoke<void>('open_im_verification', { accountId }),
+  completeImVerification: (accountId: string) => invoke<void>('complete_im_verification', { accountId }),
   appLogs: (limit = 300) => invoke<AppLog[]>('list_app_logs', { limit }),
   startChatListener: (accountId: string) => invoke<void>('start_chat_listener', { accountId }),
   stopChatListener: (accountId: string) => invoke<void>('stop_chat_listener', { accountId }),
