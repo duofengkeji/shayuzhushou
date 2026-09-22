@@ -45,11 +45,28 @@ fn renewed_cookie_cache() -> &'static Mutex<HashMap<String, String>> {
     IM_RENEWED_COOKIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Take the most recent Cookie returned while preparing an IM connection.
-/// This is needed by the manual verification window: the validation URL and
-/// its refreshed session Cookie must be used together.
-pub(crate) fn take_renewed_cookie(account_id: &str) -> Option<String> {
-    renewed_cookie_cache().lock().ok()?.remove(account_id)
+/// Take the most recent Cookie returned while preparing this IM session.
+/// The cache is keyed by platform user id, so derive that key from the Cookie
+/// rather than passing the application's local account id.
+pub(crate) fn take_renewed_cookie(cookie: &str) -> Option<String> {
+    let user_id = cookie_value(cookie, &["unb", "munb"]);
+    if user_id.is_empty() {
+        return None;
+    }
+    renewed_cookie_cache().lock().ok()?.remove(&user_id)
+}
+
+/// A completed challenge changes the authorization context. Force the next
+/// connection to obtain a token under that new context.
+pub(crate) fn invalidate_im_token_for_cookie(cookie: &str) {
+    let user_id = cookie_value(cookie, &["unb", "munb"]);
+    if user_id.is_empty() {
+        return;
+    }
+    invalidate_im_token(&user_id);
+    if let Ok(mut cookies) = renewed_cookie_cache().lock() {
+        cookies.remove(&user_id);
+    }
 }
 
 fn invalidate_im_token(user_id: &str) {

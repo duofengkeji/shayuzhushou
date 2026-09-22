@@ -147,6 +147,24 @@ fn session_cookie_entries(cookie: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+fn verification_cookie_domains(target_host: &str) -> Vec<String> {
+    let target_host = target_host.trim_start_matches('.').to_ascii_lowercase();
+    let mut domains = vec![target_host.clone()];
+    let parent = if target_host == "goofish.com" || target_host.ends_with(".goofish.com") {
+        Some(".goofish.com")
+    } else if target_host == "taobao.com" || target_host.ends_with(".taobao.com") {
+        Some(".taobao.com")
+    } else {
+        None
+    };
+    if let Some(parent) = parent {
+        if target_host != parent.trim_start_matches('.') {
+            domains.push(parent.to_owned());
+        }
+    }
+    domains
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Account {
@@ -2623,7 +2641,8 @@ async fn start_chat_listener(
                         // validation URL. Pair that fresh cookie with the URL;
                         // submitting the challenge with the previous cookie
                         // produces a generic slider failure page.
-                        let verification_cookie = xianyu_im_local::take_renewed_cookie(&listener_account_id)
+                        let verification_cookie = xianyu_local::take_im_validation_cookie(verification_url)
+                            .or_else(|| xianyu_im_local::take_renewed_cookie(&cookie))
                             .unwrap_or_else(|| cookie.clone());
                         if let Some(state) = app.try_state::<AppState>() {
                             if let Ok(conn) = state.db.lock() {
@@ -2753,12 +2772,11 @@ fn open_im_verification(
     .map_err(to_error)?;
     let target_host = target.host_str().unwrap_or("passport.goofish.com");
     for (name, value) in session_cookie_entries(&cookie) {
-        for domain in [target_host, ".goofish.com"] {
+        for domain in verification_cookie_domains(target_host) {
             let cookie = tauri::webview::Cookie::build((name.clone(), value.clone()))
                 .domain(domain)
                 .path("/")
                 .secure(true)
-                .http_only(true)
                 .same_site(tauri::webview::cookie::SameSite::None)
                 .build();
             window.set_cookie(cookie).map_err(to_error)?;
@@ -2792,7 +2810,7 @@ async fn complete_im_verification(
     if x5_cookies.is_empty() {
         return Err("尚未检测到 x5sec 风控 Cookie。请先在验证窗口完成挑战后再继续。".to_owned());
     }
-    {
+    let merged_cookie = {
         let conn = state.db.lock().map_err(to_error)?;
         let current_cookie = local_session(&conn, &account_id, &state.secret_key)?;
         let mut cookies = session_cookie_entries(&current_cookie)
@@ -2807,7 +2825,9 @@ async fn complete_im_verification(
             .collect::<Vec<_>>()
             .join("; ");
         save_renewed_session(&conn, &account_id, &merged_cookie, &state.secret_key)?;
-    }
+        merged_cookie
+    };
+    xianyu_im_local::invalidate_im_token_for_cookie(&merged_cookie);
     if let Ok(mut urls) = state.im_validation_urls.lock() {
         urls.remove(&account_id);
     }
@@ -4024,6 +4044,7 @@ mod tests {
     use super::{
         decrypt_secret, delete_account_records, encrypt_secret, initialize_database,
         normalize_order_status, normalize_product_status, remove_near_duplicate_messages,
+        verification_cookie_domains,
     };
     use rusqlite::Connection;
 
@@ -4045,6 +4066,18 @@ mod tests {
         assert_eq!(normalize_order_status("已发货".to_owned()), "待收货");
         assert_eq!(normalize_order_status("退款成功".to_owned()), "已退款");
         assert_eq!(normalize_order_status("交易关闭".to_owned()), "已关闭");
+    }
+
+    #[test]
+    fn verification_cookies_stay_on_the_challenge_site_family() {
+        assert_eq!(
+            verification_cookie_domains("passport.goofish.com"),
+            vec!["passport.goofish.com", ".goofish.com"]
+        );
+        assert_eq!(
+            verification_cookie_domains("h5api.m.taobao.com"),
+            vec!["h5api.m.taobao.com", ".taobao.com"]
+        );
     }
 
     #[test]

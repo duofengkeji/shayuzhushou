@@ -1103,6 +1103,11 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
   const quickReplyCommandRef = useRef<HTMLDivElement>(null)
   const productPickerRef = useRef<HTMLDivElement>(null)
   const contactLoadingRef = useRef(false)
+  // Each account switch gets its own contact-load generation. The previous
+  // account's native invoke cannot be cancelled, so its finally handler must
+  // not clear the loading lock (or repaint state) for the newly selected
+  // account.
+  const contactLoadGenerationRef = useRef(0)
   const pushRefreshPendingRef = useRef(false)
   const messageLoadingRef = useRef(false)
   const messageRefreshPendingRef = useRef(false)
@@ -1235,13 +1240,16 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
 
   const refreshContacts = async (remote = !imConnected, cursor: number | null = null) => {
     if (!account) { setContacts([]); setSelectedId(''); return }
+    const generation = contactLoadGenerationRef.current
     if (contactLoadingRef.current) return
     contactLoadingRef.current = true
     setContactLoading(true); setError('')
+    const current = () => contactLoadGenerationRef.current === generation
     try {
       let localContactsEmpty = false
       if (cursor === null) {
         const local = await api.chatContacts(account.id)
+        if (!current()) return
         localContactsEmpty = local.length === 0
         setContacts(local)
         setSelectedId((current) => requestedConversation(local)?.chatId ?? (local.some((item) => item.chatId === current) ? current : local[0]?.chatId ?? ''))
@@ -1250,6 +1258,7 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
       // record was deleted, so bootstrap the list even when IM is connected.
       if (remote || localContactsEmpty) {
         const page = await api.syncChatContacts(account.id, cursor)
+        if (!current()) return
         setContacts(page.items)
         setContactCursor(page.nextCursor)
         setContactHasMore(page.hasMore)
@@ -1258,8 +1267,9 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
       }
       void onUnreadChanged()
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError))
+      if (current()) setError(nextError instanceof Error ? nextError.message : String(nextError))
     } finally {
+      if (contactLoadGenerationRef.current !== generation) return
       contactLoadingRef.current = false
       setContactLoading(false)
       if (pushRefreshPendingRef.current) {
@@ -1301,6 +1311,8 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
   }
 
   useEffect(() => {
+    contactLoadGenerationRef.current += 1
+    contactLoadingRef.current = false
     setContacts([]); setMessages([]); setSelectedId('')
     setContactLimit(CONTACT_BATCH); setContactCursor(null); setContactHasMore(true)
     void refreshContacts(!imConnected)

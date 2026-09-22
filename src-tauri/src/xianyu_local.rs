@@ -21,8 +21,20 @@ const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleW
 // of persistent logs.
 const IM_VALIDATION_ERROR_PREFIX: &str = "__XY_IM_VALIDATION_URL__:";
 
+// A Baxia response may rotate the MTop session in the same response that
+// returns the signed challenge URL. Keep that cookie paired with the URL so
+// the verification WebView does not open the challenge with a stale session.
+fn im_validation_cookies() -> &'static Mutex<HashMap<String, String>> {
+    static COOKIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    COOKIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub(crate) fn im_validation_url(error: &str) -> Option<&str> {
     error.strip_prefix(IM_VALIDATION_ERROR_PREFIX)
+}
+
+pub(crate) fn take_im_validation_cookie(verification_url: &str) -> Option<String> {
+    im_validation_cookies().lock().ok()?.remove(verification_url)
 }
 
 pub(crate) fn web_user_agent() -> &'static str {
@@ -899,6 +911,11 @@ pub(crate) async fn mtop_call(
                 .pointer("/data/url")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            if !verification_url.is_empty() {
+                if let Ok(mut cookies) = im_validation_cookies().lock() {
+                    cookies.insert(verification_url.to_owned(), merged_cookie);
+                }
+            }
             return Err(format!("{IM_VALIDATION_ERROR_PREFIX}{verification_url}"));
         }
         return Err(if ret.is_empty() {
