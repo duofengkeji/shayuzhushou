@@ -5,16 +5,28 @@
 //! 自行拼接闲鱼 URL、签名或请求头，新增接口优先在本模块增加带注释的封装函数。
 
 use base64::Engine as _;
-use reqwest::header::{HeaderMap, ACCEPT, COOKIE, ORIGIN, REFERER, SET_COOKIE, USER_AGENT};
+use reqwest::{
+    cookie::{CookieStore, Jar},
+    header::{
+        HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION, COOKIE,
+        LOCATION, ORIGIN, REFERER, SET_COOKIE, USER_AGENT,
+    },
+};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
-const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+// Match the native macOS WebView profile used for in-app verification.
+// Sending a Windows Chrome fingerprint from a macOS WebView can make the
+// risk service issue a challenge that never clears.
+#[cfg(target_os = "macos")]
+pub(crate) const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
 
 // Carries the short-lived Baxia/punish URL to the IM listener. The listener
 // consumes it before writing an application log, keeping the signed URL out
@@ -29,16 +41,30 @@ fn im_validation_cookies() -> &'static Mutex<HashMap<String, String>> {
     COOKIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// All MTop calls for one logged-in account share the same short-lived H5
+// signing cookies.  Serialize those calls so a profile/order response cannot
+// overwrite a newer `_m_h5_tk` produced by an IM or QR request.
+fn mtop_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mtop_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    if let Ok(mut locks) = mtop_locks().lock() {
+        return locks
+            .entry(key.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+    }
+    Arc::new(tokio::sync::Mutex::new(()))
+}
+
 pub(crate) fn im_validation_url(error: &str) -> Option<&str> {
     error.strip_prefix(IM_VALIDATION_ERROR_PREFIX)
 }
 
 pub(crate) fn take_im_validation_cookie(verification_url: &str) -> Option<String> {
     im_validation_cookies().lock().ok()?.remove(verification_url)
-}
-
-pub(crate) fn web_user_agent() -> &'static str {
-    USER_AGENT_VALUE
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +127,16 @@ fn cookie_parse(value: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Match the reference login manager: a QR login is complete only after the
+/// final response has produced `unb`.
+fn login_account_id(cookies: &HashMap<String, String>) -> String {
+    cookies
+        .get("unb")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
 fn merge_set_cookies(cookies: &mut HashMap<String, String>, headers: &HeaderMap) {
     for header in headers.get_all(SET_COOKIE).iter() {
         let Ok(value) = header.to_str() else { continue };
@@ -150,256 +186,497 @@ fn json_truthy(value: Option<&Value>) -> bool {
     }
 }
 
-async fn follow_redirects(
+fn reference_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/json, text/plain, */*"),
+    );
+    headers.insert(
+        ACCEPT_LANGUAGE,
+        HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
+    );
+    headers.insert(
+        ACCEPT_ENCODING,
+        HeaderValue::from_static("gzip, deflate, br"),
+    );
+    headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+    headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
+    headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
+    headers.insert("Sec-Fetch-Site", HeaderValue::from_static("same-origin"));
+    headers.insert(
+        REFERER,
+        HeaderValue::from_static("https://passport.goofish.com/"),
+    );
+    headers.insert(
+        ORIGIN,
+        HeaderValue::from_static("https://passport.goofish.com"),
+    );
+    headers
+}
+
+fn seed_cookie_jar(jar: &Jar, cookies: &HashMap<String, String>, url: &reqwest::Url) {
+    for (name, value) in cookies {
+        jar.add_cookie_str(&format!("{name}={value}; Path=/"), url);
+    }
+}
+
+/// Re-establish the short-lived MTop session cookie after a QR/face login.
+/// The QR polling response can contain the user session (`unb`) before the
+/// H5 signing cookie (`_m_h5_tk`) has been issued on this request path. The
+/// official web flow warms the same endpoint before requesting the IM token.
+pub(crate) async fn warm_mtop_session(cookie: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::limited(4))
+        .default_headers(reference_headers())
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut cookies = cookie_parse(cookie);
+    let url = "https://h5api.m.goofish.com/h5/mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get/1.0/";
+    let response = client
+        .get(url)
+        .header(COOKIE, cookie)
+        .header(REFERER, "https://passport.goofish.com/")
+        .header(ORIGIN, "https://passport.goofish.com")
+        .send()
+        .await
+        .map_err(|error| format!("初始化闲鱼 MTop 会话失败：{error}"))?;
+    merge_set_cookies(&mut cookies, response.headers());
+    // The web flow follows the bootstrap GET with a signed POST.  The POST is
+    // what causes H5 to rotate `_m_h5_tk` for a freshly scanned session; doing
+    // only the GET leaves QR logins with a valid `unb` but no token for the
+    // IM endpoint.
+    let token = cookies
+        .get("_m_h5_tk")
+        .or_else(|| cookies.get("m_h5_tk"))
+        .and_then(|value| value.split('_').next())
+        .unwrap_or_default();
+    let timestamp = now_millis().to_string();
+    let app_key = "34839810";
+    let data = serde_json::json!({"bizScene":"home"}).to_string();
+    let sign = format!(
+        "{:x}",
+        md5::compute(format!("{token}&{timestamp}&{app_key}&{data}"))
+    );
+    let warm_params = [
+        ("jsv", "2.7.2"),
+        ("appKey", app_key),
+        ("t", timestamp.as_str()),
+        ("sign", sign.as_str()),
+        ("v", "1.0"),
+        ("type", "originaljson"),
+        ("dataType", "json"),
+        ("timeout", "20000"),
+        ("api", "mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get"),
+        ("data", data.as_str()),
+    ];
+    let warm_response = client
+        .post(url)
+        .query(&warm_params)
+        .header(COOKIE, cookie_string(&cookies))
+        .header(REFERER, "https://passport.goofish.com/")
+        .header(ORIGIN, "https://passport.goofish.com")
+        .send()
+        .await
+        .map_err(|error| format!("刷新闲鱼 MTop 会话失败：{error}"))?;
+    merge_set_cookies(&mut cookies, warm_response.headers());
+    Ok(cookie_string(&cookies))
+}
+
+fn merge_cookie_jar(
+    cookies: &mut HashMap<String, String>,
+    jar: &Jar,
+    urls: &[&reqwest::Url],
+) {
+    for url in urls {
+        if let Some(header) = jar.cookies(url) {
+            if let Ok(value) = header.to_str() {
+                cookies.extend(cookie_parse(value));
+            }
+        }
+    }
+}
+
+fn face_verification_url(body: &Value) -> Option<String> {
+    let data = body.pointer("/content/data")?;
+    let redirect_enabled = json_truthy(data.get("iframeRedirect"));
+    let redirect_url = data
+        .get("iframeRedirectUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    // Some responses include the boolean flag, others only include the
+    // redirect URL. The reference client treats either form as the face
+    // verification branch.
+    if redirect_enabled || redirect_url.is_some() {
+        redirect_url.map(str::to_owned)
+    } else {
+        None
+    }
+}
+
+async fn get_following_redirects(
     client: &reqwest::Client,
     url: &str,
+    headers: &HeaderMap,
     cookies: &mut HashMap<String, String>,
-    referer: &str,
-) -> Result<(String, String), String> {
+) -> Result<(reqwest::Url, Vec<u8>), String> {
     let mut current = reqwest::Url::parse(url).map_err(|_| "身份验证地址格式异常".to_owned())?;
-    for _ in 0..8 {
+    for _ in 0..10 {
         let response = client
             .get(current.clone())
-            .header(USER_AGENT, USER_AGENT_VALUE)
-            .header(
-                ACCEPT,
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
-            .header(COOKIE, cookie_string(cookies))
-            .header(REFERER, referer)
+            .headers(headers.clone())
             .send()
             .await
-            .map_err(|error| format!("请求闲鱼身份验证失败：{error}"))?;
+            .map_err(|error| format!("请求身份验证页面失败：{error}"))?;
         merge_set_cookies(cookies, response.headers());
         if response.status().is_redirection() {
             let location = response
                 .headers()
-                .get(reqwest::header::LOCATION)
+                .get(LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .ok_or("身份验证跳转地址缺失")?;
+                .ok_or("身份验证跳转地址缺失".to_owned())?;
             current = reqwest::Url::parse(location)
                 .or_else(|_| current.join(location))
                 .map_err(|_| "身份验证跳转地址异常".to_owned())?;
             continue;
         }
-        let final_url = current.to_string();
-        let html = response
-            .text()
+        let body = response
+            .bytes()
             .await
-            .map_err(|_| "读取身份验证页面失败".to_owned())?;
-        return Ok((final_url, html));
+            .map_err(|error| format!("读取身份验证页面失败：{error}"))?;
+        return Ok((current, body.to_vec()));
     }
     Err("身份验证跳转次数过多".to_owned())
 }
 
-async fn prepare_face_verification(
-    client: &reqwest::Client,
-    iframe_url: &str,
-    cookies: &mut HashMap<String, String>,
-) -> Result<(String, String, String), String> {
-    let (_, normal_html) =
-        follow_redirects(client, iframe_url, cookies, "https://passport.goofish.com/").await?;
-    let verify_modes = regex::Regex::new(
-        r#"(?i)window\.location\.href\s*=\s*["']([^"']*?/iv/mini/verify_modes\.htm\?[^"']*)["']"#,
-    )
-    .map_err(|error| error.to_string())?
-    .captures(&normal_html)
-    .and_then(|value| value.get(1))
-    .map(|value| value.as_str().replace("&amp;", "&"))
-    .ok_or("身份验证未返回验证方式地址")?;
-    let verify_modes = if verify_modes.ends_with("_umidfg=") {
-        format!("{verify_modes}1")
-    } else {
-        verify_modes
+async fn run_face_verification(session_id: String, iframe_url: String) {
+    let Some(snapshot) = sessions().lock().ok().and_then(|all| all.get(&session_id).cloned()) else {
+        return;
     };
-    let (_, identity_html) = follow_redirects(client, &verify_modes, cookies, iframe_url).await?;
-    let htoken = regex::Regex::new(r#"(?i)htoken=([A-Za-z0-9_\-]+)"#)
+
+    let result = async {
+        let passport_url = reqwest::Url::parse("https://passport.goofish.com/")
+            .map_err(|error| error.to_string())?;
+        let entry_url = reqwest::Url::parse(&iframe_url)
+            .map_err(|_| "身份验证地址格式异常".to_owned())?;
+        let jar = Arc::new(Jar::default());
+        seed_cookie_jar(&jar, &snapshot.cookies, &passport_url);
+        seed_cookie_jar(&jar, &snapshot.cookies, &entry_url);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(reference_headers())
+            .cookie_provider(Arc::clone(&jar))
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        // 1. Follow iframeRedirectUrl to normal_validate.htm using the same
+        // cookie jar that will be used by every subsequent verification call.
+        let mut cookies = snapshot.cookies.clone();
+        let (normal_url, normal_body) =
+            get_following_redirects(&client, &iframe_url, &HeaderMap::new(), &mut cookies).await?;
+        let normal_html = String::from_utf8_lossy(&normal_body);
+
+        // 2. Extract the server-rendered htoken and verify_modes URL.
+        let htoken = regex::Regex::new(r#"(?i)htoken=([A-Za-z0-9_\-]+)"#)
+            .map_err(|error| error.to_string())?
+            .captures(&normal_html)
+            .and_then(|value| value.get(1))
+            .map(|value| value.as_str().to_owned())
+            .ok_or("人脸验证：未能提取 htoken".to_owned())?;
+        let verify_modes = regex::Regex::new(
+            r#"(?i)window\.location\.href\s*=\s*[\"'](https://[^\"']*?/iv/mini/verify_modes\.htm\?[^\"']*)[\"']"#,
+        )
         .map_err(|error| error.to_string())?
         .captures(&normal_html)
         .and_then(|value| value.get(1))
-        .map(|value| value.as_str().to_owned())
-        .ok_or("身份验证未返回 htoken")?;
-    let content = regex::Regex::new(r#"(?i)new\s+Qrcode\s*\(\s*\{\s*text\s*:\s*["']([^"']+)["']"#)
+        .map(|value| value.as_str().replace("&amp;", "&"))
+        .ok_or("人脸验证：未能提取 verify_modes 链接".to_owned())?;
+        let verify_modes = if verify_modes.ends_with("_umidfg=") {
+            format!("{verify_modes}1")
+        } else {
+            verify_modes
+        };
+
+        // 3. Follow verify_modes.htm to identity_verify.htm with the same jar.
+        let (identity_url, identity_body) =
+            get_following_redirects(&client, &verify_modes, &HeaderMap::new(), &mut cookies)
+                .await?;
+        let identity_html = String::from_utf8_lossy(&identity_body);
+
+        // 4. Extract and publish the phone face-verification QR code.
+        let face_content = regex::Regex::new(
+            r#"(?i)new\s+Qrcode\s*\(\s*\{\s*text\s*:\s*[\"']([^\"']+)[\"']"#,
+        )
         .map_err(|error| error.to_string())?
         .captures(&identity_html)
         .and_then(|value| value.get(1))
         .map(|value| value.as_str().to_owned())
-        .ok_or("身份验证未返回二维码")?;
-    Ok((htoken, iframe_url.to_owned(), qr_svg_data_url(&content)?))
-}
-
-async fn poll_face_verification(
-    client: &reqwest::Client,
-    htoken: &str,
-    cookies: &mut HashMap<String, String>,
-) -> Result<(Option<String>, bool), String> {
-    if htoken.trim().is_empty() {
-        return Ok((None, false));
-    }
-    let response = client
-        .get("https://passport.goofish.com/iv/photoVerify/check.do")
-        .query(&[("htoken", htoken)])
-        .header(USER_AGENT, USER_AGENT_VALUE)
-        .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
-        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
-        .header(COOKIE, cookie_string(cookies))
-        .header(ORIGIN, "https://passport.goofish.com")
-        .header(
-            REFERER,
-            format!("https://passport.goofish.com/iv/mini/identity_verify.htm?htoken={htoken}"),
-        )
-        .header("X-Requested-With", "XMLHttpRequest")
-        .send()
-        .await
-        .map_err(|error| format!("查询身份验证状态失败：{error}"))?;
-    merge_set_cookies(cookies, response.headers());
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|_| "身份验证状态格式异常".to_owned())?;
-    let content = body.get("content").unwrap_or(&Value::Null);
-    let code = json_param(content.get("code").unwrap_or(&Value::Null));
-    let message = json_param(
-        content
-            .get("message")
-            .or_else(|| body.get("message"))
-            .unwrap_or(&Value::Null),
-    );
-    let illegal = code.eq_ignore_ascii_case("AUTH_TOKEN_ILLEGAL")
-        || message.to_ascii_uppercase().contains("AUTH_TOKEN_ILLEGAL")
-        || message.contains("核身token不合法");
-    Ok((
-        if code == "3" {
-            content
-                .get("url")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        } else {
-            None
-        },
-        illegal,
-    ))
-}
-
-async fn poll_face(
-    client: &reqwest::Client,
-    session_id: &str,
-    session: &QrSession,
-) -> Result<QrPoll, String> {
-    let mut cookies = session.cookies.clone();
-    let mut htoken = session.face_htoken.clone();
-    let mut verification_url = session.verification_url.clone();
-    let mut verification_qr_url = session.verification_qr_url.clone();
-    if htoken.is_empty() && !verification_url.is_empty() {
-        match prepare_face_verification(client, &verification_url, &mut cookies).await {
-            Ok(result) => {
-                htoken = result.0;
-                verification_url = result.1;
-                verification_qr_url = result.2;
-            }
-            Err(error) => {
-                return Ok(QrPoll {
-                    status: "verification_required".to_owned(),
-                    message: format!("身份验证二维码生成失败：{error}"),
-                    verification_url,
-                    verification_qr_url,
-                    account_id: String::new(),
-                    cookie: String::new(),
-                })
+        .ok_or("人脸验证：未能提取人脸验证二维码 URL".to_owned())?;
+        let face_qr_url = qr_svg_data_url(&face_content)?;
+        merge_cookie_jar(
+            &mut cookies,
+            &jar,
+            &[&passport_url, &normal_url, &identity_url],
+        );
+        if let Ok(mut all) = sessions().lock() {
+            if let Some(session) = all.get_mut(&session_id) {
+                session.cookies = cookies.clone();
+                session.face_htoken = htoken.clone();
+                session.verification_qr_url = face_qr_url;
+                session.message = "需要人脸验证，请使用手机闲鱼扫描二维码".to_owned();
+            } else {
+                return Ok::<(), String>(());
             }
         }
-    }
-    let (finish_url, illegal) = poll_face_verification(client, &htoken, &mut cookies).await?;
-    if illegal {
-        let updated = QrSession {
-            status: "verification_required".to_owned(),
-            message: "请使用手机闲鱼扫描当前二维码完成验证".to_owned(),
-            params: session.params.clone(),
-            cookies,
-            created_at_ms: session.created_at_ms,
-            verification_url: verification_url.clone(),
-            verification_qr_url: verification_qr_url.clone(),
-            face_htoken: htoken,
-        };
-        sessions()
-            .lock()
-            .map_err(|_| "二维码会话锁定失败".to_owned())?
-            .insert(session_id.to_owned(), updated.clone());
-        return Ok(QrPoll {
-            status: updated.status,
-            message: updated.message,
-            verification_url,
-            verification_qr_url,
-            account_id: String::new(),
-            cookie: String::new(),
-        });
-    }
-    if let Some(url) = finish_url {
-        let referer =
-            format!("https://passport.goofish.com/iv/mini/identity_verify.htm?htoken={htoken}");
-        let _ = follow_redirects(client, &url, &mut cookies, &referer).await?;
-        let account_id = cookies
-            .get("unb")
-            .or_else(|| cookies.get("tracknick"))
-            .cloned()
-            .unwrap_or_default();
-        if !account_id.is_empty() {
-            let cookie = cookie_string(&cookies);
-            let updated = QrSession {
-                status: "success".to_owned(),
-                message: "身份验证完成，扫码登录成功".to_owned(),
-                params: session.params.clone(),
-                cookies,
-                created_at_ms: session.created_at_ms,
-                verification_url: verification_url.clone(),
-                verification_qr_url: verification_qr_url.clone(),
-                face_htoken: htoken,
-            };
-            sessions()
+
+        // 5. Poll the official check endpoint every two seconds until the
+        // phone completes verification or the five-minute session expires.
+        let check_referer = format!(
+            "https://passport.goofish.com/iv/mini/identity_verify.htm?htoken={htoken}"
+        );
+        let mut iv_check_url = None;
+        loop {
+            let expired = sessions()
                 .lock()
-                .map_err(|_| "二维码会话锁定失败".to_owned())?
-                .insert(session_id.to_owned(), updated.clone());
-            return Ok(QrPoll {
-                status: updated.status,
-                message: updated.message,
-                verification_url,
-                verification_qr_url,
-                account_id,
-                cookie,
-            });
+                .ok()
+                .and_then(|all| all.get(&session_id).cloned())
+                .map(|session| now_millis().saturating_sub(session.created_at_ms) > 300_000)
+                .unwrap_or(true);
+            if expired {
+                break;
+            }
+            match client
+                .get("https://passport.goofish.com/iv/photoVerify/check.do")
+                .query(&[("htoken", htoken.as_str())])
+                .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header(REFERER, &check_referer)
+                .send()
+                .await
+            {
+                Ok(response) => match response.json::<Value>().await {
+                    Ok(body) => {
+                        let content = body.get("content").unwrap_or(&Value::Null);
+                        let code = json_param(content.get("code").unwrap_or(&Value::Null));
+                        if code == "3" {
+                            iv_check_url = content
+                                .get("url")
+                                .and_then(Value::as_str)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_owned);
+                            if iv_check_url.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                },
+                Err(_) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        let iv_check_url = iv_check_url.ok_or("人脸验证超时或未完成".to_owned())?;
+
+        // 6. Follow ivCheckLogin.htm with the same jar, then collect the final
+        // login cookie. The reference implementation only succeeds with unb.
+        let mut finish_headers = HeaderMap::new();
+        finish_headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json, text/javascript, */*; q=0.01"),
+        );
+        finish_headers.insert(
+            "X-Requested-With",
+            HeaderValue::from_static("XMLHttpRequest"),
+        );
+        finish_headers.insert(
+            REFERER,
+            HeaderValue::from_str(&check_referer)
+                .map_err(|_| "身份验证 Referer 格式异常".to_owned())?,
+        );
+        let (finish_url, _) =
+            get_following_redirects(&client, &iv_check_url, &finish_headers, &mut cookies).await?;
+        merge_cookie_jar(
+            &mut cookies,
+            &jar,
+            &[&passport_url, &normal_url, &identity_url, &finish_url],
+        );
+        let account_id = login_account_id(&cookies);
+        if account_id.is_empty() {
+            return Err("人脸验证完成但未获取到 unb，登录失败".to_owned());
+        }
+
+        if let Ok(mut all) = sessions().lock() {
+            if let Some(session) = all.get_mut(&session_id) {
+                session.status = "success".to_owned();
+                session.message = "身份验证完成，扫码登录成功".to_owned();
+                session.cookies = cookies;
+                session.face_htoken = htoken;
+            }
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+
+    if let Err(error) = result {
+        if let Ok(mut all) = sessions().lock() {
+            if let Some(session) = all.get_mut(&session_id) {
+                session.status = "expired".to_owned();
+                session.message = error;
+            }
         }
     }
-    let updated = QrSession {
-        status: "verification_required".to_owned(),
-        message: "需要身份验证，请使用手机闲鱼扫描二维码".to_owned(),
-        params: session.params.clone(),
-        cookies,
-        created_at_ms: session.created_at_ms,
-        verification_url: verification_url.clone(),
-        verification_qr_url: verification_qr_url.clone(),
-        face_htoken: htoken,
-    };
-    sessions()
-        .lock()
-        .map_err(|_| "二维码会话锁定失败".to_owned())?
-        .insert(session_id.to_owned(), updated.clone());
-    Ok(QrPoll {
-        status: updated.status.clone(),
-        message: updated.message.clone(),
-        verification_url,
-        verification_qr_url,
-        account_id: String::new(),
-        cookie: String::new(),
-    })
+}
+
+async fn monitor_qr_status(session_id: String) {
+    loop {
+        let Some(snapshot) = sessions().lock().ok().and_then(|all| all.get(&session_id).cloned()) else {
+            return;
+        };
+        if now_millis().saturating_sub(snapshot.created_at_ms) > 300_000 {
+            if let Ok(mut all) = sessions().lock() {
+                if let Some(session) = all.get_mut(&session_id) {
+                    session.status = "expired".to_owned();
+                    session.message = "二维码已过期，请重新生成".to_owned();
+                }
+            }
+            return;
+        }
+        if matches!(
+            snapshot.status.as_str(),
+            "success" | "expired" | "cancelled" | "failed" | "verification_required"
+        ) {
+            return;
+        }
+
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::limited(8))
+            .default_headers(reference_headers())
+            .build();
+        let response = match response {
+            Ok(client) => {
+                client
+                    .post("https://passport.goofish.com/newlogin/qrcode/query.do")
+                    .header(COOKIE, cookie_string(&snapshot.cookies))
+                    .form(&snapshot.params)
+                    .send()
+                    .await
+            }
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let mut cookies = snapshot.cookies.clone();
+        merge_set_cookies(&mut cookies, response.headers());
+        let body = match response.json::<Value>().await {
+            Ok(body) => body,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let raw = body
+            .pointer("/content/data/qrCodeStatus")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        match raw {
+            "NEW" => {}
+            "SCANED" => {
+                if let Ok(mut all) = sessions().lock() {
+                    if let Some(session) = all.get_mut(&session_id) {
+                        session.status = "scanned".to_owned();
+                        session.message = "已扫码，请在手机端确认登录".to_owned();
+                    }
+                }
+            }
+            "CONFIRMED"
+                if face_verification_url(&body).is_some()
+                    || json_truthy(body.pointer("/content/data/iframeRedirect")) =>
+            {
+                let iframe_url = face_verification_url(&body).unwrap_or_default();
+                if iframe_url.is_empty() {
+                    if let Ok(mut all) = sessions().lock() {
+                        if let Some(session) = all.get_mut(&session_id) {
+                            session.status = "expired".to_owned();
+                            session.message = "闲鱼要求身份验证，但未返回验证地址".to_owned();
+                        }
+                    }
+                    return;
+                }
+                if let Ok(mut all) = sessions().lock() {
+                    if let Some(session) = all.get_mut(&session_id) {
+                        session.status = "verification_required".to_owned();
+                        session.message = "正在生成人脸验证二维码".to_owned();
+                        session.cookies = cookies;
+                        session.created_at_ms = now_millis();
+                        session.verification_url = iframe_url.clone();
+                    }
+                }
+                tauri::async_runtime::spawn(run_face_verification(
+                    session_id.clone(),
+                    iframe_url,
+                ));
+                return;
+            }
+            "CONFIRMED" => {
+                let account_id = login_account_id(&cookies);
+                if let Ok(mut all) = sessions().lock() {
+                    if let Some(session) = all.get_mut(&session_id) {
+                        session.cookies = cookies;
+                        if !account_id.is_empty() {
+                            session.status = "success".to_owned();
+                            session.message = "扫码登录成功".to_owned();
+                        } else {
+                            session.status = "expired".to_owned();
+                            session.message = "扫码确认完成但未获取到 unb，登录失败".to_owned();
+                        }
+                    }
+                }
+                return;
+            }
+            "EXPIRED" => {
+                if let Ok(mut all) = sessions().lock() {
+                    if let Some(session) = all.get_mut(&session_id) {
+                        session.status = "expired".to_owned();
+                        session.message = "二维码已过期，请重新生成".to_owned();
+                    }
+                }
+                return;
+            }
+            _ => {
+                if let Ok(mut all) = sessions().lock() {
+                    if let Some(session) = all.get_mut(&session_id) {
+                        session.status = "cancelled".to_owned();
+                        session.message = "已取消扫码登录".to_owned();
+                    }
+                }
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    }
 }
 
 pub async fn generate_qr() -> Result<QrStart, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(35))
         .redirect(reqwest::redirect::Policy::limited(8))
+        .default_headers(reference_headers())
         .build()
         .map_err(|error| error.to_string())?;
     let mut cookies = HashMap::new();
@@ -409,6 +686,13 @@ pub async fn generate_qr() -> Result<QrStart, String> {
         .get(h5_api)
         .header(USER_AGENT, USER_AGENT_VALUE)
         .header(ACCEPT, "application/json, text/plain, */*")
+        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("Connection", "keep-alive")
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header(REFERER, "https://passport.goofish.com/")
+        .header(ORIGIN, "https://passport.goofish.com")
         .send()
         .await
         .map_err(|error| format!("获取闲鱼登录令牌失败：{error}"))?;
@@ -435,13 +719,21 @@ pub async fn generate_qr() -> Result<QrStart, String> {
         ("dataType", "json"),
         ("timeout", "20000"),
         ("api", "mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get"),
+        ("data", data.as_str()),
     ];
     let warm = client
         .post(h5_api)
         .query(&warm_params)
         .header(USER_AGENT, USER_AGENT_VALUE)
+        .header(ACCEPT, "application/json, text/plain, */*")
+        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("Connection", "keep-alive")
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header(REFERER, "https://passport.goofish.com/")
+        .header(ORIGIN, "https://passport.goofish.com")
         .header(COOKIE, cookie_string(&cookies))
-        .form(&[("data", data.as_str())])
         .send()
         .await
         .map_err(|error| format!("初始化闲鱼登录会话失败：{error}"))?;
@@ -464,8 +756,15 @@ pub async fn generate_qr() -> Result<QrStart, String> {
         .get("https://passport.goofish.com/mini_login.htm")
         .query(&mini_params)
         .header(USER_AGENT, USER_AGENT_VALUE)
+        .header(ACCEPT, "application/json, text/plain, */*")
+        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("Connection", "keep-alive")
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-origin")
         .header(COOKIE, cookie_string(&cookies))
         .header(REFERER, "https://passport.goofish.com/")
+        .header(ORIGIN, "https://passport.goofish.com")
         .send()
         .await
         .map_err(|error| format!("获取闲鱼扫码参数失败：{error}"))?;
@@ -495,8 +794,14 @@ pub async fn generate_qr() -> Result<QrStart, String> {
         .get("https://passport.goofish.com/newlogin/qrcode/generate.do")
         .query(&params)
         .header(USER_AGENT, USER_AGENT_VALUE)
-        .header(COOKIE, cookie_string(&cookies))
+        .header(ACCEPT, "application/json, text/plain, */*")
+        .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("Connection", "keep-alive")
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-origin")
         .header(REFERER, "https://passport.goofish.com/")
+        .header(ORIGIN, "https://passport.goofish.com")
         .send()
         .await
         .map_err(|error| format!("生成闲鱼二维码失败：{error}"))?;
@@ -537,6 +842,8 @@ pub async fn generate_qr() -> Result<QrStart, String> {
         .map_err(|_| "二维码会话锁定失败".to_owned())?;
     all.retain(|_, item| now_millis().saturating_sub(item.created_at_ms) < 600_000);
     all.insert(session_id.clone(), session);
+    drop(all);
+    tauri::async_runtime::spawn(monitor_qr_status(session_id.clone()));
     Ok(QrStart {
         session_id,
         qr_code_url,
@@ -551,146 +858,19 @@ pub async fn poll_qr(session_id: &str) -> Result<QrPoll, String> {
         .get(session_id)
         .cloned()
         .ok_or("二维码会话不存在或已过期")?;
-    if now_millis().saturating_sub(session.created_at_ms) > 300_000 {
-        return Ok(QrPoll {
-            status: "expired".to_owned(),
-            message: "二维码已过期，请重新生成".to_owned(),
-            verification_url: String::new(),
-            verification_qr_url: String::new(),
-            account_id: String::new(),
-            cookie: String::new(),
-        });
-    }
-    if matches!(
-        session.status.as_str(),
-        "success" | "expired" | "cancelled" | "failed"
-    ) {
-        let account_id = session
-            .cookies
-            .get("unb")
-            .or_else(|| session.cookies.get("tracknick"))
-            .cloned()
-            .unwrap_or_default();
-        return Ok(QrPoll {
-            status: session.status,
-            message: session.message,
-            verification_url: session.verification_url,
-            verification_qr_url: session.verification_qr_url,
-            account_id,
-            cookie: cookie_string(&session.cookies),
-        });
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(25))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| error.to_string())?;
-    if session.status == "verification_required" {
-        return poll_face(&client, session_id, &session).await;
-    }
-    let mut cookies = session.cookies.clone();
-    let response = client
-        .post("https://passport.goofish.com/newlogin/qrcode/query.do")
-        .header(USER_AGENT, USER_AGENT_VALUE)
-        .header(ACCEPT, "application/json, text/plain, */*")
-        .header(COOKIE, cookie_string(&cookies))
-        .header(REFERER, "https://passport.goofish.com/")
-        .header(ORIGIN, "https://passport.goofish.com")
-        .form(&session.params)
-        .send()
-        .await
-        .map_err(|error| format!("查询扫码状态失败：{error}"))?;
-    merge_set_cookies(&mut cookies, response.headers());
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|_| "闲鱼扫码状态返回格式异常".to_owned())?;
-    let raw = body
-        .pointer("/content/data/qrCodeStatus")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let verification_url = body
-        .pointer("/content/data/iframeRedirectUrl")
-        .or_else(|| body.pointer("/content/data/iframeUrl"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    let (status, initial_message) = match raw {
-        "NEW" => ("waiting", "请使用闲鱼 App 扫描二维码"),
-        "SCANED" => ("scanned", "已扫码，请在手机端确认登录"),
-        "EXPIRED" => ("expired", "二维码已过期，请重新生成"),
-        "CONFIRMED"
-            if json_truthy(body.pointer("/content/data/iframeRedirect"))
-                && verification_url.is_empty() =>
-        {
-            ("failed", "闲鱼要求身份验证，但未返回验证地址")
-        }
-        "CONFIRMED"
-            if json_truthy(body.pointer("/content/data/iframeRedirect"))
-                || !verification_url.is_empty() =>
-        {
-            (
-                "verification_required",
-                "需要身份验证，请使用手机闲鱼扫描二维码",
-            )
-        }
-        "CONFIRMED" => ("success", "扫码登录成功"),
-        "CANCELED" | "CANCELLED" => ("cancelled", "已取消扫码登录"),
-        _ => ("waiting", "等待扫码确认"),
+    let account_id = if session.status == "success" {
+        login_account_id(&session.cookies)
+    } else {
+        String::new()
     };
-    let mut message = initial_message.to_owned();
-    let account_id = cookies
-        .get("unb")
-        .or_else(|| cookies.get("tracknick"))
-        .cloned()
-        .unwrap_or_default();
-    let mut face_htoken = session.face_htoken;
-    let mut verification_qr_url = session.verification_qr_url;
-    if status == "verification_required" && !verification_url.is_empty() {
-        match prepare_face_verification(&client, &verification_url, &mut cookies).await {
-            Ok(result) => {
-                face_htoken = result.0;
-                verification_qr_url = result.2;
-            }
-            Err(error) => {
-                // The iframe redirect URL is an intermediate server page, not
-                // the QR payload accepted by the mobile identity verifier.
-                // Surface the extraction error and retry on the next poll
-                // instead of showing a QR code that cannot complete login.
-                verification_qr_url.clear();
-                message = format!("身份验证二维码生成失败：{error}");
-            }
-        }
-    }
-    let created_at_ms =
-        if status == "verification_required" && session.status != "verification_required" {
-            now_millis()
-        } else {
-            session.created_at_ms
-        };
-    let updated = QrSession {
-        status: status.to_owned(),
-        message: message.clone(),
-        params: session.params,
-        cookies: cookies.clone(),
-        created_at_ms,
-        verification_url: verification_url.clone(),
-        verification_qr_url: verification_qr_url.clone(),
-        face_htoken,
-    };
-    sessions()
-        .lock()
-        .map_err(|_| "二维码会话锁定失败".to_owned())?
-        .insert(session_id.to_owned(), updated);
     Ok(QrPoll {
-        status: status.to_owned(),
-        message,
-        verification_url,
-        verification_qr_url,
+        status: session.status.clone(),
+        message: session.message,
+        verification_url: session.verification_url,
+        verification_qr_url: session.verification_qr_url,
         account_id,
-        cookie: if status == "success" {
-            cookie_string(&cookies)
+        cookie: if session.status == "success" {
+            cookie_string(&session.cookies)
         } else {
             String::new()
         },
@@ -825,12 +1005,22 @@ pub(crate) async fn mtop_call(
     response_type: &str,
     data: &Value,
 ) -> Result<(Value, String), String> {
+    let parsed_cookie = cookie_parse(cookie);
+    let account_key = parsed_cookie
+        .get("unb")
+        .or_else(|| parsed_cookie.get("munb"))
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "anonymous".to_owned());
+    let account_lock = mtop_lock(&account_key);
+    let _request_guard = account_lock.lock().await;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|error| error.to_string())?;
     let mut current_cookie = cookie.to_owned();
     let data_value = data.to_string();
+    let mut warmed_session = false;
     for _ in 0..3 {
         let timestamp = now_millis().to_string();
         let cookies = cookie_parse(&current_cookie);
@@ -843,7 +1033,8 @@ pub(crate) async fn mtop_call(
             "{:x}",
             md5::compute(format!("{token}&{timestamp}&34839810&{data_value}"))
         );
-        let params = [
+        let is_im_token = api_name == "mtop.taobao.idlemessage.pc.login.token";
+        let mut params = vec![
             ("jsv", "2.7.2".to_owned()),
             ("appKey", "34839810".to_owned()),
             ("t", timestamp),
@@ -856,10 +1047,32 @@ pub(crate) async fn mtop_call(
             ("api", api_name.to_owned()),
             ("sessionOption", "AutoLoginOnly".to_owned()),
         ];
+        // Keep the IM token request aligned with the reference project's
+        // dedicated im_token_api.py request. These risk-context parameters
+        // are required for the web token endpoint and are not sent by ordinary
+        // product/order MTop calls.
+        if is_im_token {
+            params.extend([
+                ("dangerouslySetWindvaneParams", "%5Bobject%20Object%5D".to_owned()),
+                ("smToken", "token".to_owned()),
+                ("queryToken", "sm".to_owned()),
+                ("sm", "sm".to_owned()),
+                ("spm_cnt", "a21ybx.im.0.0".to_owned()),
+                ("spm_pre", "a21ybx.home.sidebar.1.4c053da6vYwnmf".to_owned()),
+                ("log_id", "4c053da6vYwnmf".to_owned()),
+            ]);
+        }
+        if api_name == "mtop.taobao.idle.trade.merchant.sold.get" {
+            // This is the order list request issued by the seller workbench;
+            // its page context is part of the normal request fingerprint.
+            params.push(("spm_cnt", "a21107h.42826273.0.0".to_owned()));
+        }
         let url = format!("https://h5api.m.goofish.com/h5/{api_name}/{version}/");
-        let seller_api = api_name.starts_with("mtop.taobao.idle.merchant.refund.")
-            || api_name == "mtop.idle.alipay.verify.url.query";
-        let response = client
+        let seller_api = api_name.starts_with("mtop.alibaba.idle.seller.")
+            || api_name.starts_with("mtop.taobao.idle.merchant.refund.")
+            || api_name == "mtop.idle.alipay.verify.url.query"
+            || api_name == "mtop.taobao.idle.trade.merchant.sold.get";
+        let mut request = client
             .post(url)
             .query(&params)
             .header(ACCEPT, "application/json")
@@ -870,10 +1083,26 @@ pub(crate) async fn mtop_call(
             .header(COOKIE, &current_cookie)
             .header(ORIGIN, if seller_api { "https://seller.goofish.com" } else { "https://www.goofish.com" })
             .header(REFERER, if seller_api { "https://seller.goofish.com/?site=COMMONPRO" } else { "https://www.goofish.com/" })
+            .header(USER_AGENT, if is_im_token {
+                USER_AGENT_VALUE
+            } else {
+                USER_AGENT_VALUE
+            });
+        if is_im_token {
+            request = request
+                .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("cache-control", "no-cache")
+                .header("pragma", "no-cache")
+                .header("priority", "u=1, i")
+                .header("sec-fetch-dest", "empty")
+                .header("sec-fetch-mode", "cors")
+                .header("sec-fetch-site", "same-site");
+        } else {
             // Seller trade actions require the same site context that the
             // official COMMONPRO workbench sends with its MTop requests.
-            .header("idle_site_biz_code", "COMMONPRO")
-            .header(USER_AGENT, USER_AGENT_VALUE)
+            request = request.header("idle_site_biz_code", "COMMONPRO");
+        }
+        let response = request
             .form(&[("data", data_value.as_str())])
             .send()
             .await
@@ -899,6 +1128,22 @@ pub(crate) async fn mtop_call(
         {
             current_cookie = merged_cookie;
             continue;
+        }
+        if (ret.contains("FAIL_SYS_TOKEN_EMPTY") || ret.contains("TOKEN_EMPTY"))
+            && !warmed_session
+        {
+            // A freshly confirmed QR login can have the user session before
+            // the H5 signing cookie reaches this request path. Warm the same
+            // MTop bootstrap endpoint once, then sign and retry the original
+            // call with the refreshed Cookie.
+            warmed_session = true;
+            let warmed_cookie = warm_mtop_session(&merged_cookie)
+                .await
+                .unwrap_or_else(|_| merged_cookie.clone());
+            if warmed_cookie != current_cookie {
+                current_cookie = warmed_cookie;
+                continue;
+            }
         }
         if ret.contains("SESSION_EXPIRED") || ret.contains("Session过期") {
             return Err("闲鱼登录已过期，请重新扫码登录".to_owned());
@@ -1020,7 +1265,11 @@ pub async fn fetch_orders(cookie: &str) -> Result<(Vec<Value>, String), String> 
             &current_cookie,
             "mtop.taobao.idle.trade.merchant.sold.get",
             "1.0",
-            "json",
+            // The seller workbench sends originaljson for this endpoint. The
+            // generic `json` response type is treated as a different client
+            // context by some accounts and can return a misleading token or
+            // permission failure.
+            "originaljson",
             &data,
         )
         .await?;
@@ -1236,4 +1485,22 @@ pub async fn fetch_refund_detail(cookie: &str, order_no: &str) -> Result<(Value,
         }
     }
     Err("官方未返回该订单的退款详情".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cookie_parse, login_account_id};
+
+    #[test]
+    fn login_account_id_accepts_unb() {
+        assert_eq!(
+            login_account_id(&cookie_parse("munb=mobile-id; unb=web-id")),
+            "web-id"
+        );
+    }
+
+    #[test]
+    fn login_account_id_rejects_display_name_only_session() {
+        assert!(login_account_id(&cookie_parse("munb=mobile-id; tracknick=buyer-name")).is_empty());
+    }
 }

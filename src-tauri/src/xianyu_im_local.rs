@@ -9,7 +9,7 @@ use reqwest::multipart::{Form, Part};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{
@@ -19,23 +19,49 @@ use tokio_tungstenite::tungstenite::{
 };
 use uuid::Uuid;
 
-use crate::xianyu_local::mtop_call;
+use crate::xianyu_local::{mtop_call, USER_AGENT_VALUE};
 
 const WS_URL: &str = "wss://wss-goofish.dingtalk.com/";
 const IM_APP_KEY: &str = "444e9908a51d1cb236a27862abc769c9";
 // Keep one stable browser profile across the MTop and WebSocket requests.
 // Rotating this value makes the same account look like a new device on every
 // reconnect and is counterproductive for normal session compatibility.
-const IM_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-const IM_TOKEN_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+// Keep the browser identity identical to the MTop/verification WebView. A
+// different Chrome version on the WebSocket is enough to make one account
+// look like two devices to the risk-control service.
+const IM_USER_AGENT: &str = USER_AGENT_VALUE;
+const IM_TOKEN_CACHE_MIN_SECS: u64 = 6 * 60 * 60;
+const IM_TOKEN_CACHE_MAX_SECS: u64 = 15 * 60 * 60;
+// Keep the same cadence as the reference project's TokenManager. The short
+// Cookie refresh keeps the MTop session alive; the long token refresh renews
+// the access token even when the WebSocket remains healthy.
+const IM_COOKIE_REFRESH_INTERVAL: Duration = Duration::from_secs(180);
+const IM_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(72_000);
+const IM_WS_PING_INTERVAL: Duration = Duration::from_secs(20);
+const IM_MESSAGE_COOKIE_REFRESH_COOLDOWN: u64 = 300;
+const IM_QR_COOKIE_REFRESH_COOLDOWN: Duration = Duration::from_secs(600);
 
 struct CachedImToken {
     token: String,
+    cookie: String,
     cached_at: Instant,
+    expires_after: Duration,
+}
+
+struct RefreshTaskGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for RefreshTaskGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 static IM_TOKEN_CACHE: OnceLock<Mutex<HashMap<String, CachedImToken>>> = OnceLock::new();
 static IM_RENEWED_COOKIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static IM_QR_REFRESH_BLOCKS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+static IM_TOKEN_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
 
 fn im_token_cache() -> &'static Mutex<HashMap<String, CachedImToken>> {
     IM_TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -43,6 +69,51 @@ fn im_token_cache() -> &'static Mutex<HashMap<String, CachedImToken>> {
 
 fn renewed_cookie_cache() -> &'static Mutex<HashMap<String, String>> {
     IM_RENEWED_COOKIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn qr_refresh_blocks() -> &'static Mutex<HashMap<String, Instant>> {
+    IM_QR_REFRESH_BLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn im_token_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    IM_TOKEN_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn im_token_lock(user_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    if let Ok(mut locks) = im_token_locks().lock() {
+        return locks
+            .entry(user_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+    }
+    Arc::new(tokio::sync::Mutex::new(()))
+}
+
+/// A QR/face login rotates the session in one burst. Match the reference
+/// scheduler by allowing that new Cookie to settle before the periodic
+/// Cookie refresh task runs again.
+pub(crate) fn mark_qr_cookie_refresh(cookie: &str) {
+    let user_id = cookie_value(cookie, &["unb", "munb"]);
+    if user_id.is_empty() {
+        return;
+    }
+    if let Ok(mut blocks) = qr_refresh_blocks().lock() {
+        blocks.insert(user_id, Instant::now() + IM_QR_COOKIE_REFRESH_COOLDOWN);
+    }
+}
+
+fn qr_cookie_refresh_blocked(user_id: &str) -> bool {
+    let Ok(mut blocks) = qr_refresh_blocks().lock() else {
+        return false;
+    };
+    match blocks.get(user_id).copied() {
+        Some(until) if until > Instant::now() => true,
+        Some(_) => {
+            blocks.remove(user_id);
+            false
+        }
+        None => false,
+    }
 }
 
 /// Take the most recent Cookie returned while preparing this IM session.
@@ -271,6 +342,27 @@ fn sync_ack_diff_message(request_mid: &str, state: Value) -> String {
     .to_string()
 }
 
+/// The reference client sends an initial sync cursor immediately after
+/// registration. Without this first ackDiff the socket may be authenticated
+/// while the server never starts the account's message sync stream.
+fn initial_sync_ack_message(request_mid: &str) -> String {
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    serde_json::json!({
+        "lwp": "/r/SyncStatus/ackDiff",
+        "headers": { "mid": request_mid },
+        "body": [{
+            "pipeline": "sync",
+            "tooLong2Tag": "PNM,1",
+            "channel": "sync",
+            "topic": "sync",
+            "highPts": 0,
+            "pts": timestamp.saturating_mul(1000),
+            "seq": 0,
+            "timestamp": timestamp
+        }]
+    }).to_string()
+}
+
 fn needs_sync_recovery(value: &Value) -> bool {
     matches!(
         value.pointer("/body/syncExtraType/type").and_then(Value::as_i64),
@@ -295,24 +387,69 @@ async fn im_token(cookie: &str, device_id: &str) -> Result<(String, String), Str
     if user_id.is_empty() {
         return Err("当前登录会话缺少闲鱼用户标识，请重新扫码登录".to_owned());
     }
+    // QR login, IM startup, background sync and verification confirmation can
+    // all arrive at the same time. The reference client serializes Token
+    // refresh per account; doing the same avoids issuing concurrent MTop
+    // token requests for one browser session.
+    let token_lock = im_token_lock(&user_id);
+    let _token_guard = token_lock.lock().await;
     if let Ok(cache) = im_token_cache().lock() {
         if let Some(entry) = cache.get(&user_id) {
-            if entry.cached_at.elapsed() < IM_TOKEN_CACHE_TTL {
+            if entry.cached_at.elapsed() < entry.expires_after {
+                let cached_cookie = if entry.cookie.trim().is_empty() {
+                    cookie.to_owned()
+                } else {
+                    entry.cookie.clone()
+                };
                 if let Ok(mut cookies) = renewed_cookie_cache().lock() {
-                    cookies.insert(user_id.clone(), cookie.to_owned());
+                    cookies.insert(user_id.clone(), cached_cookie.clone());
                 }
-                return Ok((entry.token.clone(), cookie.to_owned()));
+                return Ok((entry.token.clone(), cached_cookie));
             }
         }
     }
-    let (body, cookie) = mtop_call(
-        cookie,
+    let mut request_cookie = cookie.to_owned();
+    let has_h5_token = request_cookie.split(';').any(|part| {
+        let name = part.trim().split_once('=').map(|(name, _)| name.trim()).unwrap_or_default();
+        name.eq_ignore_ascii_case("_m_h5_tk") || name.eq_ignore_ascii_case("m_h5_tk")
+    });
+    if !has_h5_token {
+        if let Ok(warmed_cookie) = crate::xianyu_local::warm_mtop_session(&request_cookie).await {
+            request_cookie = warmed_cookie;
+        }
+    }
+    let token_result = mtop_call(
+        &request_cookie,
         "mtop.taobao.idlemessage.pc.login.token",
         "1.0",
         "originaljson",
         &serde_json::json!({ "appKey": IM_APP_KEY, "deviceId": device_id }),
     )
-    .await?;
+    .await;
+    let (body, cookie) = match token_result {
+        Ok(result) => result,
+        Err(error) if error.contains("FAIL_SYS_TOKEN_EMPTY") => {
+            // A newly confirmed QR session may still be between the login
+            // response and the H5 token cookie. Refresh that cookie once and
+            // retry the token call; do not enter the reconnect loop for this
+            // recoverable bootstrap race.
+            let warmed_cookie = crate::xianyu_local::warm_mtop_session(&request_cookie)
+                .await
+                .unwrap_or_else(|_| request_cookie.clone());
+            if warmed_cookie == request_cookie {
+                return Err(error);
+            }
+            mtop_call(
+                &warmed_cookie,
+                "mtop.taobao.idlemessage.pc.login.token",
+                "1.0",
+                "originaljson",
+                &serde_json::json!({ "appKey": IM_APP_KEY, "deviceId": device_id }),
+            )
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
     let token = body
         .pointer("/data/accessToken")
         .and_then(Value::as_str)
@@ -323,9 +460,31 @@ async fn im_token(cookie: &str, device_id: &str) -> Result<(String, String), Str
         cookies.insert(user_id.clone(), cookie.clone());
     }
     if let Ok(mut cache) = im_token_cache().lock() {
-        cache.insert(user_id, CachedImToken { token: token.clone(), cached_at: Instant::now() });
+        let expires_after = Duration::from_secs(fastrand::u64(
+            IM_TOKEN_CACHE_MIN_SECS..(IM_TOKEN_CACHE_MAX_SECS + 1),
+        ));
+        cache.insert(
+            user_id,
+            CachedImToken {
+                token: token.clone(),
+                cookie: cookie.clone(),
+                cached_at: Instant::now(),
+                expires_after,
+            },
+        );
     }
     Ok((token, cookie))
+}
+
+/// Force a fresh IM token request after an in-app risk challenge. The cached
+/// token is invalidated by the caller before this is used, and the returned
+/// cookie includes any Set-Cookie values from the platform response.
+pub(crate) async fn request_im_token(cookie: &str) -> Result<(String, String), String> {
+    let user_id = cookie_value(cookie, &["unb", "munb"]);
+    if user_id.is_empty() {
+        return Err("当前登录会话缺少闲鱼用户标识，请重新扫码登录".to_owned());
+    }
+    im_token(cookie, &device_id(&user_id)).await
 }
 
 async fn request_on_account_channel(
@@ -335,9 +494,11 @@ async fn request_on_account_channel(
     body: Value,
 ) -> Result<(Value, String), String> {
     let Some(sender) = sender else {
-        // This fallback is used only before an account's IM singleton has
-        // been started (for example, a first-time sync during setup).
-        return ws_request(cookie, lwp, body).await;
+        // Opening a second WebSocket while the account listener is reconnecting
+        // looks like a second device and is a common source of risk control.
+        // Callers should wait for the account singleton to become available
+        // instead of silently creating a parallel socket here.
+        return Err("闲鱼 IM 单例连接尚未就绪，请稍后重试".to_owned());
     };
     let (reply, response) = oneshot::channel();
     sender
@@ -353,84 +514,6 @@ async fn request_on_account_channel(
         .map_err(|_| "闲鱼 IM 单例请求超时".to_owned())?
         .map_err(|_| "闲鱼 IM 单例连接已断开，正在重连".to_owned())??;
     Ok((response, cookie.to_owned()))
-}
-
-async fn ws_request(cookie: &str, lwp: &str, body: Value) -> Result<(Value, String), String> {
-    let user_id = cookie_value(cookie, &["unb", "munb"]);
-    if user_id.is_empty() {
-        return Err("当前登录会话缺少闲鱼用户标识，请重新扫码登录".to_owned());
-    }
-    let did = device_id(&user_id);
-    let (token, renewed_cookie) = im_token(cookie, &did).await?;
-    let (stream, _) = tokio_tungstenite::connect_async(websocket_request(cookie)?)
-        .await
-        .map_err(|error| format!("闲鱼 IM WebSocket 连接失败：{error}"))?;
-    let (mut write, mut read) = stream.split();
-    let register_mid = mid();
-    write
-        .send(Message::Text(
-            register_message(&token, &did, &register_mid).into(),
-        ))
-        .await
-        .map_err(|error| format!("闲鱼 IM 注册失败：{error}"))?;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(8), async {
-        while let Some(frame) = read.next().await {
-            let frame = frame.map_err(|error| error.to_string())?;
-            let text = match frame {
-                Message::Text(value) => value.to_string(),
-                Message::Binary(value) => String::from_utf8_lossy(&value).to_string(),
-                _ => continue,
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            if let Some(ack) = ack_message(&value) {
-                let _ = write.send(Message::Text(ack.into())).await;
-            }
-            if value.pointer("/headers/mid").and_then(Value::as_str) == Some(register_mid.as_str()) {
-                if value.get("code").and_then(Value::as_i64).is_some_and(|code| code != 200) {
-                    invalidate_im_token(&user_id);
-                    return Err(format!("闲鱼 IM 注册被拒绝：{}", value));
-                }
-                return Ok::<(), String>(());
-            }
-        }
-        Err("闲鱼 IM 注册连接已关闭".to_owned())
-    })
-    .await;
-    let request_mid = mid();
-    write
-        .send(Message::Text(
-            serde_json::json!({ "lwp": lwp, "headers": { "mid": request_mid }, "body": body })
-                .to_string()
-                .into(),
-        ))
-        .await
-        .map_err(|error| format!("闲鱼 IM 请求失败：{error}"))?;
-    let response = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        while let Some(frame) = read.next().await {
-            let frame = frame.map_err(|error| format!("闲鱼 IM 接收失败：{error}"))?;
-            let text = match frame {
-                Message::Text(value) => value.to_string(),
-                Message::Binary(value) => String::from_utf8_lossy(&value).to_string(),
-                Message::Close(_) => return Err("闲鱼 IM 连接已关闭".to_owned()),
-                _ => continue,
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            if let Some(ack) = ack_message(&value) {
-                let _ = write.send(Message::Text(ack.into())).await;
-            }
-            if value.pointer("/headers/mid").and_then(Value::as_str) == Some(request_mid.as_str()) {
-                return Ok(value);
-            }
-        }
-        Err("闲鱼 IM 连接已关闭".to_owned())
-    })
-    .await
-    .map_err(|_| "闲鱼 IM 请求超时".to_owned())??;
-    Ok((response, renewed_cookie))
 }
 
 fn is_im_push(value: &Value) -> bool {
@@ -456,17 +539,19 @@ fn is_im_push(value: &Value) -> bool {
 /// Keep one registered IM WebSocket open until it disconnects. Pushes are
 /// forwarded to the callback; the outer account task reconnects only after a
 /// real socket/token failure instead of reconnecting after every message.
-pub async fn listen_for_push<F, G, H>(
+pub async fn listen_for_push<F, G, H, J>(
     cookie: &str,
     on_connected: F,
     on_push: G,
     on_trace: H,
+    on_cookie_refresh: J,
     requests: &mut mpsc::Receiver<ImRequest>,
 ) -> Result<String, String>
 where
     F: Fn() + Send + Sync + 'static,
     G: Fn(&Value) + Send + Sync + 'static,
     H: Fn(&str) + Send + Sync + 'static,
+    J: Fn(String) + Send + Sync + 'static,
 {
     let user_id = cookie_value(cookie, &["unb", "munb"]);
     if user_id.is_empty() {
@@ -475,15 +560,21 @@ where
     let did = device_id(&user_id);
     on_trace("正在获取 IM 访问令牌");
     let (token, renewed_cookie) = im_token(cookie, &did).await?;
+    let active_token = token;
+    let mut active_cookie = renewed_cookie;
     on_trace("IM 访问令牌已获取，正在建立 WebSocket");
-    let (stream, _) = tokio_tungstenite::connect_async(websocket_request(cookie)?)
-        .await
-        .map_err(|error| format!("闲鱼 IM WebSocket 连接失败：{error}"))?;
+    let (stream, _) = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio_tungstenite::connect_async(websocket_request(&active_cookie)?),
+    )
+    .await
+    .map_err(|_| "闲鱼 IM WebSocket 连接超时".to_owned())?
+    .map_err(|error| format!("闲鱼 IM WebSocket 连接失败：{error}"))?;
     let (mut write, mut read) = stream.split();
     let register_mid = mid();
     on_trace("WebSocket 已建立，正在发送 IM 注册请求");
     write
-        .send(Message::Text(register_message(&token, &did, &register_mid).into()))
+        .send(Message::Text(register_message(&active_token, &did, &register_mid).into()))
         .await
         .map_err(|error| format!("闲鱼 IM 注册失败：{error}"))?;
     let registered = tokio::time::timeout(std::time::Duration::from_secs(12), async {
@@ -511,6 +602,14 @@ where
     .await
     .map_err(|_| "闲鱼 IM 注册超时".to_owned())??;
     let _ = registered;
+    // Match the reference XianyuAsync.init(): seed the sync cursor right
+    // after registration so the server starts delivering realtime updates.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let sync_mid = mid();
+    write
+        .send(Message::Text(initial_sync_ack_message(&sync_mid).into()))
+        .await
+        .map_err(|error| format!("闲鱼 IM 初始同步确认失败：{error}"))?;
     on_trace("IM 注册成功，开始接收实时推送");
     on_connected();
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -518,6 +617,74 @@ where
     // so the first heartbeat follows the official 15-second cadence instead
     // of being sent immediately after registration/ackDiff.
     heartbeat.tick().await;
+    let mut ws_ping = tokio::time::interval(IM_WS_PING_INTERVAL);
+    ws_ping.tick().await;
+    let (refresh_tx, mut refresh_rx) = mpsc::channel::<Result<(String, String), String>>(4);
+    let refresh_cookie = active_cookie.clone();
+    let refresh_did = did.clone();
+    let refresh_user_id = user_id.clone();
+    let last_push_at = Arc::new(AtomicU64::new(0));
+    let refresh_last_push_at = Arc::clone(&last_push_at);
+    let refresh_task = tokio::spawn(async move {
+        let mut refresh_cookie = refresh_cookie;
+        let mut cookie_refresh = tokio::time::interval(IM_COOKIE_REFRESH_INTERVAL);
+        let mut token_refresh = tokio::time::interval(IM_TOKEN_REFRESH_INTERVAL);
+        // Consume the immediate first tick. The reference service starts both
+        // loops after the connection is established, rather than issuing a
+        // second token request immediately after registration.
+        cookie_refresh.tick().await;
+        token_refresh.tick().await;
+        loop {
+            let refresh_token = tokio::select! {
+                _ = cookie_refresh.tick() => {
+                    if qr_cookie_refresh_blocked(&refresh_user_id) {
+                        continue;
+                    }
+                    false
+                },
+                _ = token_refresh.tick() => true,
+            };
+            // The reference client pauses its background cookie/token work for
+            // five minutes after a message. This avoids changing the session
+            // while the server is delivering a burst of IM events.
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            let last_push = refresh_last_push_at.load(Ordering::Relaxed);
+            if last_push > 0 && now.saturating_sub(last_push) < IM_MESSAGE_COOKIE_REFRESH_COOLDOWN {
+                continue;
+            }
+            // A cookie cadence tick is only a scheduler wake-up.  The token
+            // cache intentionally remains valid for 6–15 hours; invalidating
+            // it every three minutes would turn a healthy connection into a
+            // constant token request stream and quickly trigger risk control.
+            if refresh_token {
+                invalidate_im_token_for_cookie(&refresh_cookie);
+            }
+            match im_token(&refresh_cookie, &refresh_did).await {
+                Ok((next_token, next_cookie)) => {
+                    refresh_cookie = next_cookie.clone();
+                    if refresh_tx.send(Ok((next_token, next_cookie))).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let fatal = crate::xianyu_local::im_validation_url(&error).is_some()
+                        || error.contains("SESSION_EXPIRED")
+                        || error.contains("登录已过期");
+                    if fatal {
+                        let _ = refresh_tx.send(Err(error)).await;
+                        break;
+                    }
+                    // Match the reference TokenManager: transient refresh
+                    // errors are retried on the next scheduled cycle and do
+                    // not tear down a healthy WebSocket.
+                }
+            }
+        }
+    });
+    // The refresh loop belongs to this WebSocket instance.  Aborting the
+    // listener must also abort its timer task, otherwise fast reconnects
+    // accumulate independent token refreshers for the same account.
+    let _refresh_task_guard = RefreshTaskGuard(Some(refresh_task));
     let mut heartbeat_request: Option<(String, std::time::Instant)> = None;
     let mut sync_state_request: Option<String> = None;
     let mut sync_ack_request: Option<String> = None;
@@ -557,6 +724,29 @@ where
                     .map_err(|error| format!("闲鱼 IM 心跳失败：{error}"))?;
                 heartbeat_request = Some((request_mid, std::time::Instant::now()));
             }
+            _ = ws_ping.tick() => {
+                write
+                    .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .map_err(|error| format!("闲鱼 IM 底层 Ping 失败：{error}"))?;
+            }
+            Some(result) = refresh_rx.recv() => {
+                match result {
+                    Ok((next_token, next_cookie)) => {
+                        on_cookie_refresh(next_cookie.clone());
+                        active_cookie = next_cookie;
+                        if next_token != active_token {
+                            on_trace("IM 令牌已更新，准备重连 WebSocket");
+                            return Ok(active_cookie);
+                        }
+                        on_trace("IM 会话刷新完成，继续保持当前连接");
+                    }
+                    Err(error) => {
+                        on_trace("IM 会话刷新要求重新登录或验证");
+                        return Err(error);
+                    }
+                }
+            }
             Some(frame) = read.next() => {
                 let frame = frame.map_err(|error| format!("闲鱼 IM 接收失败：{error}"))?;
                 let text = match frame {
@@ -570,7 +760,7 @@ where
                         continue;
                     }
                     Message::Pong(_) => continue,
-                    Message::Close(_) => return Ok(renewed_cookie),
+                    Message::Close(_) => return Ok(active_cookie),
                     _ => continue,
                 };
                 let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
@@ -639,6 +829,10 @@ where
                     ));
                     #[cfg(debug_assertions)]
                     eprintln!("[im] push lwp={push_lwp}");
+                    last_push_at.store(
+                        chrono::Utc::now().timestamp().max(0) as u64,
+                        Ordering::Relaxed,
+                    );
                     on_push(&value);
                     // `/s/sync` and `/s/vulcan` are unsolicited server pushes. The
                     // official client feeds them into its LWP request state machine
@@ -649,7 +843,7 @@ where
                     // conversation sync instead, which also persists the message.
                 }
             }
-            else => return Ok(renewed_cookie),
+            else => return Ok(active_cookie),
         }
     }
 }
@@ -2237,7 +2431,7 @@ pub async fn send_image(
         .header("Referer", "https://www.goofish.com/")
         .header(
             "User-Agent",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+            IM_USER_AGENT,
         )
         .header("Cookie", cookie)
         .multipart(Form::new().part("file", part))

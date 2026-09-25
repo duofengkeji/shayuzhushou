@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { listen } from '@tauri-apps/api/event'
 import { isTauri } from '@tauri-apps/api/core'
@@ -20,7 +20,10 @@ type Dialog =
   | { kind: 'order'; value?: Order }
   | { kind: 'conversation-name'; value: Account }
   | { kind: 'delete-account'; value: Account }
-  | { kind: 'qr' }
+  | { kind: 'qr'; value?: Account }
+  | { kind: 'service-create'; value: Account }
+  | { kind: 'service-login'; value: Account }
+  | { kind: 'service-sms'; value: Account }
   | { kind: 'im-verification'; value: Account }
   | null
 
@@ -266,7 +269,9 @@ function ImStatusBadge({ value }: { value?: string }) {
     connecting: ['连接中', 'connecting'],
     disconnected: ['已断开', 'disconnected'],
     verification_required: ['需要验证', 'error'],
+    risk_cooldown: ['风控冷却', 'error'],
     not_logged_in: ['未登录', 'not-logged-in'],
+    main_im_disabled: ['未登录', 'not-logged-in'],
     stopped: ['未启动', 'stopped'],
     error: ['连接异常', 'error'],
   }
@@ -288,8 +293,10 @@ function MainApp() {
   const [members, setMembers] = useState<Member[]>([])
   const [stats, setStats] = useState<DashboardStats | null>(null)
   const [accountId, setAccountId] = useState('')
+  const [serviceAccountId, setServiceAccountId] = useState('')
   const [loading, setLoading] = useState(true)
   const [notice, setNotice] = useState('')
+  const [imVerificationNotice, setImVerificationNotice] = useState('')
   const [dialog, setDialog] = useState<Dialog>(null)
   const [accountMenuOpen, setAccountMenuOpen] = useState(false)
   const [messageCenterOpen, setMessageCenterOpen] = useState(false)
@@ -304,12 +311,20 @@ function MainApp() {
   const globalMessageSnapshotRef = useRef(new Map<string, { unreadCount: number; latestMessageTime: string }>())
   const globalPollInFlightRef = useRef(false)
   const globalPollPendingRef = useRef(false)
+  const verifyingAccountsRef = useRef(new Set<string>())
+  const checkingVerificationAccountsRef = useRef(new Set<string>())
+  const promptedVerificationAccountsRef = useRef(new Set<string>())
+  const deferredImRemoteIdsRef = useRef(new Set<string>())
+  const autoLoginAttemptedRef = useRef(new Set<string>())
+  const serviceListSyncAttemptedRef = useRef(new Set<string>())
   const pageRef = useRef(page)
   const [conversationTabIds, setConversationTabIds] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem('shark-butler-conversation-tabs') || '[]') as string[] } catch { return [] }
   })
 
   const activeAccount = accounts.find((item) => item.id === accountId)
+  const activeServiceAccount = accounts.find((item) => item.id === serviceAccountId && item.remoteAccountId)
+  const mainAccounts = accounts.filter((item) => !item.parentAccountId)
 
   const refresh = async () => {
     setLoading(true)
@@ -321,11 +336,14 @@ function MainApp() {
       setUnreadTotals(nextUnreadTotals)
       setImStatuses(nextImStatuses)
       setConversationTabIds((currentTabs) => {
-        const validTabs = currentTabs.filter((id, index) => nextAccounts.some((account) => account.id === id) && currentTabs.indexOf(id) === index)
-        const nextTabs = validTabs.length ? validTabs : nextAccounts[0] ? [nextAccounts[0].id] : []
-        setAccountId((current) => nextTabs.includes(current) ? current : nextTabs[0] || '')
+        const validTabs = currentTabs.filter((id, index) => nextAccounts.some((account) => account.id === id && account.remoteAccountId) && currentTabs.indexOf(id) === index)
+        const firstServiceId = nextAccounts.find((item) => item.parentAccountId && item.remoteAccountId)?.id
+          ?? nextAccounts.find((item) => !item.parentAccountId && item.remoteAccountId)?.id
+        const nextTabs = validTabs.length ? validTabs : firstServiceId ? [firstServiceId] : []
+        setServiceAccountId((current) => nextTabs.includes(current) ? current : nextTabs[0] || '')
         return nextTabs
       })
+      setAccountId((current) => nextAccounts.some((item) => item.id === current && !item.parentAccountId) ? current : nextAccounts.find((item) => !item.parentAccountId)?.id || '')
     } catch {
       setNotice('无法读取本地数据，请检查应用数据目录。')
     } finally { setLoading(false) }
@@ -360,6 +378,81 @@ function MainApp() {
   }, [])
 
   useEffect(() => {
+    const pendingIds = new Set(accounts.filter((account) => imStatuses[account.id] === 'verification_required').map((account) => account.id))
+    for (const id of promptedVerificationAccountsRef.current) {
+      if (!pendingIds.has(id)) promptedVerificationAccountsRef.current.delete(id)
+    }
+    if (dialog) return
+    const account = accounts.find((item) => pendingIds.has(item.id) && !promptedVerificationAccountsRef.current.has(item.id))
+    if (account) {
+      promptedVerificationAccountsRef.current.add(account.id)
+      setImVerificationNotice('')
+      setDialog({ kind: 'im-verification', value: account })
+    }
+  }, [accounts, imStatuses, dialog])
+
+  useEffect(() => {
+    const pendingAccounts = accounts.filter((account) => imStatuses[account.id] === 'verification_required')
+    if (!pendingAccounts.length) return
+    let active = true
+    const pollVerificationProgress = async () => {
+      for (const account of pendingAccounts) {
+        if (!active
+          || checkingVerificationAccountsRef.current.has(account.id)
+          || verifyingAccountsRef.current.has(account.id)) continue
+        checkingVerificationAccountsRef.current.add(account.id)
+        try {
+          const progress = await api.imVerificationProgress(account.id)
+          if (!active || !progress.windowOpen || !progress.ready
+            || verifyingAccountsRef.current.has(account.id)) continue
+          verifyingAccountsRef.current.add(account.id)
+          setImVerificationNotice('')
+          setNotice('检测到滑块验证已通过，正在确认 IM 会话并重连…')
+          void api.completeImVerification(account.id)
+            .then(async (result) => {
+              setDialog((current) => current?.kind === 'im-verification' && current.value.id === account.id ? null : current)
+              if (result === 'service_login_ready') {
+                setNotice(`${account.displayName} 的滑块已通过，正在继续登录客服。`)
+                const login = await api.loginServiceAccount(account.id)
+                if (login.status === 'success') {
+                  autoLoginAttemptedRef.current.add(account.id)
+                  await refresh()
+                  await api.startChatListener(account.id)
+                  setNotice(`${account.displayName} 已登录，IM 正在连接。`)
+                } else if (login.status === 'sms_required') {
+                  setDialog({ kind: 'service-sms', value: account })
+                  setNotice(`${account.displayName} 还需要短信验证码。`)
+                } else if (login.status === 'verification_required') {
+                  setNotice(login.message)
+                  if ((await api.imVerificationState(account.id)).required) {
+                    setDialog({ kind: 'im-verification', value: account })
+                  }
+                } else {
+                  setNotice(login.message)
+                }
+              } else {
+                setNotice('滑块验证已确认，IM 正在重新连接。')
+              }
+            })
+            .catch((error) => {
+              const message = error instanceof Error ? error.message : String(error)
+              setImVerificationNotice(message)
+              setNotice('自动确认未通过：' + message + '。请在验证弹窗继续操作；新的验证结果会再次自动确认。')
+            })
+            .finally(() => verifyingAccountsRef.current.delete(account.id))
+        } catch {
+          // The validation window may be closed or still initializing.
+        } finally {
+          checkingVerificationAccountsRef.current.delete(account.id)
+        }
+      }
+    }
+    const timer = window.setInterval(() => { void pollVerificationProgress() }, 800)
+    void pollVerificationProgress()
+    return () => { active = false; window.clearInterval(timer) }
+  }, [accounts, imStatuses])
+
+  useEffect(() => {
     if (!accounts.length) return
     let cancelled = false
     let initialized = false
@@ -374,7 +467,7 @@ function MainApp() {
         let hasNewMessage = false
         let notificationAccountId = ''
         const nextSnapshot = new Map<string, { unreadCount: number; latestMessageTime: string }>()
-        for (const account of accounts) {
+        for (const account of accounts.filter((item) => item.parentAccountId)) {
           try {
             const contacts = await api.chatContacts(account.id)
             for (const contact of contacts) {
@@ -418,17 +511,62 @@ function MainApp() {
       })
       if (cancelled) stop()
       else unlisten = stop
-      await Promise.all(accounts.map((account) => api.startChatListener(account.id).catch(() => undefined)))
+      const listenerAccounts = accounts.filter((account) =>
+        account.parentAccountId && account.remoteAccountId && account.status !== '已停用' && !deferredImRemoteIdsRef.current.has(account.remoteAccountId),
+      )
+      await Promise.all(listenerAccounts.map((account) => api.startChatListener(account.id).catch(() => undefined)))
     })()
     return () => {
       cancelled = true
       unlisten?.()
-      void Promise.all(accounts.map((account) => api.stopChatListener(account.id).catch(() => undefined)))
+      void Promise.all(accounts.filter((account) => account.parentAccountId).map((account) => api.stopChatListener(account.id).catch(() => undefined)))
     }
   // IM listeners belong to the application/account lifecycle, not the
   // currently visible page.  Including `page` here would disconnect every
   // account whenever the user opened 商品、订单 or 设置.
   }, [accounts.map((account) => `${account.id}:${account.status}:${account.remoteAccountId}`).join(',')])
+
+  useEffect(() => {
+    const candidates = accounts.filter((account) => account.parentAccountId && account.status !== '已停用'
+      && (!account.remoteAccountId || imStatuses[account.id] === 'not_logged_in')
+      && !autoLoginAttemptedRef.current.has(account.id))
+    for (const account of candidates) {
+      autoLoginAttemptedRef.current.add(account.id)
+      void api.loginServiceAccount(account.id).then(async (result) => {
+        if (result.status === 'success') {
+          await refresh()
+          await api.startChatListener(account.id)
+        } else if (result.status === 'sms_required') {
+          setDialog({ kind: 'service-sms', value: account })
+          setNotice(`${account.displayName} 需要短信验证码，请在弹窗中完成。`)
+        } else if (result.status === 'verification_required') {
+          setNotice(`${account.displayName} 自动登录需要人工核验：${result.message}`)
+        }
+      }).catch((error) => {
+        if (String(error).includes('请先输入客服账号密码')) {
+          setNotice(`${account.displayName} 已从平台导入；请在客服管理中输入一次密码，之后可自动登录。`)
+        }
+      })
+    }
+  }, [accounts, imStatuses])
+
+  useEffect(() => {
+    for (const parent of accounts.filter((account) => !account.parentAccountId && account.remoteAccountId && account.status !== '已停用')) {
+      if (serviceListSyncAttemptedRef.current.has(parent.id)) continue
+      serviceListSyncAttemptedRef.current.add(parent.id)
+      void api.syncServiceAccounts(parent.id)
+        .then(async () => {
+          const next = await api.accounts()
+          setAccounts(next)
+          const first = next.find((item) => item.parentAccountId)?.id
+          if (first) {
+            setConversationTabIds((current) => current.length ? current : [first])
+            setServiceAccountId((current) => current || first)
+          }
+        })
+        .catch((error) => setNotice(`${parent.displayName} 的客服列表暂未同步：${String(error)}`))
+    }
+  }, [accounts])
 
   useEffect(() => {
     if (!accountMenuOpen) return
@@ -480,7 +618,10 @@ function MainApp() {
     }))
     setGlobalMessages((current) => current.filter((item) => !(item.account.id === readAccountId && item.contact.chatId === readChatId)))
   }
-  const handleError = (error: unknown) => setNotice(error instanceof Error ? error.message : String(error))
+  const handleError = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    setNotice(message.includes('__XY_IM_VALIDATION_URL__:') ? '闲鱼需要完成风控验证，应用会打开验证弹窗。' : message)
+  }
   const refreshUnreadTotals = async () => {
     try { setUnreadTotals(await api.chatUnreadTotals()) } catch (error) { handleError(error) }
   }
@@ -519,7 +660,7 @@ function MainApp() {
 
   const syncAccount = async (account = activeAccount) => {
     if (!account) return
-    try { const result = await api.syncAccount(account.id); setNotice(result.sourceConnected ? `${account.displayName} 本机同步完成：商品 ${result.productsChanged} 条，订单 ${result.ordersChanged} 条。` : `${account.displayName} 尚未完成本机扫码登录。`); await refresh() } catch (error) { handleError(error); await refresh() }
+    try { const result = await api.syncAccount(account.id); setNotice(result.sourceConnected ? `${account.displayName} 本机同步完成：商品 ${result.productsChanged} 条，订单 ${result.ordersChanged} 条。${result.profileWarning ? '账号头像、昵称或会员名暂未刷新，详情见“账号资料”日志。' : ''}` : `${account.displayName} 尚未完成本机扫码登录。`); await refresh() } catch (error) { handleError(error); await refresh() }
   }
   const setAccountsStatus = async (ids: string[], status: AccountInput['status']) => {
     try { await Promise.all(ids.map((id) => { const account = accounts.find((item) => item.id === id); return account ? api.updateAccount(id, { displayName: account.displayName, alias: account.alias, platform: account.platform, status, sourceUrl: account.sourceUrl, remoteAccountId: account.remoteAccountId }) : Promise.resolve() })); await refresh(); setNotice(`已更新 ${ids.length} 个账号的状态。`) } catch (error) { handleError(error) }
@@ -534,7 +675,10 @@ function MainApp() {
   const exportBackup = async () => {
     try { const data = await api.exportBackup(); downloadFile(`鲨鱼管家备份-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data, null, 2), 'application/json'); setNotice('本地数据备份已导出。') } catch (error) { handleError(error) }
   }
-  const finishQrLogin = async (remoteAccountId: string) => {
+  const finishQrLogin = async (remoteAccountId: string, expectedRemoteAccountId?: string, profileWarning = false) => {
+    if (expectedRemoteAccountId && remoteAccountId !== expectedRemoteAccountId) {
+      throw new Error('扫码账号与当前需要核验的账号不一致，请使用对应账号重新扫码。')
+    }
     setDialog(null)
     await refresh()
     try {
@@ -543,13 +687,28 @@ function MainApp() {
       // after an authentication failure.
       const account = (await api.accounts()).find((item) => item.remoteAccountId === remoteAccountId)
       if (account) {
-        await api.stopChatListener(account.id)
-        await api.startChatListener(account.id)
+        serviceListSyncAttemptedRef.current.delete(account.id)
+        // 商品和订单接口只依赖本机登录 Cookie，不依赖 IM WebSocket。
+        // 登录成功后在后台同步，二维码流程和账号资料展示不被网络耗时阻塞。
+        void api.syncAccount(account.id)
+          .then(async (result) => {
+            await refresh()
+            setNotice(`扫码登录成功，已在后台同步商品 ${result.productsChanged} 条、订单 ${result.ordersChanged} 条。`)
+          })
+          .catch((error) => {
+            handleError(error)
+            void refresh()
+          })
       }
-      setNotice('扫码登录成功，本机会话已保存，IM 正在重新连接。')
+      setNotice(`扫码登录成功，主账号 IM 默认不连接；如需使用主账号会话，可在账号卡片点击“登录 IM”。${profileWarning ? '账号头像、昵称或会员名暂未刷新，详情见“账号资料”日志。' : ''}`)
     } catch (error) {
       handleError(error)
     }
+  }
+  const openImVerification = (account: Account) => {
+    promptedVerificationAccountsRef.current.add(account.id)
+    setImVerificationNotice('')
+    setDialog({ kind: 'im-verification', value: account })
   }
   const openTrade = (section: TradeSection = 'orders') => {
     setTradeSection(section)
@@ -557,26 +716,48 @@ function MainApp() {
   }
   const openConversationTab = (id: string) => {
     setConversationTabIds((current) => current.includes(id) ? current : [...current, id])
-    setAccountId(id)
+    setServiceAccountId(id)
     setAccountMenuOpen(false)
   }
+  const loginMainIm = async (account: Account) => {
+    const currentStatus = imStatuses[account.id]
+    if (currentStatus === 'verification_required') {
+      openImVerification(account)
+      return
+    }
+    try {
+      await api.startChatListener(account.id)
+      setNotice(`${account.displayName} 的 IM 正在连接；如果闲鱼要求验证，会自动打开验证弹窗。`)
+      setConversationTabIds((current) => current.includes(account.id) ? current : [...current, account.id])
+      setServiceAccountId(account.id)
+    } catch (error) { handleError(error) }
+  }
   const jumpToUnreadConversation = (id: string) => {
-    setAccountId(id)
+    setServiceAccountId(id)
     setUnreadJumpRequest((current) => ({ accountId: id, chatId: '', nonce: current.nonce + 1 }))
   }
   const openGlobalMessage = (item: { account: Account; contact: ChatContact }) => {
     setMessageCenterOpen(false)
     setGlobalMessages((current) => current.filter((entry) => !(entry.account.id === item.account.id && entry.contact.chatId === item.contact.chatId)))
     setConversationTabIds((current) => current.includes(item.account.id) ? current : [...current, item.account.id])
-    setAccountId(item.account.id)
+    setServiceAccountId(item.account.id)
     setUnreadJumpRequest((current) => ({ accountId: item.account.id, chatId: item.contact.chatId, nonce: current.nonce + 1 }))
+    setPage('workbench')
+  }
+  const openMemberConversation = (memberAccountId: string, chatId: string) => {
+    if (!memberAccountId) return
+    const serviceId = accounts.find((item) => item.parentAccountId === memberAccountId && item.remoteAccountId)?.id
+    if (!serviceId) { setNotice('该店铺尚无已登录的客服子账号，请先到账号管理登录客服。'); return }
+    setConversationTabIds((current) => current.includes(serviceId) ? current : [...current, serviceId])
+    setServiceAccountId(serviceId)
+    setUnreadJumpRequest((current) => ({ accountId: serviceId, chatId: chatId.replace(/@goofish$/, ''), nonce: current.nonce + 1 }))
     setPage('workbench')
   }
   const closeConversationTab = (id: string) => {
     setConversationTabIds((current) => {
       const index = current.indexOf(id)
       const next = current.filter((item) => item !== id)
-      if (accountId === id) setAccountId(next[Math.min(index, next.length - 1)] || '')
+      if (serviceAccountId === id) setServiceAccountId(next[Math.min(index, next.length - 1)] || '')
       return next
     })
   }
@@ -605,11 +786,11 @@ function MainApp() {
       <section className="app-column">
         <header className={`topbar ${page === 'settings' ? 'settings-topbar' : ''}`}>
           {page === 'workbench' && <div className="conversation-tabs" aria-label="会话标签">
-            <div className="conversation-tab-strip">{conversationTabIds.map((id) => accounts.find((account) => account.id === id)).filter((account): account is Account => Boolean(account)).map((account) => <div className={`conversation-tab ${account.id === activeAccount?.id ? 'active' : ''}`} key={account.id}><button className="conversation-tab-main" onClick={() => setAccountId(account.id)} onDoubleClick={() => jumpToUnreadConversation(account.id)} title="双击跳转到下一条未读会话"><AccountAvatar account={account} className="conversation-tab-avatar" />{(unreadTotals[account.id] ?? 0) > 0 && <em className="conversation-tab-unread" aria-label={`${unreadTotals[account.id]} 条未读消息`}>{unreadTotals[account.id] > 99 ? '99+' : unreadTotals[account.id]}</em>}<span><strong>{account.conversationName || account.displayName}</strong><small>{account.remoteAccountId || account.displayName} · {account.status}</small></span></button><button className="conversation-tab-action edit" onClick={() => setDialog({ kind: 'conversation-name', value: account })} title="自定义会话名称"><Pencil size={12} /></button><button className="conversation-tab-action close" onClick={() => closeConversationTab(account.id)} title="关闭会话标签"><X size={13} /></button></div>)}</div>
-            <div className="account-menu-anchor"><button ref={accountMenuButtonRef} className={`round-button ${accountMenuOpen ? 'active' : ''}`} onClick={() => setAccountMenuOpen((open) => !open)} title="添加会话标签" aria-expanded={accountMenuOpen}><Plus size={20} /></button>{accountMenuOpen && createPortal(<div className="account-menu account-menu-portal" style={accountMenuPosition}><header><strong>选择会话账号</strong><span>{accounts.length} 个账号</span></header>{accounts.length ? accounts.map((account) => <button className={conversationTabIds.includes(account.id) ? 'selected' : ''} key={account.id} onClick={() => openConversationTab(account.id)}><AccountAvatar account={account} /><span><strong>{account.conversationName || account.displayName}</strong><small>{account.displayName} · {account.status}</small></span>{conversationTabIds.includes(account.id) && <CheckCircle2 size={17} />}</button>) : <p>暂无账号，请先到账号管理扫码登录。</p>}</div>, document.body)}</div>
+            <div className="conversation-tab-strip">{conversationTabIds.map((id) => accounts.find((account) => account.id === id)).filter((account): account is Account => Boolean(account)).map((account) => <div className={`conversation-tab ${account.id === activeServiceAccount?.id ? 'active' : ''}`} key={account.id}><button className="conversation-tab-main" onClick={() => setServiceAccountId(account.id)} onDoubleClick={() => jumpToUnreadConversation(account.id)} title="双击跳转到下一条未读会话"><AccountAvatar account={account} className="conversation-tab-avatar" />{(unreadTotals[account.id] ?? 0) > 0 && <em className="conversation-tab-unread" aria-label={`${unreadTotals[account.id]} 条未读消息`}>{unreadTotals[account.id] > 99 ? '99+' : unreadTotals[account.id]}</em>}<span><strong>{account.conversationName || account.displayName}</strong><small>{account.remoteAccountId || account.displayName} · {account.status}</small></span></button><button className="conversation-tab-action edit" onClick={() => setDialog({ kind: 'conversation-name', value: account })} title="自定义会话名称"><Pencil size={12} /></button><button className="conversation-tab-action close" onClick={() => closeConversationTab(account.id)} title="关闭会话标签"><X size={13} /></button></div>)}</div>
+            <div className="account-menu-anchor"><button ref={accountMenuButtonRef} className={`round-button ${accountMenuOpen ? 'active' : ''}`} onClick={() => setAccountMenuOpen((open) => !open)} title="添加会话标签" aria-expanded={accountMenuOpen}><Plus size={20} /></button>{accountMenuOpen && createPortal(<div className="account-menu account-menu-portal" style={accountMenuPosition}><header><strong>选择会话账号</strong><span>{accounts.filter((account) => account.remoteAccountId && account.status !== '已停用').length} 个账号</span></header>{accounts.some((account) => account.remoteAccountId && account.status !== '已停用') ? accounts.filter((account) => account.remoteAccountId && account.status !== '已停用').map((account) => <button className={conversationTabIds.includes(account.id) ? 'selected' : ''} key={account.id} onClick={() => openConversationTab(account.id)}><AccountAvatar account={account} /><span><strong>{account.conversationName || account.displayName}</strong><small>{account.parentAccountId ? '客服' : '主账号'} · {account.status}</small></span>{conversationTabIds.includes(account.id) && <CheckCircle2 size={17} />}</button>) : <p>暂无已登录的 IM 账号，请先到账号管理登录主账号或客服。</p>}</div>, document.body)}</div>
           </div>}
           {(page === 'trade' || page === 'members') && <div className="trade-topbar-title">{page === 'trade' ? <ShoppingBag size={18} /> : <ContactRound size={18} />}<strong>{page === 'trade' ? '交易' : 'CRM'}</strong><span>{page === 'trade' ? '订单与售后管理' : '客户关系管理'}</span></div>}
-          {(page === 'trade' || page === 'members') && <label className="trade-account-switcher"><Store size={15} /><span>当前账号</span><select value={accountId} onChange={(event) => setAccountId(event.target.value)} aria-label="选择当前账号"><option value="">全部账号</option>{accounts.filter((account) => Boolean(account.remoteAccountId)).map((account) => <option value={account.id} key={account.id}>{account.displayName}</option>)}</select><ChevronDown size={14} /></label>}
+          {(page === 'trade' || page === 'members') && <label className="trade-account-switcher"><Store size={15} /><span>当前账号</span><select value={accountId} onChange={(event) => setAccountId(event.target.value)} aria-label="选择当前账号"><option value="">全部账号</option>{accounts.filter((account) => Boolean(account.remoteAccountId) && !account.parentAccountId).map((account) => <option value={account.id} key={account.id}>{account.displayName}</option>)}</select><ChevronDown size={14} /></label>}
           <div className="top-actions">
             <div className="message-center-anchor">
               <button className={`message-center-button ${messageCenterOpen ? 'active' : ''}`} onClick={() => setMessageCenterOpen((open) => !open)} aria-label={`未读消息 ${globalUnreadCount} 条`} aria-expanded={messageCenterOpen}>
@@ -630,23 +811,59 @@ function MainApp() {
 
         <div className={`content ${page === 'workbench' ? 'workbench-content' : ''} ${page === 'settings' ? 'settings-content' : ''} ${page === 'members' ? 'members-content' : ''}`}>
           {page === 'members' && <aside className="trade-sidebar crm-secondary-menu"><nav><button className="active" onClick={() => setPage('members')}><ContactRound size={16} /><span><strong>会员列表</strong><small>查看和管理会员信息</small></span><ChevronDown size={15} /></button></nav></aside>}
-          {loading ? <Loading /> : page === 'dashboard' ? <Dashboard stats={stats} accounts={accounts} orders={orders} onGo={(target) => target === 'orders' ? openTrade() : setPage(target)} />
-            : page === 'workbench' ? <Workbench key={activeAccount?.id ?? 'empty'} account={activeAccount} products={products} orders={orders} onOrderUpdated={() => void refreshWorkbenchOrders()} onNotice={setNotice} imConnected={Boolean(activeAccount?.remoteAccountId)} quickReplyAutoSuggest={quickReplyAutoSuggest} onUnreadChanged={refreshUnreadTotals} onChatRead={handleChatRead} unreadJumpRequest={unreadJumpRequest} />
-              : page === 'accounts' ? <Accounts accounts={accounts} imStatuses={imStatuses} onQrLogin={() => setDialog({ kind: 'qr' })} onVerify={(value) => setDialog({ kind: 'im-verification', value })} onEdit={(value) => setDialog({ kind: 'account', value })} onDelete={(value) => setDialog({ kind: 'delete-account', value })} onSync={(account) => void syncAccount(account)} onSetStatus={(ids, status) => void setAccountsStatus(ids, status)} />
+          {loading ? <Loading /> : page === 'dashboard' ? <Dashboard stats={stats} accounts={mainAccounts} orders={orders} onGo={(target) => target === 'orders' ? openTrade() : setPage(target)} />
+            : page === 'workbench' ? <Workbench key={activeServiceAccount?.id ?? 'empty'} account={activeServiceAccount} products={products} orders={orders} onOrderUpdated={() => void refreshWorkbenchOrders()} onNotice={setNotice} imConnected={Boolean(activeServiceAccount?.remoteAccountId)} quickReplyAutoSuggest={quickReplyAutoSuggest} onUnreadChanged={refreshUnreadTotals} onChatRead={handleChatRead} unreadJumpRequest={unreadJumpRequest} />
+                : page === 'accounts' ? <Accounts accounts={accounts} imStatuses={imStatuses} onQrLogin={() => setDialog({ kind: 'qr' })} onVerify={openImVerification} onLoginIm={loginMainIm} onEdit={(value) => setDialog({ kind: 'account', value })} onDelete={(value) => setDialog({ kind: 'delete-account', value })} onSetStatus={(ids, status) => void setAccountsStatus(ids, status)} onAddService={(value) => setDialog({ kind: 'service-create', value })} onLoginService={(value) => setDialog({ kind: 'service-login', value })} onOpenService={(value) => { openConversationTab(value.id); setPage('workbench') }} onSyncServices={(value) => { void api.syncServiceAccounts(value.id).then(async () => { const next = await api.accounts(); setAccounts(next); const first = next.find((item) => item.parentAccountId)?.id; if (first) { setConversationTabIds((current) => current.length ? current : [first]); setServiceAccountId((current) => current || first) } setNotice(`${value.displayName} 的客服列表已刷新。`) }).catch(handleError) }} />
                 : page === 'products' ? <Products items={filteredProducts} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, action) => void bulkProducts(ids, action)} onAdd={() => setDialog({ kind: 'product' })} onEdit={(value) => setDialog({ kind: 'product', value })} onDelete={(id) => void remove('product', id)} />
-                  : page === 'trade' ? <TradeWorkspace section={tradeSection} onSectionChange={setTradeSection} accounts={accounts} account={activeAccount} onAccountChange={setAccountId} items={filteredOrders} products={filteredProducts} onSync={() => void syncAccount()} onBulk={(ids, status) => void bulkOrders(ids, status)} onAdd={() => setDialog({ kind: 'order' })} onDetail={setTradeDetailOrder} onEdit={(value) => setDialog({ kind: 'order', value })} onDelete={(id) => void remove('order', id)} />
+                  : page === 'trade' ? <TradeWorkspace section={tradeSection} onSectionChange={setTradeSection} accounts={mainAccounts} account={activeAccount} onAccountChange={setAccountId} items={filteredOrders} products={filteredProducts} onSync={() => void syncAccount()} onBulk={(ids, status) => void bulkOrders(ids, status)} onAdd={() => setDialog({ kind: 'order' })} onDetail={setTradeDetailOrder} onEdit={(value) => setDialog({ kind: 'order', value })} onDelete={(id) => void remove('order', id)} />
                   : page === 'orders' ? <Orders items={filteredOrders} account={activeAccount} onSync={() => void syncAccount()} onBulk={(ids, status) => void bulkOrders(ids, status)} onAdd={() => setDialog({ kind: 'order' })} onEdit={(value) => setDialog({ kind: 'order', value })} onDelete={(id) => void remove('order', id)} />
-                    : page === 'members' ? <Members items={members} accounts={accounts} onRefresh={() => void refresh()} onNotice={setNotice} />
-                    : <SettingsPage accounts={accounts} quickReplyAutoSuggest={quickReplyAutoSuggest} onQuickReplyAutoSuggestChange={setQuickReplyAutoSuggest} onExport={() => void exportBackup()} onOpenLogs={() => setLogManagerOpen(true)} onQrLogin={() => setDialog({ kind: 'qr' })} />}
+                    : page === 'members' ? <Members items={members} accounts={mainAccounts} onRefresh={() => void refresh()} onNotice={setNotice} onOpenConversation={openMemberConversation} />
+                    : <SettingsPage accounts={mainAccounts} quickReplyAutoSuggest={quickReplyAutoSuggest} onQuickReplyAutoSuggestChange={setQuickReplyAutoSuggest} onExport={() => void exportBackup()} onOpenLogs={() => setLogManagerOpen(true)} onQrLogin={() => setDialog({ kind: 'qr' })} />}
         </div>
         {dialog?.kind === 'account' && <AccountDialog value={dialog.value} onClose={() => setDialog(null)} onSave={saveAccount} />}
-        {dialog?.kind === 'product' && <ProductDialog accounts={accounts} selectedAccountId={activeAccount?.id} value={dialog.value} onClose={() => setDialog(null)} onSave={saveProduct} />}
-        {dialog?.kind === 'order' && <OrderDialog accounts={accounts} selectedAccountId={activeAccount?.id} value={dialog.value} onClose={() => setDialog(null)} onSave={saveOrder} />}
+        {dialog?.kind === 'service-create' && <ServiceCreateDialog parent={dialog.value} onClose={() => setDialog(null)} onCreated={async (child) => {
+          autoLoginAttemptedRef.current.add(child.id)
+          setDialog(null)
+          try { await api.syncServiceAccounts(child.parentAccountId) } catch { /* The newly registered account may not appear immediately. */ }
+          await refresh()
+          try {
+            const result = await api.loginServiceAccount(child.id)
+            if (result.status === 'success') {
+              await refresh()
+              await api.startChatListener(child.id)
+              setNotice(`客服 ${child.displayName} 已创建并登录。`)
+            } else if (result.status === 'sms_required') {
+              setDialog({ kind: 'service-sms', value: child })
+              setNotice(`客服已创建，${child.displayName} 需要短信验证码。`)
+            } else {
+              setNotice(`客服已创建，${result.message}`)
+            }
+          } catch (error) { setNotice(`客服已创建，但自动登录未完成：${String(error)}`) }
+        }} />}
+        {dialog?.kind === 'service-login' && <ServiceLoginDialog account={dialog.value} onClose={() => setDialog(null)} onSmsRequired={() => setDialog({ kind: 'service-sms', value: dialog.value })} onVerificationRequired={() => openImVerification(dialog.value)} onLoggedIn={async () => {
+          autoLoginAttemptedRef.current.add(dialog.value.id)
+          setDialog(null)
+          await refresh()
+          await api.startChatListener(dialog.value.id)
+          setNotice(`客服 ${dialog.value.displayName} 已登录，IM 正在连接。`)
+        }} />}
+        {dialog?.kind === 'service-sms' && <ServiceSmsDialog account={dialog.value} onClose={() => setDialog(null)} onLoggedIn={async () => {
+          const child = dialog.value
+          setDialog(null)
+          await refresh()
+          await api.startChatListener(child.id)
+          setNotice(`${child.displayName} 验证成功，IM 正在连接。`)
+        }} />}
+        {dialog?.kind === 'im-verification' && <ImVerificationDialog account={dialog.value} verificationNotice={imVerificationNotice} onClose={() => setDialog(null)} onCleared={() => {
+          setDialog(null)
+          setNotice('闲鱼已解除风控，IM 正在重新连接。')
+        }} />}
+        {dialog?.kind === 'product' && <ProductDialog accounts={mainAccounts} selectedAccountId={activeAccount?.id} value={dialog.value} onClose={() => setDialog(null)} onSave={saveProduct} />}
+        {dialog?.kind === 'order' && <OrderDialog accounts={mainAccounts} selectedAccountId={activeAccount?.id} value={dialog.value} onClose={() => setDialog(null)} onSave={saveOrder} />}
         {dialog?.kind === 'conversation-name' && <ConversationNameDialog account={dialog.value} onClose={() => setDialog(null)} onSave={saveConversationName} />}
         {dialog?.kind === 'delete-account' && <DeleteAccountDialog account={dialog.value} onClose={() => setDialog(null)} onDelete={deleteAccount} />}
         {logManagerOpen && <LogManager onClose={() => setLogManagerOpen(false)} />}
-        {dialog?.kind === 'qr' && <QrLoginDialog onClose={() => setDialog(null)} onConnected={finishQrLogin} />}
-        {dialog?.kind === 'im-verification' && <ImVerificationDialog account={dialog.value} onClose={() => setDialog(null)} onCompleted={async () => { await refresh(); setDialog(null); setNotice('闲鱼安全验证已保存，IM 正在重新连接。') }} />}
+        {dialog?.kind === 'qr' && <QrLoginDialog account={dialog.value} onClose={() => setDialog(null)} onConnected={(remoteAccountId, profileWarning) => finishQrLogin(remoteAccountId, dialog.value?.remoteAccountId, profileWarning)} />}
         {tradeDetailOrder && <OrderDetailModal order={tradeDetailOrder} product={products.find((item) => item.accountId === tradeDetailOrder.accountId && (item.id.endsWith(`-${tradeDetailOrder.itemId}`) || item.title === tradeDetailOrder.productTitle))} onClose={() => setTradeDetailOrder(null)} />}
       </section>
     </main>
@@ -655,7 +872,7 @@ function MainApp() {
 
 function Loading() { return <div className="loading"><span /><p>正在加载本地工作台…</p></div> }
 
-function Members({ items, accounts, onRefresh, onNotice }: { items: Member[]; accounts: Account[]; onRefresh: () => void; onNotice: (value: string) => void }) {
+function Members({ items, accounts, onRefresh, onNotice, onOpenConversation }: { items: Member[]; accounts: Account[]; onRefresh: () => void; onNotice: (value: string) => void; onOpenConversation: (accountId: string, chatId: string) => void }) {
   const pageSize = 20
   const [query, setQuery] = useState('')
   const [accountFilter, setAccountFilter] = useState('all')
@@ -667,12 +884,12 @@ function Members({ items, accounts, onRefresh, onNotice }: { items: Member[]; ac
   const [tags, setTags] = useState('')
   const [remark, setRemark] = useState('')
   const [mergeView, setMergeView] = useState(false)
-  const visible = items.filter((item) => (accountFilter === 'all' || item.accountId === accountFilter) && `${item.displayName} ${item.buyerId} ${item.phoneMasked} ${item.addressMasked}`.toLowerCase().includes(query.toLowerCase()))
+  const visible = items.filter((item) => (accountFilter === 'all' || item.relatedAccounts.some((related) => related.accountId === accountFilter)) && `${item.displayName} ${item.buyerId} ${item.phoneMasked} ${item.addressMasked} ${item.relatedAccounts.map((related) => related.displayName).join(' ')}`.toLowerCase().includes(query.toLowerCase()))
   const accountName = (id: string) => accounts.find((account) => account.id === id)?.displayName || '未知店铺'
   const merged = Array.from(items.reduce((groups, item) => {
-    const key = item.buyerId || `${item.displayName}:${item.phoneMasked}`
+    const key = item.id
     const current = groups.get(key)
-    if (!current) { groups.set(key, { ...item, accountId: 'merged', orderCount: item.orderCount, paidOrderCount: item.paidOrderCount, totalSpend: item.totalSpend, averageOrderValue: item.averageOrderValue, tags: [...item.tags] }); return groups }
+    if (!current) { groups.set(key, { ...item, accountId: 'merged', orderCount: item.orderCount, paidOrderCount: item.paidOrderCount, totalSpend: item.totalSpend, averageOrderValue: item.averageOrderValue, tags: [...item.tags], relatedAccounts: [...item.relatedAccounts] }); return groups }
     current.orderCount += item.orderCount; current.paidOrderCount += item.paidOrderCount; current.totalSpend += item.totalSpend; current.averageOrderValue = current.paidOrderCount ? current.totalSpend / current.paidOrderCount : 0; current.lastOrderAt = current.lastOrderAt > item.lastOrderAt ? current.lastOrderAt : item.lastOrderAt; current.tags = Array.from(new Set([...current.tags, ...item.tags]));
     return groups
   }, new Map<string, Member>()).values())
@@ -686,8 +903,8 @@ function Members({ items, accounts, onRefresh, onNotice }: { items: Member[]; ac
   const reveal = async () => { if (!detail) return; try { const next = await api.revealMember(detail.id); setRevealed(next); onNotice('已记录查看敏感信息的本地审计日志') } catch (error) { onNotice(error instanceof Error ? error.message : String(error)) } }
   const save = async () => { if (!detail) return; try { const next = await api.updateMember(detail.id, remark, tags.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean)); setDetail(next); onRefresh(); onNotice('会员资料已保存') } catch (error) { onNotice(error instanceof Error ? error.message : String(error)) } }
   const applyTags = async () => { const nextTags = window.prompt('输入批量标签，多个标签用逗号分隔', '重点客户')?.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean); if (!nextTags?.length) return; await Promise.all(selected.map(async (id) => { const member = items.find((item) => item.id === id); if (member) await api.updateMember(id, member.remark, Array.from(new Set([...member.tags, ...nextTags]))) })); setSelected([]); onRefresh(); onNotice(`已为 ${selected.length} 位会员添加标签`) }
-  const exportCsv = () => { const rows = [['会员', '闲鱼ID', '店铺', '手机号', '地址', '下单次数', '有效订单数', '累计消费', '最近下单时间'], ...displayItems.map((item) => [item.displayName, item.buyerId, mergeView ? '跨店铺汇总' : accountName(item.accountId), item.phoneMasked, item.addressMasked, item.orderCount, item.paidOrderCount, item.totalSpend.toFixed(2), item.lastOrderAt])]; const csv = '\ufeff' + rows.map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n'); downloadFile(`鲨鱼管家会员-${new Date().toISOString().slice(0, 10)}.csv`, csv, 'text/csv;charset=utf-8') }
-  return <div className="page members-page"><PageHead eyebrow="CRM · 会员列表" title="会员列表" description="订单同步后自动建档；手机号和地址默认脱敏，跨店铺视图仅用于汇总查看。" action={<div className="head-actions"><button className="secondary" onClick={onRefresh}><RefreshCw size={16} />刷新会员</button><button className="secondary" onClick={exportCsv}><Download size={16} />导出 CSV</button></div>} /><div className="toolbar"><div className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索会员、闲鱼 ID、手机号" /></div><select className="filter-select" value={accountFilter} onChange={(event) => setAccountFilter(event.target.value)}><option value="all">全部店铺</option>{accounts.map((account) => <option key={account.id} value={account.id}>{account.displayName}</option>)}</select><button className={`secondary ${mergeView ? 'active' : ''}`} onClick={() => setMergeView((value) => !value)}><UsersRound size={16} />{mergeView ? '店铺隔离' : '跨店铺汇总'}</button></div><div className="batch-bar"><span>已选择 {selected.length} 位会员</span><button disabled={!selected.length} onClick={() => void applyTags()}>批量加标签</button></div><section className="table-panel"><table><thead><tr><th><input aria-label="全选当前页会员" type="checkbox" checked={Boolean(pageItems.length) && pageItems.every((item) => selected.includes(item.id))} onChange={() => setSelected(pageItems.every((item) => selected.includes(item.id)) ? selected.filter((id) => !pageItems.some((item) => item.id === id)) : Array.from(new Set([...selected, ...pageItems.map((item) => item.id)])))} /></th><th>会员</th><th>店铺</th><th>手机号</th><th>下单次数</th><th>累计消费</th><th>最近下单</th><th>标签</th><th>操作</th></tr></thead><tbody>{pageItems.map((item) => <tr key={item.id}><td><input aria-label={`选择 ${item.displayName}`} type="checkbox" checked={selected.includes(item.id)} onChange={() => setSelected((current) => current.includes(item.id) ? current.filter((id) => id !== item.id) : [...current, item.id])} /></td><td><div className="member-cell"><span className="member-avatar"><UserRound size={16} /></span><div><strong>{item.displayName || '未命名会员'}</strong><small>{item.buyerId || '未取得闲鱼 ID'}</small></div></div></td><td>{mergeView ? '跨店铺汇总' : accountName(item.accountId)}</td><td>{item.phoneMasked || '—'}</td><td>{item.orderCount} <small className="muted">({item.paidOrderCount} 有效)</small></td><td><strong>¥{item.totalSpend.toFixed(2)}</strong></td><td>{formatDate(item.lastOrderAt)}</td><td><div className="tags">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></td><td><button className="link-button" onClick={() => void openDetail(item)}>查看详情</button></td></tr>)}</tbody></table>{displayItems.length === 0 && <EmptyTable text="暂无会员，先同步订单即可自动建档" />}</section><div className="pagination-bar"><span>共 {displayItems.length} 条，每页 20 条</span><div><button disabled={currentPage <= 1} onClick={() => setCurrentPage((value) => value - 1)}>上一页</button><strong>{currentPage} / {totalPages}</strong><button disabled={currentPage >= totalPages} onClick={() => setCurrentPage((value) => value + 1)}>下一页</button></div></div>{detail && <Modal title={`会员详情 · ${detail.displayName || '未命名会员'}`} onClose={() => setDetail(null)}><div className="member-detail"><div className="member-detail-grid"><div><span>所属店铺</span><strong>{accountName(detail.accountId)}</strong></div><div><span>闲鱼 ID</span><strong>{detail.buyerId || '—'}</strong></div><div><span>手机号</span><strong>{revealed?.id === detail.id ? revealed.phoneMasked || '—' : detail.phoneMasked || '—'}</strong></div><div><span>收货地址</span><strong>{revealed?.id === detail.id ? revealed.addressMasked || '—' : detail.addressMasked || '—'}</strong></div><div><span>下单次数</span><strong>{detail.orderCount}（有效 {detail.paidOrderCount}）</strong></div><div><span>累计消费</span><strong>¥{detail.totalSpend.toFixed(2)}</strong></div></div><button className="secondary" onClick={() => void reveal()}><Eye size={15} />查看完整敏感信息</button><label>会员备注<textarea value={remark} onChange={(event) => setRemark(event.target.value)} /></label><label>会员标签<input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="重点客户, 复购" /></label><div className="member-orders"><h3>关联订单</h3>{detailOrders.map(({ order, matchedBy }) => <div className="member-order-row" key={order.id}><span>{order.orderNo}</span><span>{order.productTitle}</span><span>¥{(order.amount - order.refundAmount).toFixed(2)}</span><small>匹配：{matchedBy}</small></div>)}{detailOrders.length === 0 && <p className="muted">暂无关联订单</p>}</div><div className="modal-actions"><button className="secondary" onClick={() => setDetail(null)}>关闭</button><button className="primary" onClick={() => void save()}>保存资料</button></div></div></Modal>}</div>
+  const exportCsv = () => { const rows = [['姓名', '手机号', '关联闲鱼昵称', '店铺', '下单次数', '累计消费', '最近下单时间'], ...displayItems.map((item) => [item.displayName, item.phoneMasked, item.relatedAccounts.map((related) => related.displayName).join('、'), item.relatedAccounts.map((related) => related.shopName).filter((name, index, names) => names.indexOf(name) === index).join('、') || accountName(item.accountId), item.orderCount, item.totalSpend.toFixed(2), item.lastOrderAt])]; const csv = '\ufeff' + rows.map((row) => row.map((cell) => `\"${String(cell).replace(/\"/g, '\"\"')}\"`).join(',')).join('\n'); downloadFile(`鲨鱼管家会员-${new Date().toISOString().slice(0, 10)}.csv`, csv, 'text/csv;charset=utf-8') }
+  return <div className="page members-page"><PageHead eyebrow="CRM · 会员列表" title="会员列表" description="只有成功付款或进入履约的订单才会建档；手机号是唯一客户 ID，关联账号可直接打开闲鱼会话。" action={<div className="head-actions"><button className="secondary" onClick={onRefresh}><RefreshCw size={16} />刷新会员</button><button className="secondary" onClick={exportCsv}><Download size={16} />导出 CSV</button></div>} /><div className="toolbar"><div className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索姓名、手机号、闲鱼昵称" /></div><select className="filter-select" value={accountFilter} onChange={(event) => setAccountFilter(event.target.value)}><option value="all">全部店铺</option>{accounts.map((account) => <option key={account.id} value={account.id}>{account.displayName}</option>)}</select><button className={`secondary ${mergeView ? 'active' : ''}`} onClick={() => setMergeView((value) => !value)}><UsersRound size={16} />{mergeView ? '关联账号' : '手机号汇总'}</button></div><div className="batch-bar"><span>已选择 {selected.length} 位会员</span><button disabled={!selected.length} onClick={() => void applyTags()}>批量加标签</button></div><section className="table-panel"><table><thead><tr><th><input aria-label="全选当前页会员" type="checkbox" checked={Boolean(pageItems.length) && pageItems.every((item) => selected.includes(item.id))} onChange={() => setSelected(pageItems.every((item) => selected.includes(item.id)) ? selected.filter((id) => !pageItems.some((item) => item.id === id)) : Array.from(new Set([...selected, ...pageItems.map((item) => item.id)])))} /></th><th>姓名</th><th>手机号</th><th>关联账号</th><th>店铺</th><th>下单次数</th><th>累计消费</th><th>最近下单</th><th>查看详情</th></tr></thead><tbody>{pageItems.map((item) => <tr key={item.id}><td><input aria-label={`选择 ${item.displayName}`} type="checkbox" checked={selected.includes(item.id)} onChange={() => setSelected((current) => current.includes(item.id) ? current.filter((id) => id !== item.id) : [...current, item.id])} /></td><td><div className="member-cell"><span className="member-avatar"><UserRound size={16} /></span><div><strong>{item.displayName || '未命名客户'}</strong><small>手机号客户</small></div></div></td><td>{item.phoneMasked || '—'}</td><td><div className="member-related-accounts">{item.relatedAccounts.map((related) => <button type="button" className="member-related-account" key={`${related.accountId}:${related.chatId}`} onClick={() => onOpenConversation(related.accountId, related.chatId)} title={`打开 ${related.displayName} 会话`}><span className="member-related-avatar"><span>{related.displayName.slice(0, 1) || '?'}</span>{related.avatarUrl && <img src={displayImageUrl(related.avatarUrl)} alt="" loading="lazy" onError={(event) => event.currentTarget.remove()} />}</span><span>{related.displayName}</span></button>)}</div></td><td>{item.relatedAccounts.map((related) => related.shopName).filter((name, index, names) => names.indexOf(name) === index).join('、') || accountName(item.accountId)}</td><td>{item.orderCount}</td><td><strong>¥{item.totalSpend.toFixed(2)}</strong></td><td>{formatDate(item.lastOrderAt)}</td><td><button className="link-button" onClick={() => void openDetail(item)}>查看详情</button></td></tr>)}</tbody></table>{displayItems.length === 0 && <EmptyTable text="暂无会员，只有同步到成功订单后才会自动建档" />}</section><div className="pagination-bar"><span>共 {displayItems.length} 条，每页 20 条</span><div><button disabled={currentPage <= 1} onClick={() => setCurrentPage((value) => value - 1)}>上一页</button><strong>{currentPage} / {totalPages}</strong><button disabled={currentPage >= totalPages} onClick={() => setCurrentPage((value) => value + 1)}>下一页</button></div></div>{detail && <Modal title={`会员详情 · ${detail.displayName || '未命名客户'}`} onClose={() => setDetail(null)}><div className="member-detail"><div className="member-detail-grid"><div><span>手机号</span><strong>{revealed?.id === detail.id ? revealed.phoneMasked || '—' : detail.phoneMasked || '—'}</strong></div><div><span>关联账号</span><strong>{detail.relatedAccounts.map((related) => related.displayName).join('、') || '—'}</strong></div><div><span>闲鱼 ID</span><strong>{detail.buyerId || '—'}</strong></div><div><span>收货地址</span><strong>{revealed?.id === detail.id ? revealed.addressMasked || '—' : detail.addressMasked || '—'}</strong></div><div><span>下单次数</span><strong>{detail.orderCount}</strong></div><div><span>累计消费</span><strong>¥{detail.totalSpend.toFixed(2)}</strong></div></div><button className="secondary" onClick={() => void reveal()}><Eye size={15} />查看完整敏感信息</button><label>会员备注<textarea value={remark} onChange={(event) => setRemark(event.target.value)} /></label><label>会员标签<input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="重点客户, 复购" /></label><div className="member-orders"><h3>关联订单</h3>{detailOrders.map(({ order, matchedBy }) => <div className="member-order-row" key={order.id}><span>{order.orderNo}</span><span>{order.productTitle}</span><span>¥{(order.amount - order.refundAmount).toFixed(2)}</span><small>匹配：{matchedBy}</small></div>)}{detailOrders.length === 0 && <p className="muted">暂无关联订单</p>}</div><div className="modal-actions"><button className="secondary" onClick={() => setDetail(null)}>关闭</button><button className="primary" onClick={() => void save()}>保存资料</button></div></div></Modal>}</div>
 }
 
 function Dashboard({ stats, accounts, orders, onGo }: { stats: DashboardStats | null; accounts: Account[]; orders: Order[]; onGo: (p: Page) => void }) {
@@ -717,23 +934,77 @@ function AccountAvatar({ account, className = '' }: { account: Account; classNam
   return <span className={`avatar account-avatar ${className}`}><span>{fallback}</span>{account.avatarUrl && <img src={displayImageUrl(account.avatarUrl)} alt={`${account.displayName}头像`} loading="lazy" onError={(event) => event.currentTarget.remove()} />}</span>
 }
 
-function Accounts({ accounts, imStatuses, onQrLogin, onVerify, onEdit, onDelete, onSync, onSetStatus }: { accounts: Account[]; imStatuses: Record<string, string>; onQrLogin: () => void; onVerify: (account: Account) => void; onEdit: (account: Account) => void; onDelete: (account: Account) => void; onSync: (account: Account) => void; onSetStatus: (ids: string[], status: AccountInput['status']) => void }) {
+function Accounts({ accounts, imStatuses, onQrLogin, onVerify, onLoginIm, onEdit, onDelete, onSetStatus, onAddService, onLoginService, onOpenService, onSyncServices }: { accounts: Account[]; imStatuses: Record<string, string>; onQrLogin: () => void; onVerify: (account: Account) => void; onLoginIm: (account: Account) => void; onEdit: (account: Account) => void; onDelete: (account: Account) => void; onSetStatus: (ids: string[], status: AccountInput['status']) => void; onAddService: (account: Account) => void; onLoginService: (account: Account) => void; onOpenService: (account: Account) => void; onSyncServices: (account: Account) => void }) {
   const [query, setQuery] = useState(''); const [status, setStatus] = useState('全部状态'); const [selected, setSelected] = useState<string[]>([])
-  const visible = accounts.filter((account) => (status === '全部状态' || account.status === status) && `${account.displayName}${account.alias}${account.platform}`.toLowerCase().includes(query.toLowerCase()))
+  const visible = accounts.filter((account) => !account.parentAccountId && (status === '全部状态' || account.status === status) && `${account.displayName}${account.alias}${account.platform}`.toLowerCase().includes(query.toLowerCase()))
+  const serviceAccountsByParent = useMemo(() => {
+    const grouped = new Map<string, Account[]>()
+    for (const account of accounts) {
+      if (!account.parentAccountId) continue
+      const siblings = grouped.get(account.parentAccountId) ?? []
+      siblings.push(account)
+      grouped.set(account.parentAccountId, siblings)
+    }
+    return grouped
+  }, [accounts])
   const toggleAll = () => setSelected(selected.length === visible.length ? [] : visible.map((account) => account.id))
   const toggle = (id: string) => setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])
   return <div className="page account-page">
-    <PageHead eyebrow="账号管理" title="店铺账号与本机会话" description="支持本机扫码登录、批量启停，并同步商品与订单。" action={<div className="head-actions"><button className="secondary" onClick={onQrLogin}><LogIn size={17} />扫码登录</button></div>} />
-    <section className="table-panel accounts-table"><div className="account-table-head"><div><h2>账号列表 <span>{visible.length} 个账号</span></h2><p>已选择 {selected.length} 个账号</p></div><div className="account-batch-actions"><button className="secondary" disabled={!selected.length} onClick={() => onSetStatus(selected, '授权有效')}>批量启用</button><button className="secondary" disabled={!selected.length} onClick={() => onSetStatus(selected, '已停用')}>批量停用</button><button className="secondary" onClick={() => visible.forEach(onSync)}><RefreshCw size={15} />同步当前列表</button></div></div>
+    <PageHead eyebrow="账号管理" title="店铺账号与本机会话" description="支持本机扫码登录；登录成功后会在后台获取账号资料并同步商品与订单。" action={<div className="head-actions"><button className="secondary" onClick={onQrLogin}><LogIn size={17} />扫码登录</button></div>} />
+    <section className="table-panel accounts-table"><div className="account-table-head"><div><h2>账号列表 <span>{visible.length} 个账号</span></h2><p>已选择 {selected.length} 个账号</p></div><div className="account-batch-actions"><button className="secondary" disabled={!selected.length} onClick={() => onSetStatus(selected, '授权有效')}>批量启用</button><button className="secondary" disabled={!selected.length} onClick={() => onSetStatus(selected, '已停用')}>批量停用</button></div></div>
       <div className="toolbar account-toolbar"><div className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索店铺名、别名或平台" /></div><select className="filter-select" value={status} onChange={(event) => setStatus(event.target.value)}><option>全部状态</option><option>授权有效</option><option>即将过期</option><option>同步异常</option><option>已停用</option></select></div>
-      <div className="account-cards account-cards-page">{visible.map((account) => <article className={`account-card account-card-rich ${selected.includes(account.id) ? 'selected' : ''}`} key={account.id}>
+      <div className="account-cards account-cards-page">{visible.map((account) => {
+        const serviceAccounts = serviceAccountsByParent.get(account.id) ?? []
+        return <article className={`account-card account-card-rich ${selected.includes(account.id) ? 'selected' : ''}`} key={account.id}>
         <header className="account-card-rich-head"><label className="account-card-check"><input aria-label={`选择 ${account.displayName}`} type="checkbox" checked={selected.includes(account.id)} onChange={() => toggle(account.id)} /><span>选择账号</span></label><Status value={account.status} /></header>
         <div className="account-card-identity"><AccountAvatar account={account} className="large" /><div className="account-card-name-block"><div className="account-card-name-line"><h3>{account.displayName}</h3><span className="account-card-platform">{account.platform}</span></div><p><span>会员名</span>{account.memberName || account.remoteAccountId || `本地账号 · ${account.id.slice(0, 8)}`}</p></div></div>
-        <div className="account-card-badges"><span className={account.remoteAccountId ? 'account-card-connected' : 'account-card-muted'}>{account.remoteAccountId ? <><CheckCircle2 size={13} />已登录</> : '仅本地资料'}</span><ImStatusBadge value={imStatuses[account.id] ?? (account.remoteAccountId ? 'connecting' : 'not_logged_in')} /></div>
+        <div className="account-card-badges"><span className={account.remoteAccountId ? 'account-card-connected' : 'account-card-muted'}>{account.remoteAccountId ? <><CheckCircle2 size={13} />已登录</> : '仅本地资料'}</span><ImStatusBadge value={imStatuses[account.id]} /></div>
         <div className="account-card-info"><div><span>账号别名</span><strong>{account.alias || '未设置别名'}</strong></div><div><span>最后同步</span><strong>{formatDate(account.lastSyncAt)}</strong></div></div>
         <div className="account-card-metrics"><div><span>商品</span><b>{account.productCount}</b></div><div><span>订单</span><b>{account.orderCount}</b></div><div><span>同步状态</span><b>{account.status === '授权有效' ? '正常' : '需关注'}</b></div></div>
-        <footer className="account-card-rich-footer">{imStatuses[account.id] === 'verification_required' && <button className="account-card-sync" onClick={() => onVerify(account)}><ShieldCheck size={14} />完成验证</button>}<button className="account-card-sync" onClick={() => onSync(account)}><RefreshCw size={14} />同步</button><button onClick={() => onEdit(account)}>编辑</button><button className="danger-link" onClick={() => onDelete(account)}>删除</button></footer>
-      </article>)}{visible.length === 0 && <EmptyTable text="没有符合条件的账号" />}</div>
+        <div className="service-management">
+          <div className="service-management-head">
+            <div className="service-management-title"><strong>客服管理</strong><span>{serviceAccounts.length} 位客服</span></div>
+            <div className="service-management-actions">
+              <button className="service-refresh-button" type="button" title="刷新客服列表" aria-label="刷新客服列表" disabled={!account.remoteAccountId} onClick={() => onSyncServices(account)}><RefreshCw size={15} /></button>
+              <button className="service-add-button" type="button" disabled={!account.remoteAccountId} onClick={() => onAddService(account)}><Plus size={14} />添加客服</button>
+            </div>
+          </div>
+          <div className="service-management-list">
+            {serviceAccounts.map((child) => {
+              const imStatus = imStatuses[child.id] ?? (child.remoteAccountId ? 'connecting' : 'not_logged_in')
+              return <div className="service-account-card" key={child.id}>
+                <div className="service-account-head">
+                  <AccountAvatar account={child} className="service-account-avatar" />
+                  <div className="service-account-identity"><strong title={child.displayName}>{child.displayName}</strong><span>{child.serviceRole || '岗位未设置'}</span></div>
+                  <ImStatusBadge value={imStatus} />
+                </div>
+                <div className="service-account-meta">
+                  <div><span>登录名</span><strong title={child.serviceLoginName}>{child.serviceLoginName || '未设置'}</strong></div>
+                  <div><span>手机号</span><strong>{child.serviceMobile || '未设置'}</strong></div>
+                </div>
+                <div className="service-account-actions">
+                  {imStatus === 'verification_required'
+                    ? <button className="service-account-action-primary" type="button" onClick={() => onVerify(child)}><ShieldCheck size={14} />滑块验证</button>
+                    : <button className={imStatus === 'connected' ? 'service-account-action-secondary' : 'service-account-action-primary'} type="button" onClick={() => onLoginService(child)}><LogIn size={14} />登录客服</button>}
+                  <button className={imStatus === 'connected' ? 'service-account-action-primary' : 'service-account-action-secondary'} type="button" onClick={() => onOpenService(child)}><MessageCircle size={14} />进入会话</button>
+                </div>
+              </div>
+            })}
+            {serviceAccounts.length === 0 && <p className="service-management-empty">暂无客服，添加后可独立连接 IM。</p>}
+          </div>
+        </div>
+        <footer className="account-card-rich-footer account-card-manage-footer">
+          <span>主账号操作</span>
+          {imStatuses[account.id] === 'verification_required'
+            ? <button className="account-card-sync" onClick={() => onVerify(account)}><ShieldCheck size={14} />打开验证</button>
+            : imStatuses[account.id] === 'connected'
+              ? <button className="account-card-sync" onClick={() => { onOpenService(account) }}><MessageCircle size={14} />进入会话</button>
+              : <button className="account-card-sync" disabled={!account.remoteAccountId || imStatuses[account.id] === 'connecting' || imStatuses[account.id] === 'risk_cooldown'} onClick={() => onLoginIm(account)}><LogIn size={14} />{imStatuses[account.id] === 'connecting' ? '连接中…' : '登录 IM'}</button>}
+          <button onClick={() => onEdit(account)}><Pencil size={13} />编辑</button>
+          <button className="danger-link" onClick={() => onDelete(account)}><Trash2 size={13} />删除</button>
+        </footer>
+      </article>
+      })}{visible.length === 0 && <EmptyTable text="没有符合条件的账号" />}</div>
     </section>
   </div>
 }
@@ -817,6 +1088,57 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
   return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><section className="modal" role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}><header><h2>{title}</h2><button className="icon-button" onClick={onClose}>×</button></header>{children}</section></div>
 }
 
+function ImVerificationDialog({ account, verificationNotice, onClose, onCleared }: { account: Account; verificationNotice: string; onClose: () => void; onCleared: () => void }) {
+  const slotRef = useRef<HTMLDivElement>(null)
+  const [opened, setOpened] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let active = true
+    let started = false
+    const slot = slotRef.current
+    if (!slot) return
+    const bounds = () => {
+      const rect = slot.getBoundingClientRect()
+      return { x: rect.left, y: rect.top, width: rect.width, height: rect.height }
+    }
+    const position = () => { void api.positionImVerification(account.id, bounds()).catch(() => undefined) }
+    const observer = new ResizeObserver(position)
+    observer.observe(slot)
+    window.addEventListener('resize', position)
+    const startTimer = window.setTimeout(() => {
+      started = true
+      void api.openImVerification(account.id, bounds())
+        .then((result) => {
+          if (!active) { void api.closeImVerification(account.id); return }
+          if (result === 'already_cleared') { onCleared(); return }
+          setOpened(true)
+          position()
+        })
+        .catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : String(cause)) })
+    }, 0)
+    return () => {
+      active = false
+      window.clearTimeout(startTimer)
+      observer.disconnect()
+      window.removeEventListener('resize', position)
+      if (started) void api.closeImVerification(account.id).catch(() => undefined)
+    }
+  }, [account.id])
+
+  return <Modal title={`闲鱼安全验证 · ${account.displayName}`} onClose={onClose}>
+    <div className="im-verification-dialog">
+      <p>请在下方完成闲鱼官方滑块验证。通过后应用会自动确认结果，并继续登录或连接 IM。</p>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      {verificationNotice && <p className="form-error" role="alert">{verificationNotice}</p>}
+      <div className="im-verification-slot" ref={slotRef}>
+        {!opened && <span>{error ? '验证页未能打开，请关闭后重新尝试。' : '正在加载验证页面…'}</span>}
+      </div>
+      <div className="im-verification-footer"><span>客服账号：{account.displayName}</span><button type="button" className="secondary" onClick={onClose}>稍后处理</button></div>
+    </div>
+  </Modal>
+}
+
 function ConversationNameDialog({ account, onClose, onSave }: { account: Account; onClose: () => void; onSave: (account: Account, name: string) => void }) {
   const [name, setName] = useState(account.conversationName || account.displayName)
   return <Modal title="自定义会话名称" onClose={onClose}><form className="form-grid" onSubmit={(event) => { event.preventDefault(); onSave(account, name) }}><label>会话名称<input autoFocus maxLength={30} value={name} onChange={(event) => setName(event.target.value)} placeholder={account.displayName} /></label><p className="form-note">仅修改顶部会话管理的显示名称，不会更改闲鱼账号名称。留空保存可恢复为“{account.displayName}”。</p><div className="modal-actions"><button type="button" className="secondary" onClick={() => setName('')}>恢复默认</button><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存名称</button></div></form></Modal>
@@ -840,7 +1162,75 @@ function AccountDialog({ value, onClose, onSave }: { value?: Account; onClose: (
   return <Modal title={value ? '编辑账号资料' : '添加本地账号资料'} onClose={onClose}><form className="form-grid" onSubmit={(event) => { event.preventDefault(); onSave({ displayName, alias, platform, status, sourceUrl: value?.sourceUrl ?? '', remoteAccountId: value?.remoteAccountId ?? '' }, value) }}><label>店铺名称<input required autoFocus value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="例如：鲨鱼精选店" /></label><label>账号别名<input value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="用于内部区分" /></label><label>平台<select value={platform} onChange={(event) => setPlatform(event.target.value)}><option>闲鱼</option><option>淘宝（仅本地资料）</option><option>其他平台（仅本地资料）</option></select></label><label>运营状态<select value={status} onChange={(event) => setStatus(event.target.value as AccountInput['status'])}><option>授权有效</option><option>即将过期</option><option>同步异常</option><option>已停用</option></select></label><p className="form-note">这里用于维护显示名称和备注。需要同步闲鱼真实数据时，请使用账号页的“扫码登录”。</p><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button className="primary" type="submit">保存账号</button></div></form></Modal>
 }
 
-function QrLoginDialog({ onClose, onConnected }: { onClose: () => void; onConnected: (remoteAccountId: string) => Promise<void> }) {
+function ServiceCreateDialog({ parent, onClose, onCreated }: { parent: Account; onClose: () => void; onCreated: (account: Account) => Promise<void> }) {
+  const [suffix, setSuffix] = useState('')
+  const [name, setName] = useState('')
+  const [mobile, setMobile] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setBusy(true); setError('')
+    try {
+      const account = await api.createServiceAccount(parent.id, suffix.trim(), name.trim(), mobile.trim(), password)
+      setPassword('')
+      await onCreated(account)
+    } catch (cause) { setError(String(cause)) } finally { setBusy(false) }
+  }
+  return <Modal title={`添加客服 · ${parent.displayName}`} onClose={onClose}><form className="form-grid" onSubmit={(event) => void submit(event)}><label>登录名后缀<input required autoFocus maxLength={10} pattern="[A-Za-z0-9_]+" value={suffix} onChange={(event) => setSuffix(event.target.value)} placeholder="1–10 位字母、数字或下划线" /></label><label>客服姓名<input required maxLength={15} value={name} onChange={(event) => setName(event.target.value)} /></label><label>手机号<input required inputMode="numeric" pattern="1[0-9]{10}" value={mobile} onChange={(event) => setMobile(event.target.value)} placeholder="子账号绑定手机号" /></label><label>登录密码<input required type="password" autoComplete="new-password" minLength={8} maxLength={15} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="8–15 位字母和数字组合" /></label><p className="form-note">角色默认为管理员。创建成功后会自动登录客服账号，密码加密保存在本机供以后自动登录。平台提示需要配置客服分流时，还需完成分流配置才能接收消息。</p>{error && <p className="form-error" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary" disabled={busy}>{busy ? '正在创建…' : '创建并登录'}</button></div></form></Modal>
+}
+
+function ServiceLoginDialog({ account, onClose, onLoggedIn, onSmsRequired, onVerificationRequired }: { account: Account; onClose: () => void; onLoggedIn: () => Promise<void>; onSmsRequired: () => void; onVerificationRequired: () => void }) {
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setBusy(true); setMessage('')
+    try {
+      const result = await api.loginServiceAccount(account.id, password || undefined)
+      setPassword('')
+      if (result.status === 'success') await onLoggedIn()
+      else if (result.status === 'sms_required') onSmsRequired()
+      else if (result.status === 'verification_required' && (await api.imVerificationState(account.id)).required) onVerificationRequired()
+      else setMessage(result.message)
+    } catch (cause) { setMessage(String(cause)) } finally { setBusy(false) }
+  }
+  return <Modal title={`客服登录 · ${account.displayName}`} onClose={onClose}><form className="form-grid" onSubmit={(event) => void submit(event)}><p className="form-note">登录名：{account.serviceLoginName}。留空密码将使用本机加密保存的密码。</p><label>密码<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="留空使用已保存密码" /></label>{message && <p className="form-error" role="alert">{message}</p>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary" disabled={busy}>{busy ? '正在登录…' : '登录客服'}</button></div></form></Modal>
+}
+
+function ServiceSmsDialog({ account, onClose, onLoggedIn }: { account: Account; onClose: () => void; onLoggedIn: () => Promise<void> }) {
+  const [mobile, setMobile] = useState('')
+  const [mobileDisplay, setMobileDisplay] = useState(account.serviceMobile)
+  const [code, setCode] = useState('')
+  const [sent, setSent] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+  const send = async () => {
+    setBusy(true); setMessage('')
+    try {
+      const result = await api.sendServiceLoginSms(account.id, mobile.trim() || undefined)
+      setMobileDisplay(result.mobile || account.serviceMobile)
+      setMobile('')
+      setSent(true)
+      setMessage(`验证码已发送至 ${result.mobile || account.serviceMobile || '绑定手机号'}`)
+    } catch (cause) { setMessage(String(cause)) } finally { setBusy(false) }
+  }
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setBusy(true); setMessage('')
+    try {
+      const result = await api.submitServiceLoginSms(account.id, code.trim())
+      setCode('')
+      if (result.status === 'success') await onLoggedIn()
+      else setMessage(result.message)
+    } catch (cause) { setMessage(String(cause)) } finally { setBusy(false) }
+  }
+  return <Modal title={`客服短信验证 · ${account.displayName}`} onClose={onClose}><form className="form-grid" onSubmit={(event) => void submit(event)}><p className="form-note">客服：{account.serviceLoginName}<br />绑定手机号：{mobileDisplay || '平台未返回完整手机号'}</p>{!mobileDisplay || mobileDisplay.includes('*') ? <label>完整手机号（仅平台未保存时填写）<input inputMode="tel" autoComplete="tel" value={mobile} onChange={(event) => setMobile(event.target.value)} placeholder="如已保存可留空" /></label> : null}<div className="service-sms-send"><button type="button" className="secondary" disabled={busy} onClick={() => void send()}>{sent ? '重新发送验证码' : '发送验证码'}</button></div><label>短信验证码<input required inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{4,8}" value={code} onChange={(event) => setCode(event.target.value)} placeholder="输入收到的验证码" /></label>{message && <p className={sent ? 'form-note' : 'form-error'} role="status">{message}</p>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>稍后处理</button><button type="submit" className="primary" disabled={busy || !sent}>{busy ? '正在验证…' : '完成登录'}</button></div></form></Modal>
+}
+
+function QrLoginDialog({ account, onClose, onConnected }: { account?: Account; onClose: () => void; onConnected: (remoteAccountId: string, profileWarning: boolean) => Promise<void> }) {
   const [session, setSession] = useState<QrLoginStart | null>(null)
   const [status, setStatus] = useState<QrLoginStatus | null>(null)
   const [working, setWorking] = useState(true)
@@ -858,43 +1248,35 @@ function QrLoginDialog({ onClose, onConnected }: { onClose: () => void; onConnec
   useEffect(() => {
     if (!session || ['success', 'failed', 'expired', 'cancelled'].includes(status?.status ?? '')) return
     let cancelled = false
+    let pollInFlight = false
+    let loginHandled = false
     const poll = async () => {
+      if (pollInFlight || cancelled) return
+      pollInFlight = true
       try {
-        const next = await api.checkQrLoginStatus(session.sessionId)
+        const next = await api.checkQrLoginStatus(session.sessionId, account?.remoteAccountId)
         if (cancelled) return
         setStatus(next)
-        if (next.status === 'success') await onConnected(next.accountId)
+        if (next.status === 'success' && !loginHandled) {
+          loginHandled = true
+          await onConnected(next.accountId, next.profileWarning)
+        }
       } catch (value) { if (!cancelled) setError(value instanceof Error ? value.message : String(value)) }
+      finally { pollInFlight = false }
     }
     void poll(); const timer = window.setInterval(() => void poll(), 2000)
     return () => { cancelled = true; window.clearInterval(timer) }
-  }, [session, status?.status, onConnected])
+  }, [session, status?.status, onConnected, account?.remoteAccountId])
   const identityVerification = status?.status === 'verification_required'
   const qr = identityVerification ? status?.faceQrUrl : session?.qrCodeUrl
   const message = status?.message || session?.message || (working ? '正在生成二维码…' : '二维码生成失败')
-  return <Modal title={identityVerification ? '闲鱼身份验证' : '本机扫码登录闲鱼'} onClose={onClose}><div className="qr-login"><p>{identityVerification ? '闲鱼要求本次登录完成身份验证。请使用闲鱼 App 扫描下方人脸验证二维码，并在手机端完成验证。' : '二维码由鲨鱼管家在本机直接生成。请使用闲鱼 App 扫码并在手机端确认。'}</p>{qr ? <img className="qr-image" src={qr} alt={identityVerification ? '闲鱼身份验证二维码' : '闲鱼登录二维码'} /> : <div className="qr-placeholder">{identityVerification ? <ShieldCheck size={32} /> : <LogIn size={32} />}<span>{working ? '正在生成二维码…' : identityVerification ? '正在获取身份验证二维码…' : '二维码加载失败，请刷新'}</span></div>}<strong>{message}</strong>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button type="button" className="primary" disabled={working} onClick={() => void generate()}><RefreshCw size={16} />{working ? '生成中…' : '刷新二维码'}</button></div></div></Modal>
-}
-
-function ImVerificationDialog({ account, onClose, onCompleted }: { account: Account; onClose: () => void; onCompleted: () => Promise<void> }) {
-  const [opening, setOpening] = useState(false)
-  const [completing, setCompleting] = useState(false)
-  const [error, setError] = useState('')
-  useEffect(() => {
-    let cancelled = false
-    void api.imVerificationState(account.id).then((state) => {
-      if (!cancelled && !state.required) setError('验证请求已失效。请重新启动 IM 后再试。')
-    }).catch((value) => { if (!cancelled) setError(value instanceof Error ? value.message : String(value)) })
-    return () => { cancelled = true }
-  }, [account.id])
-  const open = async () => {
-    setOpening(true); setError('')
-    try { await api.openImVerification(account.id) } catch (value) { setError(value instanceof Error ? value.message : String(value)) } finally { setOpening(false) }
-  }
-  const complete = async () => {
-    setCompleting(true); setError('')
-    try { await api.completeImVerification(account.id); await onCompleted() } catch (value) { setError(value instanceof Error ? value.message : String(value)) } finally { setCompleting(false) }
-  }
-  return <Modal title="完成闲鱼安全验证" onClose={onClose}><div className="qr-login"><p>闲鱼要求此账号完成一次安全验证。打开验证页后，请在新窗口中手动完成挑战；验证 Cookie 只保存在本机加密会话中。</p><strong>{account.displayName}</strong>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={() => void open()} disabled={opening || completing}><ExternalLink size={16} />{opening ? '正在打开…' : '打开验证页'}</button><button type="button" className="primary" onClick={() => void complete()} disabled={opening || completing}><ShieldCheck size={16} />{completing ? '正在保存…' : '我已完成验证'}</button></div></div></Modal>
+  const title = identityVerification ? '闲鱼身份验证' : account ? `重新核验 ${account.displayName}` : '本机扫码登录闲鱼'
+  const introduction = identityVerification
+    ? '闲鱼要求本次登录完成人脸身份验证。请使用闲鱼 App 扫描下方二维码，并在手机端完成验证。'
+    : account
+      ? '该账号的 IM 会话需要重新核验。请使用同一个闲鱼账号扫码；如平台要求身份验证，这里会自动切换为手机人脸核验二维码。'
+      : '二维码由鲨鱼管家在本机直接生成。请使用闲鱼 App 扫码并在手机端确认。'
+  return <Modal title={title} onClose={onClose}><div className="qr-login"><p>{introduction}</p>{qr ? <img className="qr-image" src={qr} alt={identityVerification ? '闲鱼身份验证二维码' : '闲鱼登录二维码'} /> : <div className="qr-placeholder">{identityVerification ? <ShieldCheck size={32} /> : <LogIn size={32} />}<span>{working ? '正在生成二维码…' : identityVerification ? '正在获取身份验证二维码…' : '二维码加载失败，请刷新'}</span></div>}<strong>{message}</strong>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>取消</button><button type="button" className="primary" disabled={working} onClick={() => void generate()}><RefreshCw size={16} />{working ? '生成中…' : '刷新二维码'}</button></div></div></Modal>
 }
 
 function ProductDialog({ accounts, selectedAccountId, value, onClose, onSave }: { accounts: Account[]; selectedAccountId?: string; value?: Product; onClose: () => void; onSave: (input: ProductInput, current?: Product) => void }) {
@@ -1110,11 +1492,12 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
   const contactLoadGenerationRef = useRef(0)
   const pushRefreshPendingRef = useRef(false)
   const messageLoadingRef = useRef(false)
+  const pendingConversationScrollRef = useRef('')
   const messageRefreshPendingRef = useRef(false)
   const knownMessageIdsRef = useRef<Set<string>>(new Set())
   const contactsRef = useRef<ChatContact[]>([])
   const processedUnreadJumpRef = useRef(0)
-  const selected = contacts.find((item) => item.chatId === selectedId) ?? contacts[0]
+  const selected = useMemo(() => contacts.find((item) => item.chatId === selectedId) ?? contacts[0], [contacts, selectedId])
   useEffect(() => { contactsRef.current = contacts }, [contacts])
   useEffect(() => {
     setConversationMenu(null)
@@ -1220,18 +1603,26 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
       onNotice(`读取关联订单失败：${nextError instanceof Error ? nextError.message : String(nextError)}`)
     }
   }
-  const filteredContacts = contacts.filter((item) => {
+  const normalizedQuery = query.trim().toLowerCase()
+  const filteredContacts = useMemo(() => contacts.filter((item) => {
     const upstreamStatus = `${item.orderStatus} ${item.latestMessage}`
     const matchesStatus = conversationStatus === '全部'
       || (conversationStatus === '待下单' ? !item.orderStatus && !/待付款|待发货|已发货|退款/.test(item.latestMessage) : upstreamStatus.includes(conversationStatus))
-    return matchesStatus && `${item.otherUserName}${item.latestMessage}${item.itemTitle}`.toLowerCase().includes(query.toLowerCase())
-  })
-  const sortedContacts = [...filteredContacts].sort((left, right) => {
-    const leftPinned = pinnedChatIds.includes(left.chatId)
-    const rightPinned = pinnedChatIds.includes(right.chatId)
-    if (leftPinned !== rightPinned) return leftPinned ? -1 : 1
-    return 0
-  })
+    return matchesStatus && `${item.otherUserName}${item.latestMessage}${item.itemTitle}`.toLowerCase().includes(normalizedQuery)
+  }), [contacts, conversationStatus, normalizedQuery])
+  const pinnedChatIdSet = useMemo(() => new Set(pinnedChatIds), [pinnedChatIds])
+  const sortedContacts = useMemo(() => {
+    if (pinnedChatIdSet.size === 0) return filteredContacts
+    // SQL already returns contacts in newest-message order. Stable partitioning
+    // moves pinned rows to the top in O(n), preserving that order without an
+    // O(n log n) sort on every workbench render.
+    const pinned: ChatContact[] = []
+    const regular: ChatContact[] = []
+    for (const contact of filteredContacts) {
+      (pinnedChatIdSet.has(contact.chatId) ? pinned : regular).push(contact)
+    }
+    return [...pinned, ...regular]
+  }, [filteredContacts, pinnedChatIdSet])
   const visibleContacts = sortedContacts.slice(0, contactLimit)
   const visibleMessages = messages.slice(messageStart)
   const requestedConversation = (items: ChatContact[]) => unreadJumpRequest.accountId === account?.id && unreadJumpRequest.nonce > processedUnreadJumpRef.current
@@ -1499,6 +1890,8 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
 
   useEffect(() => {
     if (!account || !selected) { setMessages([]); return }
+    const selectionKey = `${account.id}:${selected.chatId}`
+    pendingConversationScrollRef.current = selectionKey
     knownMessageIdsRef.current = new Set()
     let active = true
     const load = async () => {
@@ -1510,7 +1903,6 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
           setMessages(local)
           knownMessageIdsRef.current = new Set(local.map((message) => message.id))
           setMessageStart(Math.max(0, local.length - MESSAGE_BATCH))
-          requestAnimationFrame(() => { const list = messageListRef.current; if (list) list.scrollTop = list.scrollHeight })
         }
         // A freshly re-added account has a valid remote login but no local
         // chat cache because deleting the old account intentionally removed
@@ -1524,7 +1916,6 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
             setMessageStart(Math.max(0, page.items.length - MESSAGE_BATCH))
             setMessageCursor(page.nextCursor)
             setMessageHasMore(page.hasMore)
-            requestAnimationFrame(() => { const list = messageListRef.current; if (list) list.scrollTop = list.scrollHeight })
           }
         } else if (active) {
           setMessageHasMore(false)
@@ -1538,8 +1929,10 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
           messageRefreshPendingRef.current = false
           void api.syncChatMessages(account.id, selected.chatId, null).then((page) => {
             if (!active) return
+            pendingConversationScrollRef.current = selectionKey
             knownMessageIdsRef.current = new Set(page.items.map((message) => message.id))
             setMessages(page.items)
+            setMessageStart(Math.max(0, page.items.length - MESSAGE_BATCH))
             setMessageCursor(page.nextCursor)
             setMessageHasMore(page.hasMore)
           }).catch(() => undefined)
@@ -1550,6 +1943,28 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
     void load()
     return () => { active = false }
   }, [account?.id, selected?.chatId, imConnected])
+
+  useLayoutEffect(() => {
+    if (!account || !selected || messageLoading) return
+    const selectionKey = `${account.id}:${selected.chatId}`
+    if (pendingConversationScrollRef.current !== selectionKey) return
+    const list = messageListRef.current
+    if (!list) return
+    list.scrollTop = list.scrollHeight
+    let secondFrame = 0
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        if (pendingConversationScrollRef.current !== selectionKey) return
+        const current = messageListRef.current
+        if (current) current.scrollTop = current.scrollHeight
+        pendingConversationScrollRef.current = ''
+      })
+    })
+    return () => {
+      cancelAnimationFrame(firstFrame)
+      if (secondFrame) cancelAnimationFrame(secondFrame)
+    }
+  }, [account?.id, selected?.chatId, messages, messageStart, messageLoading])
 
   const loadMoreContacts = () => {
     if (contactLoadingRef.current) return
@@ -1811,7 +2226,7 @@ function Workbench({ account, products, orders, onOrderUpdated, onNotice, imConn
           {queuedReplyImages.length > 0 && <div className="queued-reply-images">{queuedReplyImages.map((image, index) => <span key={`${image.name}-${index}`}><img src={image.dataUrl} alt="快捷回复图片" /><button type="button" aria-label="移除快捷回复图片" onClick={() => setQueuedReplyImages((current) => current.filter((_, imageIndex) => imageIndex !== index))}>×</button></span>)}</div>}
           <div className="composer-input-row"><div className="composer-command-anchor" ref={quickReplyCommandRef}><textarea value={draft} onChange={(event) => { const next = event.target.value; setDraft(next); setQuickReplyCommandOpen(/(?:^|\s)\/[a-zA-Z0-9_-]*$/.test(next) || (quickReplyAutoSuggest && next.trim().length >= 2)) }} onPaste={(event) => { const image = Array.from(event.clipboardData.items).find((item) => item.kind === 'file' && item.type.startsWith('image/'))?.getAsFile(); if (!image) return; event.preventDefault(); void sendImage(image) }} onKeyDown={(event) => { if (event.key === 'Escape') { setQuickReplyCommandOpen(false); return } if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} placeholder={'通过设置启用「自动联想」或输入“/”唤起快捷回复\n「Command + V」可直接发送截图或复制的图片\n「Shift + Enter」进行内容换行'} />{quickReplyCommandOpen && <div className="quick-command-menu"><header><strong>{commandActive ? '快捷指令' : '自动联想'}</strong><small>{commandActive ? `输入 /${commandQuery} 筛选` : '根据输入匹配快捷回复'}</small></header>{matchingQuickReplies.length ? matchingQuickReplies.map((reply) => <button type="button" key={reply.id} onClick={() => insertQuickReply(reply, commandActive, !commandActive)}><span><strong>{reply.title}</strong><small>/{reply.shortCode}</small></span><em>{reply.images.length ? `${reply.images.length} 图` : '文字'}</em></button>) : <p>{commandActive ? '没有匹配的快捷回复' : '暂无联想结果'}</p>}</div>}</div><button className="primary" disabled={(!draft.trim() && !queuedReplyImages.length) || busy} onClick={() => void send()}><Send size={15} />{busy ? '处理中' : '发送'}</button></div>
         </footer>
-      </> : <div className="chat-blank"><MessageCircle size={42} /><h2>{account ? '暂无会话' : '请先添加账号'}</h2><p>{account ? '确保账号已扫码登录，然后点击左侧同步。' : '扫码登录后即可同步真实会话。'}</p></div>}
+      </> : <div className="chat-blank"><MessageCircle size={42} /><h2>{account ? '暂无会话' : '请先添加客服'}</h2><p>{account ? '确保客服账号已登录，然后点击左侧同步。' : '到账号管理添加并登录客服子账号后即可查看会话。'}</p></div>}
     </section>
     <aside className={`context-panel ${quickReplyManaging ? 'quick-reply-manager-panel' : ''}`}>{quickReplyManaging ? <QuickReplyManager replies={quickReplies} value={editingQuickReply} onClose={() => { setQuickReplyManaging(false); setEditingQuickReply(undefined) }} onSave={saveQuickReply} onEdit={setEditingQuickReply} onDelete={(reply) => void deleteQuickReply(reply)} /> : selected ? <CustomerContextPanel contact={selected} profile={customerProfile} inventory={products} orders={orders} onOrderUpdated={onOrderUpdated} onOrderAction={openOrderAction} loading={customerProfileLoading} error={customerProfileError} activeTab={customerProductTab} onTabChange={setCustomerProductTab} onEditRemark={() => setCustomerRemarkOpen(true)} /> : <div className="context-empty"><img src={logo} alt="" /><p>选择会话后查看客户资料、交易统计和商品足迹。</p></div>}</aside>
     {conversationMenu && createPortal(<div className="conversation-context-menu" style={{ left: Math.min(conversationMenu.x, window.innerWidth - 176), top: Math.min(conversationMenu.y, window.innerHeight - 104) }} onMouseDown={(event) => event.stopPropagation()}><button type="button" onClick={() => void toggleConversationPin(conversationMenu.contact)}><Pin size={15} />{pinnedChatIds.includes(conversationMenu.contact.chatId) ? '取消置顶' : '置顶'}</button><button type="button" className="danger" onClick={() => void deleteConversation(conversationMenu.contact)}><Trash2 size={15} />删除</button></div>, document.body)}

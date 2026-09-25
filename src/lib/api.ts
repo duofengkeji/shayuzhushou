@@ -6,7 +6,7 @@
  * command layer remains the single integration boundary for Xianyu APIs.
  */
 import { invoke } from '@tauri-apps/api/core'
-import type { Account, AccountInput, AppLog, BackupData, ChatContact, ChatContactsPage, ChatEmoji, ChatMessage, ChatMessagesPage, CustomerProfile, DashboardStats, ImVerificationState, Member, MemberOrder, Order, OrderDetail, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, RefundDetail, RefundVerification, SyncJob, SyncResult } from './types'
+import type { Account, AccountInput, AppLog, BackupData, ChatContact, ChatContactsPage, ChatEmoji, ChatMessage, ChatMessagesPage, CustomerProfile, DashboardStats, ImVerificationProgress, ImVerificationState, Member, MemberOrder, Order, OrderDetail, OrderInput, Product, ProductInput, QrLoginStart, QrLoginStatus, QuickReply, QuickReplyImage, RefundDetail, RefundVerification, SyncJob, SyncResult } from './types'
 
 const relatedOrderStatusIds: Record<string, string> = {
   '全部': 'ALL',
@@ -18,9 +18,16 @@ const relatedOrderStatusIds: Record<string, string> = {
   '交易成功': 'SUCCESS',
 }
 
+export type ImVerificationBounds = { x: number; y: number; width: number; height: number }
+
 export const api = {
   dashboard: () => invoke<DashboardStats>('dashboard_stats'),
   accounts: () => invoke<Account[]>('list_accounts'),
+  syncServiceAccounts: (parentAccountId: string) => invoke<Account[]>('sync_service_accounts', { parentAccountId }),
+  createServiceAccount: (parentAccountId: string, loginSuffix: string, displayName: string, mobile: string, password: string) => invoke<Account>('create_service_account', { parentAccountId, loginSuffix, displayName, mobile, password }),
+  loginServiceAccount: (accountId: string, password?: string) => invoke<{ status: string; message: string }>('login_service_account', { accountId, password }),
+  sendServiceLoginSms: (accountId: string, mobile?: string) => invoke<{ mobile: string }>('send_service_login_sms', { accountId, mobile }),
+  submitServiceLoginSms: (accountId: string, code: string) => invoke<{ status: string; message: string }>('submit_service_login_sms', { accountId, code }),
   products: (accountId?: string) => invoke<Product[]>('list_products', { accountId }),
   orders: (accountId?: string) => invoke<Order[]>('list_orders', { accountId }),
   members: (accountId?: string) => invoke<Member[]>('list_members', { accountId }),
@@ -39,15 +46,18 @@ export const api = {
   syncAccount: (accountId: string) => invoke<SyncResult>('sync_account', { accountId }),
   syncJobs: (accountId?: string) => invoke<SyncJob[]>('list_sync_jobs', { accountId }),
   generateQrLogin: () => invoke<QrLoginStart>('generate_qr_login'),
-  checkQrLoginStatus: (sessionId: string) => invoke<QrLoginStatus>('check_qr_login_status', { sessionId }),
+  checkQrLoginStatus: (sessionId: string, expectedAccountId?: string) => invoke<QrLoginStatus>('check_qr_login_status', { sessionId, expectedAccountId }),
   chatContacts: (accountId: string) => invoke<ChatContact[]>('list_chat_contacts', { accountId }),
   customerProfile: (accountId: string, chatId: string) => invoke<CustomerProfile>('customer_profile', { accountId, chatId }),
   updateCustomerRemark: (accountId: string, chatId: string, remark: string) => invoke<string>('update_customer_remark', { accountId, chatId, remark }),
   chatUnreadTotals: () => invoke<Record<string, number>>('chat_unread_totals'),
   imStatuses: () => invoke<Record<string, string>>('get_im_statuses'),
   imVerificationState: (accountId: string) => invoke<ImVerificationState>('get_im_verification_state', { accountId }),
-  openImVerification: (accountId: string) => invoke<void>('open_im_verification', { accountId }),
-  completeImVerification: (accountId: string) => invoke<void>('complete_im_verification', { accountId }),
+  imVerificationProgress: (accountId: string) => invoke<ImVerificationProgress>('get_im_verification_progress', { accountId }),
+  openImVerification: (accountId: string, bounds: ImVerificationBounds) => invoke<'opened' | 'already_cleared'>('open_im_verification', { accountId, bounds }),
+  positionImVerification: (accountId: string, bounds: ImVerificationBounds) => invoke<void>('position_im_verification', { accountId, bounds }),
+  closeImVerification: (accountId: string) => invoke<void>('close_im_verification', { accountId }),
+  completeImVerification: (accountId: string) => invoke<'im_reconnecting' | 'service_login_ready'>('complete_im_verification', { accountId }),
   appLogs: (limit = 300) => invoke<AppLog[]>('list_app_logs', { limit }),
   startChatListener: (accountId: string) => invoke<void>('start_chat_listener', { accountId }),
   stopChatListener: (accountId: string) => invoke<void>('stop_chat_listener', { accountId }),

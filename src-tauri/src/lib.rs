@@ -5,12 +5,26 @@ use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, fs, sync::Mutex};
+use std::{collections::HashMap, fs, sync::{Arc, Mutex}};
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
 
 mod xianyu_im_local;
 mod xianyu_local;
+mod service_account;
+
+// Match the reference project's connection manager: repeated authentication
+// failures enter a cooldown instead of hammering the token endpoint and
+// producing a new risk-control challenge on every reconnect.
+const IM_AUTH_FAILURE_THRESHOLD: u32 = 5;
+// The reference scheduler gives an account a longer quiet period after
+// repeated authentication failures. This prevents a stale session from
+// opening the same risk challenge in a tight reconnect loop.
+const IM_RISK_COOLDOWN_SECS: u64 = 20 * 60;
+const IM_SHORT_CONNECTION_THRESHOLD_SECS: u64 = 30;
+const IM_SHORT_DISCONNECT_WINDOW_SECS: u64 = 5 * 60;
+const IM_SHORT_DISCONNECT_LIMIT: usize = 5;
+const IM_NETWORK_FAILURE_LIMIT: u32 = 20;
 
 struct AppState {
     db: Mutex<Connection>,
@@ -20,6 +34,24 @@ struct AppState {
     im_statuses: Mutex<HashMap<String, String>>,
     im_validation_urls: Mutex<HashMap<String, String>>,
     im_validation_cookies: Mutex<HashMap<String, String>>,
+    im_validation_embedded: Mutex<HashMap<String, bool>>,
+    im_validation_baseline_x5: Mutex<HashMap<String, String>>,
+    im_validation_attempted_x5: Mutex<HashMap<String, String>>,
+    im_risk_cooldowns: Mutex<HashMap<String, i64>>,
+    account_sync_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    service_login_challenges: Mutex<HashMap<String, ServiceLoginChallenge>>,
+}
+
+#[derive(Clone)]
+struct ServiceLoginChallenge {
+    cookie: String,
+    verification_url: String,
+    context_token: String,
+    mobile: String,
+    password: String,
+    sms_token: String,
+    created_at: i64,
+    last_sent_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +74,36 @@ struct ImStatusEvent {
 #[serde(rename_all = "camelCase")]
 struct ImVerificationState {
     required: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImVerificationProgress {
+    window_open: bool,
+    ready: bool,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VerificationBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl VerificationBounds {
+    fn rect(self) -> Result<tauri::Rect, String> {
+        if ![self.x, self.y, self.width, self.height].iter().all(|value| value.is_finite())
+            || self.x < 0.0 || self.y < 0.0 || self.width < 100.0 || self.height < 100.0
+        {
+            return Err("验证弹窗位置或大小无效".to_owned());
+        }
+        Ok(tauri::Rect {
+            position: tauri::Position::Logical(tauri::LogicalPosition::new(self.x, self.y)),
+            size: tauri::Size::Logical(tauri::LogicalSize::new(self.width, self.height)),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +145,11 @@ fn append_app_log(app: &tauri::AppHandle, level: &str, category: &str, account_i
 }
 
 fn update_im_status(app: &tauri::AppHandle, account_id: &str, status: &str, message: &str) {
+    let message = if message.contains("__XY_IM_VALIDATION_URL__:") {
+        "闲鱼 IM 需要完成风控验证"
+    } else {
+        message
+    };
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(mut statuses) = state.im_statuses.lock() {
             statuses.insert(account_id.to_owned(), status.to_owned());
@@ -104,6 +171,42 @@ fn update_im_status(app: &tauri::AppHandle, account_id: &str, status: &str, mess
             message: message.to_owned(),
         },
     );
+}
+
+fn im_risk_cooldown_remaining(state: &AppState, account_id: &str) -> Option<u64> {
+    let now = Utc::now().timestamp();
+    let mut cooldowns = state.im_risk_cooldowns.lock().ok()?;
+    let until = *cooldowns.get(account_id)?;
+    if until <= now {
+        cooldowns.remove(account_id);
+        return None;
+    }
+    Some((until - now) as u64)
+}
+
+fn set_im_risk_cooldown(state: &AppState, account_id: &str) {
+    if let Ok(mut cooldowns) = state.im_risk_cooldowns.lock() {
+        cooldowns.insert(
+            account_id.to_owned(),
+            Utc::now().timestamp().saturating_add(IM_RISK_COOLDOWN_SECS as i64),
+        );
+    }
+}
+
+fn clear_im_risk_cooldown(state: &AppState, account_id: &str) {
+    if let Ok(mut cooldowns) = state.im_risk_cooldowns.lock() {
+        cooldowns.remove(account_id);
+    }
+}
+
+fn account_sync_lock(state: &AppState, account_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    if let Ok(mut locks) = state.account_sync_locks.lock() {
+        return locks
+            .entry(account_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+    }
+    Arc::new(tokio::sync::Mutex::new(()))
 }
 
 /// Removes a listener that has terminated permanently.  Keeping its completed
@@ -147,6 +250,37 @@ fn session_cookie_entries(cookie: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+fn im_x5sec_cookie(cookie: &str) -> String {
+    session_cookie_entries(cookie)
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x5sec"))
+        .map(|(_, value)| value)
+        .unwrap_or_default()
+}
+
+fn is_im_punish_url(url: &str) -> bool {
+    let url = url.to_ascii_lowercase();
+    ["punish", "x5step=2", "action=captcha", "purecaptcha", "/captcha"]
+        .iter()
+        .any(|marker| url.contains(marker))
+}
+
+fn is_im_risk_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "fail_sys_user_validate",
+        "rgv587",
+        "fail_sys_illegal_access",
+        "哎哟喂",
+        "挤爆",
+        "punish",
+        "captcha",
+        "validate",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 fn verification_cookie_domains(target_host: &str) -> Vec<String> {
     let target_host = target_host.trim_start_matches('.').to_ascii_lowercase();
     let mut domains = vec![target_host.clone()];
@@ -181,6 +315,10 @@ struct Account {
     conversation_name: String,
     avatar_url: String,
     member_name: String,
+    parent_account_id: String,
+    service_login_name: String,
+    service_role: String,
+    service_mobile: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -247,6 +385,16 @@ struct Order {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct MemberAccount {
+    account_id: String,
+    display_name: String,
+    shop_name: String,
+    avatar_url: String,
+    chat_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Member {
     id: String,
     account_id: String,
@@ -269,6 +417,7 @@ struct Member {
     created_at: String,
     updated_at: String,
     last_synced_at: String,
+    related_accounts: Vec<MemberAccount>,
 }
 
 #[derive(Debug, Serialize)]
@@ -376,6 +525,7 @@ struct SyncResult {
     products_changed: usize,
     orders_changed: usize,
     source_connected: bool,
+    profile_warning: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -426,6 +576,7 @@ struct QrLoginStatus {
     account_id: String,
     display_name: String,
     is_new_account: bool,
+    profile_warning: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -522,8 +673,52 @@ fn mask_address(value: &str) -> String {
     format!("{}******{}", chars.iter().take(4).collect::<String>(), chars.iter().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect::<String>())
 }
 
+fn normalize_phone(value: &str) -> String {
+    let digits: String = value.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    if digits.len() > 11 && digits.starts_with("86") {
+        digits[digits.len() - 11..].to_owned()
+    } else {
+        digits
+    }
+}
+
+fn is_paid_member_order(status_code: &str, status: &str) -> bool {
+    let code = status_code.trim().to_ascii_uppercase();
+    if matches!(code.as_str(), "WAIT_SHIP" | "WAIT_SELLER_SEND_GOODS" | "WAIT_SEND_GOODS" | "WAIT_DELIVERY" | "PAID" | "SHIPPED" | "WAIT_BUYER_CONFIRM_GOODS" | "WAIT_BUYER_CONFIRM_RECEIVE" | "WAIT_RECEIVE" | "SUCCESS" | "TRADE_SUCCESS" | "WAIT_SELLER_RATE" | "COMPLETED" | "REFUNDING" | "REFUND" | "IN_REFUND" | "REFUND_SUCCESS" | "REFUNDED") {
+        return true;
+    }
+    matches!(status.trim(), "待发货" | "待收货" | "已发货" | "已付款" | "退款中" | "退款成功" | "已退款" | "交易成功" | "已完成")
+}
+
+fn recompute_member_stats(conn: &Connection, member_id: &str) -> Result<(), String> {
+    let (order_count, paid_count, total, first_order_at, last_order_at, last_status): (i64, i64, f64, String, String, String) = conn.query_row(
+        "SELECT COUNT(*), COUNT(*), COALESCE(SUM(MAX(o.amount - o.refund_amount, 0)), 0), COALESCE(MIN(o.created_at), ''), COALESCE(MAX(o.created_at), ''), COALESCE((SELECT o2.status FROM member_order_links l2 JOIN orders o2 ON o2.id = l2.order_id WHERE l2.member_id = ?1 ORDER BY o2.created_at DESC LIMIT 1), '') FROM member_order_links l JOIN orders o ON o.id = l.order_id WHERE l.member_id = ?1",
+        [member_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?),),
+    ).map_err(to_error)?;
+    conn.execute(
+        "UPDATE members SET first_order_at = ?1, last_order_at = ?2, order_count = ?3, paid_order_count = ?4, total_spend = ?5, average_order_value = CASE WHEN ?4 > 0 THEN ?5 / ?4 ELSE 0 END, last_order_status = ?6, updated_at = ?7 WHERE id = ?8",
+        params![first_order_at, last_order_at, order_count, paid_count, total, last_status, Utc::now().to_rfc3339(), member_id],
+    ).map_err(to_error)?;
+    Ok(())
+}
+
+fn member_related_accounts(conn: &Connection, member_id: &str) -> Result<Vec<MemberAccount>, String> {
+    let mut statement = conn.prepare(
+        "SELECT o.account_id, COALESCE(NULLIF(p.nickname, ''), a.display_name), a.display_name, COALESCE(p.avatar_url, ''), COALESCE((SELECT c.chat_id FROM chat_contacts c WHERE c.account_id = o.account_id AND (c.other_user_id = o.buyer_id OR c.chat_id = o.buyer_id) ORDER BY c.latest_message_time DESC LIMIT 1), o.buyer_id) FROM member_order_links l JOIN orders o ON o.id = l.order_id JOIN accounts a ON a.id = o.account_id LEFT JOIN account_profiles p ON p.account_id = o.account_id WHERE l.member_id = ?1 AND (UPPER(o.status_code) IN ('WAIT_SHIP','WAIT_SELLER_SEND_GOODS','WAIT_SEND_GOODS','WAIT_DELIVERY','PAID','SHIPPED','WAIT_BUYER_CONFIRM_GOODS','WAIT_BUYER_CONFIRM_RECEIVE','WAIT_RECEIVE','SUCCESS','TRADE_SUCCESS','WAIT_SELLER_RATE','COMPLETED','REFUNDING','REFUND','IN_REFUND','REFUND_SUCCESS','REFUNDED') OR o.status IN ('待发货','待收货','已发货','已付款','退款中','退款成功','已退款','交易成功','已完成')) GROUP BY o.account_id, p.nickname, a.display_name, p.avatar_url, o.buyer_id ORDER BY MAX(o.created_at) DESC",
+    ).map_err(to_error)?;
+    let rows = statement.query_map([member_id], |row| Ok(MemberAccount {
+        account_id: row.get(0)?,
+        display_name: row.get(1)?,
+        shop_name: row.get(2)?,
+        avatar_url: row.get(3)?,
+        chat_id: row.get(4)?,
+    })).map_err(to_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
+}
+
 fn member_load(conn: &Connection, id: &str, secret_key: &[u8; 32], reveal: bool) -> Result<Member, String> {
-    conn.query_row(
+    let member = conn.query_row(
         "SELECT id, account_id, buyer_id, display_name, phone_ciphertext, address_ciphertext, first_order_at, last_order_at, order_count, paid_order_count, total_spend, average_order_value, last_order_status, remark, tags, status, created_at, updated_at, last_synced_at FROM members WHERE id = ?1",
         [id],
         |row| {
@@ -541,37 +736,48 @@ fn member_load(conn: &Connection, id: &str, secret_key: &[u8; 32], reveal: bool)
                 first_order_at: row.get(6)?, last_order_at: row.get(7)?, order_count: row.get(8)?, paid_order_count: row.get(9)?,
                 total_spend: row.get(10)?, average_order_value: row.get(11)?, last_order_status: row.get(12)?, remark: row.get(13)?, tags,
                 status: row.get(15)?, created_at: row.get(16)?, updated_at: row.get(17)?, last_synced_at: row.get(18)?,
+                related_accounts: Vec::new(),
             })
         },
-    ).map_err(to_error)
+    ).map_err(to_error)?;
+    let mut member = member;
+    member.related_accounts = member_related_accounts(conn, id)?;
+    Ok(member)
 }
 
 fn sync_member_from_order(conn: &Connection, secret_key: &[u8; 32], account_id: &str, order_id: &str, order: &Value, display_name: &str, status: &str, created_at: &str) -> Result<(), String> {
     let buyer_id = value_string(order, &["buyer_id", "buyerId", "buyer_user_id", "user_id", "userId"]);
-    let phone = nested_value(order, &["receiver_mobile", "receiverMobile", "mobile", "phone", "buyer_phone", "buyerPhone", "tel"]);
+    let phone = normalize_phone(&nested_value(order, &["receiver_mobile", "receiverMobile", "mobile", "phone", "buyer_phone", "buyerPhone", "tel"]));
     let address = nested_value(order, &["receiver_address", "receiverAddress", "address", "buyer_address", "buyerAddress", "delivery_address"]);
     let name = first_nonempty(nested_value(order, &["receiver_name", "receiverName", "consignee", "receiver", "buyer_name", "buyerName"]), display_name.to_owned());
-    if buyer_id.is_empty() && phone.is_empty() && (name.is_empty() || address.is_empty()) { return Ok(()); }
+    if !is_paid_member_order(&value_string(order, &["status_code", "statusCode", "order_status_code"]), status) {
+        let member_ids = {
+            let mut statement = conn.prepare("SELECT member_id FROM member_order_links WHERE order_id = ?1").map_err(to_error)?;
+            let rows = statement.query_map([order_id], |row| row.get::<_, String>(0)).map_err(to_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+        };
+        conn.execute("DELETE FROM member_order_links WHERE order_id = ?1", [order_id]).map_err(to_error)?;
+        for member_id in member_ids { recompute_member_stats(conn, &member_id)?; }
+        return Ok(());
+    }
+    // A membership record is created only after a successful/paid order and a
+    // normalized phone number is available. The phone is the cross-shop key.
+    if phone.is_empty() { return Ok(()); }
     let mut found: Option<(String, String, String)> = None;
-    let mut stmt = conn.prepare("SELECT id, phone_ciphertext, address_ciphertext FROM members WHERE account_id = ?1 AND status <> '隐藏'").map_err(to_error)?;
-    let candidates = stmt.query_map([account_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).map_err(to_error)?;
+    let mut stmt = conn.prepare("SELECT id, phone_ciphertext, address_ciphertext FROM members WHERE status <> '隐藏'").map_err(to_error)?;
+    let candidates = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).map_err(to_error)?;
     for candidate in candidates.flatten() {
-        let (id, saved_phone, saved_address) = candidate;
-        let phone_match = !phone.is_empty() && decrypt_secret(secret_key, &saved_phone).unwrap_or_default() == phone;
-        let address_match = !name.is_empty() && !address.is_empty() && decrypt_secret(secret_key, &saved_address).unwrap_or_default() == address;
-        let id_match = !buyer_id.is_empty() && conn.query_row("SELECT buyer_id FROM members WHERE id = ?1", [&id], |row| row.get::<_, String>(0)).unwrap_or_default() == buyer_id;
-        if id_match { found = Some((id, "buyer_id".to_owned(), saved_phone)); break; }
+        let (id, saved_phone, _saved_address) = candidate;
+        let phone_match = normalize_phone(&decrypt_secret(secret_key, &saved_phone).unwrap_or_default()) == phone;
         if phone_match { found = Some((id, "phone".to_owned(), saved_phone)); break; }
-        if address_match { found = Some((id, "name_address".to_owned(), saved_phone)); break; }
     }
     let now = Utc::now().to_rfc3339();
-    let (member_id, matched_by, existing_phone) = found.unwrap_or_else(|| (Uuid::new_v4().to_string(), if !buyer_id.is_empty() { "buyer_id".to_owned() } else if !phone.is_empty() { "phone".to_owned() } else { "name_address".to_owned() }, String::new()));
+    let (member_id, matched_by, existing_phone) = found.unwrap_or_else(|| (Uuid::new_v4().to_string(), "phone".to_owned(), String::new()));
     let phone_cipher = if phone.is_empty() { existing_phone } else { encrypt_secret(secret_key, &phone)? };
     let address_cipher = if address.is_empty() { String::new() } else { encrypt_secret(secret_key, &address)? };
     conn.execute("INSERT INTO members (id, account_id, buyer_id, display_name, phone_ciphertext, address_ciphertext, first_order_at, last_order_at, last_order_status, created_at, updated_at, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?9, ?9) ON CONFLICT(id) DO UPDATE SET buyer_id = CASE WHEN excluded.buyer_id <> '' THEN excluded.buyer_id ELSE members.buyer_id END, display_name = CASE WHEN excluded.display_name <> '' THEN excluded.display_name ELSE members.display_name END, phone_ciphertext = CASE WHEN excluded.phone_ciphertext <> '' THEN excluded.phone_ciphertext ELSE members.phone_ciphertext END, address_ciphertext = CASE WHEN excluded.address_ciphertext <> '' THEN excluded.address_ciphertext ELSE members.address_ciphertext END, last_order_at = CASE WHEN excluded.last_order_at > members.last_order_at THEN excluded.last_order_at ELSE members.last_order_at END, last_order_status = excluded.last_order_status, updated_at = excluded.updated_at, last_synced_at = excluded.last_synced_at", params![member_id, account_id, buyer_id, name, phone_cipher, address_cipher, created_at, status, now]).map_err(to_error)?;
     conn.execute("INSERT OR IGNORE INTO member_order_links (member_id, order_id, matched_by, created_at) VALUES (?1, ?2, ?3, ?4)", params![member_id, order_id, matched_by, now]).map_err(to_error)?;
-    let (order_count, paid_count, total): (i64, i64, f64) = conn.query_row("SELECT COUNT(*), SUM(CASE WHEN o.status NOT IN ('待付款','待支付','交易关闭','已关闭','退款关闭','已取消') THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN o.status NOT IN ('待付款','待支付','交易关闭','已关闭','退款关闭','已取消') THEN MAX(o.amount - o.refund_amount, 0) ELSE 0 END), 0) FROM member_order_links l JOIN orders o ON o.id = l.order_id WHERE l.member_id = ?1", [&member_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(to_error)?;
-    conn.execute("UPDATE members SET order_count = ?1, paid_order_count = ?2, total_spend = ?3, average_order_value = CASE WHEN ?2 > 0 THEN ?3 / ?2 ELSE 0 END WHERE id = ?4", params![order_count, paid_count, total, member_id]).map_err(to_error)?;
+    recompute_member_stats(conn, &member_id)?;
     Ok(())
 }
 
@@ -644,16 +850,32 @@ async fn fetch_account_profile(cookie: &str) -> Result<AccountProfile, String> {
         .pointer("/data/data/base")
         .or_else(|| body.pointer("/data/base"))
         .unwrap_or(&body);
-    let profile = AccountProfile {
-        nickname: nested_value(base, &["displayName"]),
-        member_name: nested_value(base, &["displayNick", "nick", "nickname"]),
-        avatar_url: nested_value(base, &["avatar", "avatarUrl", "logo"]).replace("http://", "https://"),
-        cookie: renewed_cookie,
-    };
-    if profile.nickname.is_empty() {
-        return Err("闲鱼会员资料未返回账号名称".to_owned());
+    let member_name = nested_value(base, &["displayNick", "memberName", "member_name", "nick", "nickname"]);
+    let nickname = first_nonempty(
+        nested_value(base, &["displayName", "display_name", "nickName", "nickname", "nick"]),
+        member_name.clone(),
+    );
+    let avatar_url = nested_value(base, &["avatar", "avatarUrl", "avatarURL", "avatar_url", "headPic", "headPicUrl", "logo"])
+        .replace("http://", "https://");
+    if nickname.is_empty() && member_name.is_empty() && avatar_url.is_empty() {
+        return Err("闲鱼会员资料接口成功响应，但未返回昵称、会员名或头像".to_owned());
     }
-    Ok(profile)
+    Ok(AccountProfile {
+        nickname,
+        member_name,
+        avatar_url,
+        cookie: renewed_cookie,
+    })
+}
+
+fn account_profile_error_summary(error: &str) -> String {
+    if xianyu_local::im_validation_url(error).is_some() {
+        return "闲鱼资料接口触发安全验证，验证链接已省略；本次登录和同步仍会继续。".to_owned();
+    }
+    if let Some((code, _)) = error.split_once("::") {
+        return format!("闲鱼资料接口返回错误：{}", code.chars().take(160).collect::<String>());
+    }
+    error.chars().take(300).collect()
 }
 
 fn save_account_profile(
@@ -913,12 +1135,12 @@ fn count_for(conn: &Connection, table: &str, account_id: &str) -> rusqlite::Resu
 
 fn get_account(conn: &Connection, account_id: &str) -> rusqlite::Result<Account> {
     let account = conn.query_row(
-        "SELECT a.id, a.display_name, a.alias, a.platform, a.status, a.last_sync_at, COALESCE(s.source_url, ''), COALESCE(s.remote_account_id, ''), COALESCE(p.avatar_url, ''), COALESCE(p.member_name, '') FROM accounts a LEFT JOIN account_sources s ON s.account_id = a.id LEFT JOIN account_profiles p ON p.account_id = a.id WHERE a.id = ?1",
+        "SELECT a.id, a.display_name, a.alias, a.platform, a.status, a.last_sync_at, COALESCE(s.source_url, ''), COALESCE(s.remote_account_id, ''), COALESCE(p.avatar_url, ''), COALESCE(p.member_name, ''), COALESCE(sa.parent_account_id, ''), COALESCE(sa.login_name, ''), COALESCE(sa.role, ''), COALESCE(sa.mobile_display, '') FROM accounts a LEFT JOIN account_sources s ON s.account_id = a.id LEFT JOIN account_profiles p ON p.account_id = a.id LEFT JOIN service_accounts sa ON sa.account_id = a.id WHERE a.id = ?1",
         [account_id],
         |row| {
             Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?, row.get::<_, String>(9)?,
+                row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?, row.get::<_, String>(9)?, row.get::<_, String>(10)?, row.get::<_, String>(11)?, row.get::<_, String>(12)?, row.get::<_, String>(13)?,
             ))
         },
     )?;
@@ -943,6 +1165,10 @@ fn get_account(conn: &Connection, account_id: &str) -> rusqlite::Result<Account>
         conversation_name,
         avatar_url: account.8,
         member_name: account.9,
+        parent_account_id: account.10,
+        service_login_name: account.11,
+        service_role: account.12,
+        service_mobile: account.13,
     })
 }
 
@@ -995,6 +1221,18 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS account_credentials (
           account_id TEXT PRIMARY KEY, cookie TEXT NOT NULL, updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS service_accounts (
+          account_id TEXT PRIMARY KEY, parent_account_id TEXT NOT NULL,
+          login_name TEXT NOT NULL, role TEXT NOT NULL DEFAULT '管理员',
+          platform_sub_id TEXT NOT NULL DEFAULT '',
+          mobile_cipher TEXT NOT NULL DEFAULT '', mobile_display TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          UNIQUE(parent_account_id, login_name)
+        );
+        CREATE TABLE IF NOT EXISTS service_passwords (
+          account_id TEXT PRIMARY KEY, encrypted_password TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_service_accounts_parent ON service_accounts(parent_account_id);
         CREATE TABLE IF NOT EXISTS account_profiles (
           account_id TEXT PRIMARY KEY, nickname TEXT NOT NULL DEFAULT '', member_name TEXT NOT NULL DEFAULT '',
           avatar_url TEXT NOT NULL DEFAULT '', avatar_source TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
@@ -1009,6 +1247,7 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
           latest_message TEXT NOT NULL, latest_message_time TEXT NOT NULL, unread_count INTEGER NOT NULL,
           PRIMARY KEY (account_id, chat_id)
         );
+        CREATE INDEX IF NOT EXISTS idx_chat_contacts_account_latest ON chat_contacts(account_id, latest_message_time DESC);
         CREATE TABLE IF NOT EXISTS customer_remarks (
           account_id TEXT NOT NULL, chat_id TEXT NOT NULL, remark TEXT NOT NULL DEFAULT '',
           updated_at TEXT NOT NULL, PRIMARY KEY (account_id, chat_id)
@@ -1081,6 +1320,9 @@ fn initialize_database(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE orders ADD COLUMN item_image_url TEXT NOT NULL DEFAULT ''",
         [],
     );
+    let _ = conn.execute("ALTER TABLE service_accounts ADD COLUMN platform_sub_id TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE service_accounts ADD COLUMN mobile_cipher TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE service_accounts ADD COLUMN mobile_display TEXT NOT NULL DEFAULT ''", []);
     let _ = conn.execute(
         "ALTER TABLE orders ADD COLUMN status_code TEXT NOT NULL DEFAULT ''",
         [],
@@ -1233,6 +1475,336 @@ fn list_accounts(state: tauri::State<'_, AppState>) -> Result<Vec<Account>, Stri
 }
 
 #[tauri::command]
+async fn sync_service_accounts(
+    parent_account_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Account>, String> {
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        let parent = get_account(&conn, &parent_account_id).map_err(to_error)?;
+        if !parent.parent_account_id.is_empty() || parent.remote_account_id.is_empty() {
+            return Err("请先登录店铺主账号".to_owned());
+        }
+        local_session(&conn, &parent_account_id, &state.secret_key)?
+    };
+    let (remote_accounts, renewed_cookie) = service_account::list(&cookie).await?;
+    let mut conn = state.db.lock().map_err(to_error)?;
+    save_renewed_session(&conn, &parent_account_id, &renewed_cookie, &state.secret_key)?;
+    let transaction = conn.transaction().map_err(to_error)?;
+    let now = Utc::now().to_rfc3339();
+    let stale_ids = {
+        let mut statement = transaction
+            .prepare("SELECT account_id, login_name, platform_sub_id FROM service_accounts WHERE parent_account_id = ?1")
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([&parent_account_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(to_error)?;
+        rows.filter_map(|row| row.ok())
+            .filter(|(_, login_name, platform_sub_id)| {
+                !remote_accounts.iter().any(|remote| {
+                    (!login_name.is_empty() && remote.login_name == *login_name)
+                        || (!platform_sub_id.is_empty()
+                            && !remote.platform_sub_id.is_empty()
+                            && remote.platform_sub_id == *platform_sub_id)
+                })
+            })
+            .map(|(account_id, _, _)| account_id)
+            .collect::<Vec<_>>()
+    };
+    for account_id in &stale_ids {
+        // Stop a deleted remote客服 before removing its local rows, otherwise
+        // its listener could reconnect using a record that no longer exists.
+        stop_chat_listener_state(&state, account_id)?;
+        delete_account_data(&transaction, account_id)?;
+    }
+    let mut ids = Vec::new();
+    for remote in remote_accounts {
+        let account_id = transaction.query_row(
+            "SELECT account_id FROM service_accounts WHERE parent_account_id = ?1 AND (login_name = ?2 OR (platform_sub_id <> '' AND platform_sub_id = ?3)) LIMIT 1",
+            params![parent_account_id, remote.login_name, remote.platform_sub_id],
+            |row| row.get::<_, String>(0),
+        ).unwrap_or_else(|_| Uuid::new_v4().to_string());
+        let name = if remote.display_name.is_empty() { remote.login_name.as_str() } else { remote.display_name.as_str() };
+        transaction.execute(
+            "INSERT INTO accounts (id, display_name, alias, platform, status, last_sync_at) VALUES (?1, ?2, '客服子账号', '闲鱼', '授权有效', ?3) ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name, last_sync_at = excluded.last_sync_at",
+            params![account_id, name, now],
+        ).map_err(to_error)?;
+        let mobile_cipher = if remote.mobile.len() == 11 && remote.mobile.chars().all(|ch| ch.is_ascii_digit()) {
+            encrypt_secret(&state.secret_key, &remote.mobile)?
+        } else { String::new() };
+        let mobile_display = if mobile_cipher.is_empty() { remote.mobile.clone() } else { mask_phone(&remote.mobile) };
+        transaction.execute(
+            "INSERT INTO service_accounts (account_id, parent_account_id, login_name, role, platform_sub_id, mobile_cipher, mobile_display, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(account_id) DO UPDATE SET login_name = excluded.login_name, role = CASE WHEN excluded.role <> '' THEN excluded.role ELSE service_accounts.role END, platform_sub_id = CASE WHEN excluded.platform_sub_id <> '' THEN excluded.platform_sub_id ELSE service_accounts.platform_sub_id END, mobile_cipher = CASE WHEN excluded.mobile_cipher <> '' THEN excluded.mobile_cipher ELSE service_accounts.mobile_cipher END, mobile_display = CASE WHEN excluded.mobile_display <> '' THEN excluded.mobile_display ELSE service_accounts.mobile_display END",
+            params![account_id, parent_account_id, remote.login_name, remote.role, remote.platform_sub_id, mobile_cipher, mobile_display, now],
+        ).map_err(to_error)?;
+        ids.push(account_id);
+    }
+    transaction.commit().map_err(to_error)?;
+    ids.into_iter().map(|id| get_account(&conn, &id).map_err(to_error)).collect()
+}
+
+#[tauri::command]
+async fn create_service_account(
+    parent_account_id: String,
+    login_suffix: String,
+    display_name: String,
+    mobile: String,
+    password: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Account, String> {
+    let suffix = login_suffix.trim();
+    if suffix.is_empty() || suffix.chars().count() > 10
+        || !suffix.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err("客服登录名后缀须为 1–10 位字母、数字或下划线".to_owned());
+    }
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        return Err("请填写客服姓名或展示名称".to_owned());
+    }
+    if display_name.chars().count() > 15 { return Err("客服姓名最多 15 个字符".to_owned()); }
+    if mobile.len() != 11 || !mobile.starts_with('1') || !mobile.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("请填写有效的 11 位手机号".to_owned());
+    }
+    if !(8..=15).contains(&password.len()) || !password.chars().all(|ch| ch.is_ascii_alphanumeric())
+        || !password.chars().any(|ch| ch.is_ascii_alphabetic())
+        || !password.chars().any(|ch| ch.is_ascii_digit()) {
+        return Err("密码须为 8–15 位字母和数字组合".to_owned());
+    }
+    let cookie = {
+        let conn = state.db.lock().map_err(to_error)?;
+        let parent = get_account(&conn, &parent_account_id).map_err(to_error)?;
+        if !parent.parent_account_id.is_empty() || parent.remote_account_id.is_empty() {
+            return Err("请先完成店铺主账号扫码登录".to_owned());
+        }
+        local_session(&conn, &parent_account_id, &state.secret_key)?
+    };
+    let (login_name, renewed_cookie) = service_account::register(&cookie, suffix, display_name, mobile.trim(), &password).await?;
+    let conn = state.db.lock().map_err(to_error)?;
+    save_renewed_session(&conn, &parent_account_id, &renewed_cookie, &state.secret_key)?;
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let encrypted_mobile = encrypt_secret(&state.secret_key, mobile.trim())?;
+    let mobile_display = mask_phone(mobile.trim());
+    conn.execute(
+        "INSERT INTO accounts (id, display_name, alias, platform, status, last_sync_at) VALUES (?1, ?2, '客服子账号', '闲鱼', '授权有效', ?3)",
+        params![id, display_name, now],
+    ).map_err(to_error)?;
+    if let Err(error) = conn.execute(
+        "INSERT INTO service_accounts (account_id, parent_account_id, login_name, role, mobile_cipher, mobile_display, created_at) VALUES (?1, ?2, ?3, '管理员', ?4, ?5, ?6)",
+        params![id, parent_account_id, login_name, encrypted_mobile, mobile_display, now],
+    ) {
+        let _ = conn.execute("DELETE FROM accounts WHERE id = ?1", [&id]);
+        return Err(if error.to_string().contains("UNIQUE") {
+            "该店铺已添加此客服登录名".to_owned()
+        } else {
+            error.to_string()
+        });
+    }
+    let encrypted_password = encrypt_secret(&state.secret_key, &password)?;
+    conn.execute(
+        "INSERT INTO service_passwords (account_id, encrypted_password, updated_at) VALUES (?1, ?2, ?3)",
+        params![id, encrypted_password, now],
+    ).map_err(to_error)?;
+    get_account(&conn, &id).map_err(to_error)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceLoginStatus { status: String, message: String }
+
+#[tauri::command]
+async fn login_service_account(
+    account_id: String,
+    password: Option<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceLoginStatus, String> {
+    let pending_challenge = state.service_login_challenges.lock().map_err(to_error)?.remove(&account_id);
+    let (login_name, password, parent_id, mobile, parent_cookie) = {
+        let conn = state.db.lock().map_err(to_error)?;
+        let account = get_account(&conn, &account_id).map_err(to_error)?;
+        if account.parent_account_id.is_empty() { return Err("仅客服子账号可使用密码登录".to_owned()); }
+        // 子账号不是独立的闲鱼主账号。login.do 需要带着店铺主账号
+        // 的会话，才能把客服登录关联到对应店铺；没有这个 Cookie 时，
+        // 平台会直接返回“暂不支持子账号登录”。
+        let parent_cookie = local_session(&conn, &account.parent_account_id, &state.secret_key)?;
+        let saved = conn.query_row(
+            "SELECT encrypted_password FROM service_passwords WHERE account_id = ?1", [&account_id],
+            |row| row.get::<_, String>(0)).ok();
+        let password = match password.filter(|value| !value.is_empty())
+            .or_else(|| pending_challenge.as_ref().map(|challenge| challenge.password.clone())) {
+            Some(value) => value,
+            None => decrypt_secret(&state.secret_key, &saved.ok_or("请先输入客服账号密码".to_owned())?)?,
+        };
+        let mobile_cipher = conn.query_row(
+            "SELECT mobile_cipher FROM service_accounts WHERE account_id = ?1", [&account_id],
+            |row| row.get::<_, String>(0)).unwrap_or_default();
+        let mobile = if mobile_cipher.is_empty() { String::new() }
+            else { decrypt_secret(&state.secret_key, &mobile_cipher)? };
+        (account.service_login_name, password, account.parent_account_id, mobile, parent_cookie)
+    };
+    let challenge_cookie = pending_challenge.as_ref()
+        .filter(|challenge| !challenge.verification_url.is_empty())
+        .map(|challenge| challenge.cookie.as_str());
+    let initial_cookie = challenge_cookie.or(Some(parent_cookie.as_str()));
+    let mut result = service_account::password_login(&login_name, &password, initial_cookie).await?;
+    // 账号列表返回的登录名通常是“主账号前缀:后缀”。部分登录节点
+    // 只接受后缀，但仍要求主账号 Cookie；仅在平台明确返回子账号不支持
+    // 时尝试一次，避免对普通密码错误或风控响应重复提交。
+    if result.status == "failed" && result.message.contains("暂不支持子账号登录") {
+        if let Some((_, suffix)) = login_name.rsplit_once(':') {
+            if !suffix.is_empty() && suffix != login_name {
+                result = service_account::password_login(suffix, &password, initial_cookie).await?;
+            }
+        }
+    }
+    let verification_url = if result.status == "verification_required" {
+        reqwest::Url::parse(&result.verification_url).ok()
+            .filter(is_xianyu_official_url)
+            .filter(|url| is_im_punish_url(url.as_str()))
+            .map(|url| url.to_string()).unwrap_or_default()
+    } else { String::new() };
+    if result.status == "sms_required" || !verification_url.is_empty() {
+        state.service_login_challenges.lock().map_err(to_error)?.insert(account_id.clone(), ServiceLoginChallenge {
+            cookie: result.cookie.clone(), verification_url: verification_url.clone(), context_token: result.context_token.clone(),
+            mobile, password: password.clone(), sms_token: result.sms_token.clone(), created_at: Utc::now().timestamp(), last_sent_at: if result.sms_token.is_empty() { 0 } else { Utc::now().timestamp() },
+        });
+    }
+    if !verification_url.is_empty() {
+        update_im_status(&app, &account_id, "verification_required", "客服登录需要滑块验证，请在应用弹窗完成");
+    } else if pending_challenge.as_ref().is_some_and(|challenge| !challenge.verification_url.is_empty()) {
+        update_im_status(&app, &account_id, "not_logged_in", "客服登录滑块验证已结束");
+    }
+    if result.status == "success" {
+        state.service_login_challenges.lock().map_err(to_error)?.remove(&account_id);
+        let remote_id = session_cookie_entries(&result.cookie).into_iter()
+            .find(|(name, value)| name == "unb" && !value.is_empty())
+            .map(|(_, value)| value).ok_or("登录成功，但未取得客服独立会话 Cookie".to_owned())?;
+        let conn = state.db.lock().map_err(to_error)?;
+        let parent = get_account(&conn, &parent_id).map_err(to_error)?;
+        if remote_id == parent.remote_account_id { return Err("登录返回的是主账号，请核对客服登录名".to_owned()); }
+        let encrypted_cookie = encrypt_secret(&state.secret_key, &result.cookie)?;
+        let encrypted_password = encrypt_secret(&state.secret_key, &password)?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute("INSERT INTO account_credentials (account_id, cookie, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET cookie = excluded.cookie, updated_at = excluded.updated_at", params![account_id, encrypted_cookie, now]).map_err(to_error)?;
+        conn.execute("INSERT INTO service_passwords (account_id, encrypted_password, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET encrypted_password = excluded.encrypted_password, updated_at = excluded.updated_at", params![account_id, encrypted_password, now]).map_err(to_error)?;
+        save_account_source(&conn, &account_id, "", &remote_id).map_err(to_error)?;
+    }
+    Ok(ServiceLoginStatus { status: result.status, message: result.message })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceSmsSent { mobile: String }
+
+#[tauri::command]
+async fn send_service_login_sms(
+    account_id: String,
+    mobile: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceSmsSent, String> {
+    let challenge = state.service_login_challenges.lock().map_err(to_error)?
+        .get(&account_id).cloned().ok_or("短信登录会话已失效，请重新输入密码".to_owned())?;
+    let now = Utc::now().timestamp();
+    if now - challenge.created_at > 600 { return Err("短信登录会话已过期，请重新输入密码".to_owned()); }
+    let mobile = mobile.unwrap_or_default();
+    let mobile = if mobile.trim().is_empty() { challenge.mobile } else {
+        let candidate = mobile.trim();
+        if candidate.len() != 11 || !candidate.chars().all(|ch| ch.is_ascii_digit()) {
+            return Err("请输入完整的 11 位手机号".to_owned());
+        }
+        let stored_display = {
+            let conn = state.db.lock().map_err(to_error)?;
+            get_account(&conn, &account_id).map_err(to_error)?.service_mobile
+        };
+        if !stored_display.is_empty() && stored_display.contains('*')
+            && !candidate.ends_with(&stored_display[stored_display.len().saturating_sub(4)..]) {
+            return Err("输入手机号与平台显示的客服手机号不一致".to_owned());
+        }
+        candidate.to_owned()
+    };
+    if mobile.is_empty() { return Err("平台只返回脱敏手机号，请输入完整手机号后发送验证码".to_owned()); }
+    if !challenge.sms_token.is_empty() && now - challenge.last_sent_at < 60 {
+        if let Some(current) = state.service_login_challenges.lock().map_err(to_error)?.get_mut(&account_id) {
+            current.mobile = mobile.clone();
+        }
+        return Ok(ServiceSmsSent { mobile: mask_phone(&mobile) });
+    }
+    if now - challenge.last_sent_at < 60 { return Err("验证码已发送，请 60 秒后重试".to_owned()); }
+    let (sms_token, cookie) = service_account::send_sms(&challenge.cookie, &mobile, &challenge.context_token).await?;
+    {
+        let mut challenges = state.service_login_challenges.lock().map_err(to_error)?;
+        let current = challenges.get_mut(&account_id).ok_or("短信登录会话已失效".to_owned())?;
+        current.cookie = cookie;
+        current.mobile = mobile.clone();
+        current.sms_token = sms_token;
+        current.last_sent_at = now;
+    }
+    let conn = state.db.lock().map_err(to_error)?;
+    conn.execute("UPDATE service_accounts SET mobile_cipher = ?1, mobile_display = ?2 WHERE account_id = ?3",
+        params![encrypt_secret(&state.secret_key, &mobile)?, mask_phone(&mobile), account_id]).map_err(to_error)?;
+    Ok(ServiceSmsSent { mobile: mask_phone(&mobile) })
+}
+
+#[tauri::command]
+async fn submit_service_login_sms(
+    account_id: String,
+    code: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceLoginStatus, String> {
+    if !(4..=8).contains(&code.len()) || !code.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("请输入有效的数字验证码".to_owned());
+    }
+    let challenge = state.service_login_challenges.lock().map_err(to_error)?
+        .get(&account_id).cloned().ok_or("短信登录会话已失效，请重新输入密码".to_owned())?;
+    if Utc::now().timestamp() - challenge.created_at > 600 {
+        return Err("短信登录会话已过期，请重新输入密码".to_owned());
+    }
+    if challenge.sms_token.is_empty() { return Err("请先发送验证码".to_owned()); }
+    let result = service_account::submit_sms(&challenge.cookie, &challenge.mobile,
+        &challenge.context_token, &challenge.sms_token, &code).await?;
+    let remote_id = session_cookie_entries(&result.cookie).into_iter()
+        .find(|(name, value)| name == "unb" && !value.is_empty())
+        .map(|(_, value)| value).ok_or("短信验证完成但未取得客服会话".to_owned())?;
+    let (service, parent) = {
+        let conn = state.db.lock().map_err(to_error)?;
+        let service = get_account(&conn, &account_id).map_err(to_error)?;
+        let parent = get_account(&conn, &service.parent_account_id).map_err(to_error)?;
+        (service, parent)
+    };
+    if remote_id == parent.remote_account_id || (!service.remote_account_id.is_empty() && remote_id != service.remote_account_id) {
+        return Err("短信登录返回的不是当前客服账号，已拒绝写入会话".to_owned());
+    }
+    let profile = if service.remote_account_id.is_empty() {
+        let profile = fetch_account_profile(&result.cookie).await?;
+        if result.reported_login_id != service.service_login_name
+            && profile.member_name != service.service_login_name {
+            return Err("短信登录身份与客服登录名不一致，已拒绝写入会话".to_owned());
+        }
+        Some(profile)
+    } else { None };
+    let cookie = profile.as_ref().map(|value| value.cookie.as_str()).unwrap_or(&result.cookie);
+    let conn = state.db.lock().map_err(to_error)?;
+    conn.execute("INSERT INTO account_credentials (account_id, cookie, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET cookie = excluded.cookie, updated_at = excluded.updated_at",
+        params![account_id, encrypt_secret(&state.secret_key, cookie)?, Utc::now().to_rfc3339()]).map_err(to_error)?;
+    conn.execute("INSERT INTO service_passwords (account_id, encrypted_password, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET encrypted_password = excluded.encrypted_password, updated_at = excluded.updated_at",
+        params![account_id, encrypt_secret(&state.secret_key, &challenge.password)?, Utc::now().to_rfc3339()]).map_err(to_error)?;
+    conn.execute("UPDATE service_accounts SET mobile_cipher = ?1, mobile_display = ?2 WHERE account_id = ?3",
+        params![encrypt_secret(&state.secret_key, &challenge.mobile)?, mask_phone(&challenge.mobile), account_id]).map_err(to_error)?;
+    save_account_source(&conn, &account_id, "", &remote_id).map_err(to_error)?;
+    if let Some(profile) = &profile { save_account_profile(&conn, &account_id, profile)?; }
+    state.service_login_challenges.lock().map_err(to_error)?.remove(&account_id);
+    Ok(ServiceLoginStatus { status: "success".to_owned(), message: "短信验证通过，客服已登录".to_owned() })
+}
+
+#[tauri::command]
 fn update_conversation_name(
     account_id: String,
     conversation_name: String,
@@ -1320,7 +1892,7 @@ fn read_quick_replies(conn: &Connection, account_id: &str) -> Result<Vec<QuickRe
 }
 
 #[tauri::command]
-fn list_quick_replies(account_id: String, state: tauri::State<'_, AppState>) -> Result<Vec<QuickReply>, String> {
+async fn list_quick_replies(account_id: String, state: tauri::State<'_, AppState>) -> Result<Vec<QuickReply>, String> {
     let conn = state.db.lock().map_err(to_error)?;
     ensure_account_exists(&conn, &account_id)?;
     read_quick_replies(&conn, &account_id)
@@ -1392,7 +1964,7 @@ fn list_orders(
 #[tauri::command]
 fn list_members(account_id: Option<String>, state: tauri::State<'_, AppState>) -> Result<Vec<Member>, String> {
     let conn = state.db.lock().map_err(to_error)?;
-    let mut statement = conn.prepare("SELECT m.id FROM members m JOIN accounts a ON a.id = m.account_id WHERE (?1 IS NULL OR m.account_id = ?1) ORDER BY m.last_order_at DESC, m.updated_at DESC").map_err(to_error)?;
+    let mut statement = conn.prepare("SELECT m.id FROM members m WHERE m.phone_ciphertext <> '' AND EXISTS (SELECT 1 FROM member_order_links l JOIN orders o ON o.id = l.order_id WHERE l.member_id = m.id AND (UPPER(o.status_code) IN ('WAIT_SHIP','WAIT_SELLER_SEND_GOODS','WAIT_SEND_GOODS','WAIT_DELIVERY','PAID','SHIPPED','WAIT_BUYER_CONFIRM_GOODS','WAIT_BUYER_CONFIRM_RECEIVE','WAIT_RECEIVE','SUCCESS','TRADE_SUCCESS','WAIT_SELLER_RATE','COMPLETED','REFUNDING','REFUND','IN_REFUND','REFUND_SUCCESS','REFUNDED') OR o.status IN ('待发货','待收货','已发货','已付款','退款中','退款成功','已退款','交易成功','已完成'))) AND (?1 IS NULL OR EXISTS (SELECT 1 FROM member_order_links l2 JOIN orders o2 ON o2.id = l2.order_id WHERE l2.member_id = m.id AND o2.account_id = ?1)) ORDER BY m.last_order_at DESC, m.updated_at DESC").map_err(to_error)?;
     let ids = statement.query_map([account_id], |row| row.get::<_, String>(0)).map_err(to_error)?.collect::<Result<Vec<_>, _>>().map_err(to_error)?;
     ids.iter().map(|id| member_load(&conn, id, &state.secret_key, false)).collect()
 }
@@ -1418,7 +1990,7 @@ fn update_member(id: String, remark: String, tags: Vec<String>, state: tauri::St
 #[tauri::command]
 fn member_orders(id: String, state: tauri::State<'_, AppState>) -> Result<Vec<MemberOrder>, String> {
     let conn = state.db.lock().map_err(to_error)?;
-    let mut statement = conn.prepare("SELECT o.id, o.account_id, o.order_no, o.item_id, o.item_image_url, o.product_title, o.specification, o.buyer_masked_name, o.amount, o.refund_amount, o.status_code, o.status, o.shipping_refund_status, o.created_at, o.note, l.matched_by FROM member_order_links l JOIN orders o ON o.id = l.order_id WHERE l.member_id = ?1 ORDER BY o.created_at DESC").map_err(to_error)?;
+    let mut statement = conn.prepare("SELECT o.id, o.account_id, o.order_no, o.item_id, o.item_image_url, o.product_title, o.specification, o.buyer_masked_name, o.amount, o.refund_amount, o.status_code, o.status, o.shipping_refund_status, o.created_at, o.note, l.matched_by FROM member_order_links l JOIN orders o ON o.id = l.order_id WHERE l.member_id = ?1 AND (UPPER(o.status_code) IN ('WAIT_SHIP','WAIT_SELLER_SEND_GOODS','WAIT_SEND_GOODS','WAIT_DELIVERY','PAID','SHIPPED','WAIT_BUYER_CONFIRM_GOODS','WAIT_BUYER_CONFIRM_RECEIVE','WAIT_RECEIVE','SUCCESS','TRADE_SUCCESS','WAIT_SELLER_RATE','COMPLETED','REFUNDING','REFUND','IN_REFUND','REFUND_SUCCESS','REFUNDED') OR o.status IN ('待发货','待收货','已发货','已付款','退款中','退款成功','已退款','交易成功','已完成')) ORDER BY o.created_at DESC").map_err(to_error)?;
     let rows = statement.query_map([id], |row| Ok(MemberOrder { order: Order { id: row.get(0)?, account_id: row.get(1)?, order_no: row.get(2)?, item_id: row.get(3)?, item_image_url: row.get(4)?, product_title: row.get(5)?, specification: row.get(6)?, buyer_masked_name: row.get(7)?, amount: row.get(8)?, refund_amount: row.get(9)?, status_code: row.get(10)?, status: row.get(11)?, shipping_refund_status: row.get(12)?, created_at: row.get(13)?, note: row.get(14)? }, matched_by: row.get(15)? })).map_err(to_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
 }
@@ -1677,19 +2249,70 @@ async fn generate_qr_login() -> Result<QrLoginStart, String> {
 #[tauri::command]
 async fn check_qr_login_status(
     session_id: String,
+    expected_account_id: Option<String>,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<QrLoginStatus, String> {
     if session_id.trim().is_empty() {
         return Err("二维码会话 ID 不能为空".to_owned());
     }
     let result = xianyu_local::poll_qr(session_id.trim()).await?;
+    if result.status == "success"
+        && expected_account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|expected| expected != result.account_id)
+    {
+        return Ok(QrLoginStatus {
+            success: true,
+            status: "failed".to_owned(),
+            message: "扫码账号与当前需要核验的账号不一致，请使用对应账号重新扫码。".to_owned(),
+            face_qr_url: result.verification_qr_url,
+            verification_url: result.verification_url,
+            account_id: String::new(),
+            display_name: String::new(),
+            is_new_account: false,
+            profile_warning: false,
+        });
+    }
     let mut display_name = result.account_id.clone();
     let mut is_new_account = false;
+    let mut profile_warning = false;
     if result.status == "success" && !result.account_id.is_empty() && !result.cookie.is_empty() {
         // The profile endpoint is the source of truth for the logged-in
         // account's nickname and avatar. A profile failure must not invalidate
         // an otherwise successful QR login, so retain the cookie either way.
-        let profile = fetch_account_profile(&result.cookie).await.ok();
+        let profile_cookie = xianyu_local::warm_mtop_session(&result.cookie)
+            .await
+            .unwrap_or_else(|_| result.cookie.clone());
+        let profile = match fetch_account_profile(&profile_cookie).await {
+            Ok(profile) => Some(profile),
+            Err(first_error) => {
+                // QR confirmation and the MTop session cookie are delivered
+                // by separate responses. Give the freshly logged-in session
+                // one short retry window before declaring the profile missing.
+                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                match fetch_account_profile(&profile_cookie).await {
+                    Ok(profile) => Some(profile),
+                    Err(error) => {
+                        profile_warning = true;
+                        append_app_log(
+                            &app,
+                            "warn",
+                            "账号资料",
+                            &result.account_id,
+                            &format!(
+                                "{}（首次请求：{}）",
+                                account_profile_error_summary(&error),
+                                account_profile_error_summary(&first_error),
+                            ),
+                        );
+                        None
+                    }
+                }
+            }
+        };
         let conn = state.db.lock().map_err(to_error)?;
         let existing = conn
             .query_row(
@@ -1712,9 +2335,25 @@ async fn check_qr_login_status(
             .as_ref()
             .filter(|profile| !profile.cookie.is_empty())
             .map(|profile| profile.cookie.as_str())
-            .unwrap_or(&result.cookie);
+            .unwrap_or(&profile_cookie);
         let encrypted_cookie = encrypt_secret(&state.secret_key, latest_cookie)?;
         conn.execute("INSERT INTO account_credentials (account_id, cookie, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET cookie = excluded.cookie, updated_at = excluded.updated_at", params![local_id, encrypted_cookie, Utc::now().to_rfc3339()]).map_err(to_error)?;
+        // A fresh QR/face login creates a new authorization context. Discard
+        // any token issued for the previous Cookie before the UI restarts IM.
+        xianyu_im_local::invalidate_im_token_for_cookie(latest_cookie);
+        xianyu_im_local::mark_qr_cookie_refresh(latest_cookie);
+        if let Ok(mut urls) = state.im_validation_urls.lock() {
+            urls.remove(&local_id);
+        }
+        if let Ok(mut cookies) = state.im_validation_cookies.lock() {
+            cookies.remove(&local_id);
+        }
+        if let Ok(mut attempted) = state.im_validation_attempted_x5.lock() {
+            attempted.remove(&local_id);
+        }
+        if let Ok(mut baseline) = state.im_validation_baseline_x5.lock() {
+            baseline.remove(&local_id);
+        }
         if let Some(profile) = profile.as_ref() {
             save_account_profile(&conn, &local_id, profile)?;
         }
@@ -1731,6 +2370,7 @@ async fn check_qr_login_status(
         account_id: result.account_id,
         display_name,
         is_new_account,
+        profile_warning,
     })
 }
 
@@ -1777,66 +2417,103 @@ fn update_account(
 #[tauri::command]
 fn delete_account(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let mut conn = state.db.lock().map_err(to_error)?;
+    let child_ids = {
+        let mut statement = conn
+            .prepare("SELECT account_id FROM service_accounts WHERE parent_account_id = ?1")
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([&id], |row| row.get::<_, String>(0))
+            .map_err(to_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_error)?;
+        rows
+    };
+    for child_id in child_ids {
+        stop_chat_listener_state(&state, &child_id)?;
+    }
+    stop_chat_listener_state(&state, &id)?;
     delete_account_records(&mut conn, &id)
+}
+
+fn delete_account_data(transaction: &rusqlite::Transaction<'_>, id: &str) -> Result<(), String> {
+    transaction
+        .execute("DELETE FROM service_accounts WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM service_passwords WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM products WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM orders WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM member_order_links WHERE member_id IN (SELECT id FROM members WHERE account_id = ?1)", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM member_audit_logs WHERE member_id IN (SELECT id FROM members WHERE account_id = ?1)", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM members WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM sync_jobs WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM chat_messages WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM customer_remarks WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM chat_emojis WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM chat_contacts WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM chat_read_state WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM conversation_preferences WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM account_credentials WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    transaction
+        .execute("DELETE FROM account_sources WHERE account_id = ?1", [id])
+        .map_err(to_error)?;
+    let deleted = transaction
+        .execute("DELETE FROM accounts WHERE id = ?1", [id])
+        .map_err(to_error)?;
+    if deleted != 1 {
+        return Err("账号删除失败，请刷新账号列表后重试".to_owned());
+    }
+    Ok(())
 }
 
 fn delete_account_records(conn: &mut Connection, id: &str) -> Result<(), String> {
     ensure_account_exists(&conn, &id)?;
     let transaction = conn.transaction().map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM products WHERE account_id = ?1", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM orders WHERE account_id = ?1", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM member_order_links WHERE member_id IN (SELECT id FROM members WHERE account_id = ?1)", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM member_audit_logs WHERE member_id IN (SELECT id FROM members WHERE account_id = ?1)", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM members WHERE account_id = ?1", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM sync_jobs WHERE account_id = ?1", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM chat_messages WHERE account_id = ?1", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM customer_remarks WHERE account_id = ?1", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM chat_emojis WHERE account_id = ?1", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM chat_contacts WHERE account_id = ?1", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM chat_read_state WHERE account_id = ?1", [&id])
-        .map_err(to_error)?;
-    transaction
-        .execute(
-            "DELETE FROM conversation_preferences WHERE account_id = ?1",
-            [&id],
-        )
-        .map_err(to_error)?;
-    transaction
-        .execute(
-            "DELETE FROM account_credentials WHERE account_id = ?1",
-            [&id],
-        )
-        .map_err(to_error)?;
-    transaction
-        .execute("DELETE FROM account_sources WHERE account_id = ?1", [&id])
-        .map_err(to_error)?;
-    let deleted = transaction
-        .execute("DELETE FROM accounts WHERE id = ?1", [&id])
-        .map_err(to_error)?;
-    if deleted != 1 {
-        return Err("账号删除失败，请刷新账号列表后重试".to_owned());
+    let child_ids = {
+        let mut statement = transaction
+            .prepare("SELECT account_id FROM service_accounts WHERE parent_account_id = ?1")
+            .map_err(to_error)?;
+        let children = statement
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(to_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_error)?;
+        children
+    };
+    // A child removed from the official seller console is already orphaned
+    // locally. Remove those records together with the parent instead of
+    // blocking the parent deletion on stale local rows.
+    for child_id in child_ids {
+        delete_account_data(&transaction, &child_id)?;
     }
+    delete_account_data(&transaction, &id)?;
     transaction.commit().map_err(to_error)?;
     Ok(())
 }
@@ -1911,13 +2588,12 @@ async fn open_product_detail(
         .title("闲鱼宝贝详情")
         .inner_size(390.0, 780.0)
         .min_inner_size(390.0, 780.0)
-        .max_inner_size(390.0, 780.0)
-        .center()
-        .resizable(false)
-        .maximizable(false)
-        .focused(true)
-        .user_agent("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1")
-        .build()
+    .max_inner_size(390.0, 780.0)
+    .center()
+    .resizable(false)
+    .maximizable(false)
+    .focused(true)
+    .build()
         .map_err(to_error)?;
     for (name, value) in cookie_values {
         for domain in [".goofish.com", ".taobao.com"] {
@@ -2228,7 +2904,7 @@ fn read_chat_contacts(
 }
 
 #[tauri::command]
-fn list_chat_contacts(
+async fn list_chat_contacts(
     account_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<xianyu_im_local::ChatContact>, String> {
@@ -2503,7 +3179,7 @@ async fn update_customer_remark(
 }
 
 #[tauri::command]
-fn chat_unread_totals(
+async fn chat_unread_totals(
     state: tauri::State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, i64>, String> {
     let conn = state.db.lock().map_err(to_error)?;
@@ -2531,16 +3207,34 @@ async fn start_chat_listener(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let cookie = {
+    let (cookie, account_status) = {
         let conn = state.db.lock().map_err(to_error)?;
+        let status = conn
+            .query_row(
+                "SELECT status FROM accounts WHERE id = ?1",
+                [&account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(to_error)?;
         match local_session(&conn, &account_id, &state.secret_key) {
-            Ok(cookie) => cookie,
+            Ok(cookie) => (cookie, status),
             Err(error) => {
                 update_im_status(&app, &account_id, "not_logged_in", &error);
                 return Err(error);
             }
         }
     };
+    if account_status == "已停用" {
+        update_im_status(&app, &account_id, "disabled", "账号已停用，跳过闲鱼 IM 连接");
+        return Ok(());
+    }
+    if let Some(state_ref) = app.try_state::<AppState>() {
+        if let Some(remaining) = im_risk_cooldown_remaining(&state_ref, &account_id) {
+            let message = format!("闲鱼 IM 账号处于风控冷却中，约 {} 秒后再试", remaining);
+            update_im_status(&app, &account_id, "risk_cooldown", &message);
+            return Err(message);
+        }
+    }
     let mut listeners = state.chat_listeners.lock().map_err(to_error)?;
     if listeners.contains_key(&account_id) {
         return Ok(());
@@ -2558,6 +3252,9 @@ async fn start_chat_listener(
     let handle = tauri::async_runtime::spawn(async move {
         let mut cookie = cookie;
         let mut reconnect_attempt = 0_u32;
+        let mut auth_failures = 0_u32;
+        let mut network_failures = 0_u32;
+        let mut short_disconnects = Vec::<std::time::Instant>::new();
         loop {
             // Match the web service behavior: every reconnect starts from the
             // latest persisted session. Token and verification requests can
@@ -2579,11 +3276,15 @@ async fn start_chat_listener(
             let connected_account_id = listener_account_id.clone();
             let push_app = app.clone();
             let push_account_id = listener_account_id.clone();
-            let push_cookie = cookie.clone();
+            let push_cookie = Arc::new(Mutex::new(cookie.clone()));
+            let push_cookie_for_push = Arc::clone(&push_cookie);
             let trace_app = app.clone();
             let trace_account_id = listener_account_id.clone();
             let connection_started_at = std::time::Instant::now();
             match xianyu_im_local::listen_for_push(&cookie, move || {
+                if let Some(state) = connected_app.try_state::<AppState>() {
+                    clear_im_risk_cooldown(&state, &connected_account_id);
+                }
                 update_im_status(&connected_app, &connected_account_id, "connected", "闲鱼 IM 已连接");
                 #[cfg(debug_assertions)]
                 eprintln!("[im] account={} connected", connected_account_id);
@@ -2592,10 +3293,14 @@ async fn start_chat_listener(
                 let typing_chat_ids = xianyu_im_local::parse_typing_push_chat_ids(value);
                 let requires_sync = !message_refs.is_empty();
                 let chat_id = message_refs.first().map(|(chat_id, _)| chat_id.clone()).or_else(|| typing_chat_ids.first().cloned()).unwrap_or_default();
-                let _ = ingest_im_push(&push_app, &push_account_id, &push_cookie, value);
+                let current_cookie = push_cookie_for_push
+                    .lock()
+                    .map(|cookie| cookie.clone())
+                    .unwrap_or_default();
+                let _ = ingest_im_push(&push_app, &push_account_id, &current_cookie, value);
                 if !typing_chat_ids.is_empty() {
                     if let Ok(read_refs) = mark_typing_chats_read(&push_app, &push_account_id, &typing_chat_ids) {
-                        schedule_typing_readback(&push_app, &push_account_id, &push_cookie, read_refs);
+                        schedule_typing_readback(&push_app, &push_account_id, &current_cookie, read_refs);
                     }
                 }
                 let _ = push_app.emit(
@@ -2604,9 +3309,66 @@ async fn start_chat_listener(
                 );
             }, move |message| {
                 append_app_log(&trace_app, "info", "IM 协议", &trace_account_id, message);
+            }, {
+                let refresh_app = app.clone();
+                let refresh_account_id = listener_account_id.clone();
+                let refresh_cookie_state = Arc::clone(&push_cookie);
+                move |refreshed_cookie: String| {
+                    if let Ok(mut current_cookie) = refresh_cookie_state.lock() {
+                        *current_cookie = refreshed_cookie.clone();
+                    }
+                    if let Some(state) = refresh_app.try_state::<AppState>() {
+                        if let Ok(conn) = state.db.lock() {
+                            if let Err(error) = save_renewed_session(
+                                &conn,
+                                &refresh_account_id,
+                                &refreshed_cookie,
+                                &state.secret_key,
+                            ) {
+                                append_app_log(
+                                    &refresh_app,
+                                    "warn",
+                                    "IM",
+                                    &refresh_account_id,
+                                    &format!("IM 刷新 Cookie 持久化失败：{error}"),
+                                );
+                            }
+                        }
+                    }
+                }
             }, &mut request_receiver).await {
                 Ok(renewed_cookie) => {
+                    let connected_duration = connection_started_at.elapsed();
+                    if connected_duration >= std::time::Duration::from_secs(IM_SHORT_CONNECTION_THRESHOLD_SECS) {
+                        short_disconnects.clear();
+                        network_failures = 0;
+                    } else {
+                        short_disconnects.push(std::time::Instant::now());
+                        let window_start = std::time::Instant::now()
+                            .checked_sub(std::time::Duration::from_secs(IM_SHORT_DISCONNECT_WINDOW_SECS))
+                            .unwrap_or_else(std::time::Instant::now);
+                        short_disconnects.retain(|at| *at >= window_start);
+                        network_failures = network_failures.saturating_add(1);
+                    }
+                    if short_disconnects.len() >= IM_SHORT_DISCONNECT_LIMIT {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            set_im_risk_cooldown(&state, &listener_account_id);
+                        }
+                        update_im_status(
+                            &app,
+                            &listener_account_id,
+                            "risk_cooldown",
+                            &format!(
+                                "闲鱼 IM 在 {} 分钟内频繁短连接断开，账号进入 {} 秒冷却",
+                                IM_SHORT_DISCONNECT_WINDOW_SECS / 60,
+                                IM_RISK_COOLDOWN_SECS
+                            ),
+                        );
+                        clear_terminated_chat_listener(&app, &listener_account_id);
+                        break;
+                    }
                     cookie = renewed_cookie;
+                    auth_failures = 0;
                     let persist_error = if let Some(state) = app.try_state::<AppState>() {
                         state.db.lock().ok().and_then(|conn| {
                             save_renewed_session(
@@ -2633,7 +3395,7 @@ async fn start_chat_listener(
                     update_im_status(&app, &listener_account_id, "connecting", "闲鱼 IM 连接已结束，正在重连");
                 }
                 Err(error) => {
-                    if let Some(verification_url) = xianyu_local::im_validation_url(&error) {
+                    if let Some(verification_url) = xianyu_local::im_validation_url(&error).filter(|url| !url.is_empty()) {
                         #[cfg(debug_assertions)]
                         eprintln!("[im] account={} requires user validation", listener_account_id);
                         // The token request may have rotated session cookies
@@ -2659,10 +3421,25 @@ async fn start_chat_listener(
                                 urls.insert(listener_account_id.clone(), verification_url.to_owned());
                             }
                             if let Ok(mut cookies) = state.im_validation_cookies.lock() {
-                                cookies.insert(listener_account_id.clone(), verification_cookie);
+                                cookies.insert(listener_account_id.clone(), verification_cookie.clone());
+                            }
+                            if let Ok(mut attempted) = state.im_validation_attempted_x5.lock() {
+                                attempted.remove(&listener_account_id);
+                            }
+                            if let Ok(mut baseline) = state.im_validation_baseline_x5.lock() {
+                                baseline.remove(&listener_account_id);
                             }
                         }
-                        update_im_status(&app, &listener_account_id, "verification_required", "闲鱼 IM 需要完成风控验证");
+                        // Keep the challenge in the application's own
+                        // WebView. A separate Playwright context can visually
+                        // pass the slider while leaving its x5 cookies outside
+                        // the reqwest IM session, which produces TOKEN_EMPTY on
+                        // the next registration. The user-facing command
+                        // `open_im_verification` injects this exact Cookie into
+                        // the embedded window; `complete_im_verification`
+                        // reads the resulting cookies back before reconnecting.
+                        update_im_status(&app, &listener_account_id, "verification_required", "请在应用弹窗完成闲鱼滑块");
+                        xianyu_im_local::invalidate_im_token_for_cookie(&verification_cookie);
                         clear_terminated_chat_listener(&app, &listener_account_id);
                         break;
                     }
@@ -2673,17 +3450,104 @@ async fn start_chat_listener(
                         clear_terminated_chat_listener(&app, &listener_account_id);
                         break;
                     }
+                    if is_im_risk_error(&error) {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            set_im_risk_cooldown(&state, &listener_account_id);
+                        }
+                        update_im_status(
+                            &app,
+                            &listener_account_id,
+                            "risk_cooldown",
+                            &format!("闲鱼 IM 触发风控，账号进入 {} 秒冷却", IM_RISK_COOLDOWN_SECS),
+                        );
+                        clear_terminated_chat_listener(&app, &listener_account_id);
+                        break;
+                    }
+                    let auth_error = error.contains("FAIL_SYS_TOKEN_EMPTY")
+                        || error.contains("FAIL_SYS_TOKEN_EXPIRED")
+                        || error.contains("FAIL_SYS_TOKEN_EXOIRED")
+                        || error.contains("闲鱼 IM 注册被拒绝")
+                        || error.contains("AUTH_TOKEN");
+                    if auth_error {
+                        auth_failures = auth_failures.saturating_add(1);
+                        xianyu_im_local::invalidate_im_token_for_cookie(&cookie);
+                        if auth_failures >= IM_AUTH_FAILURE_THRESHOLD {
+                            if let Some(state) = app.try_state::<AppState>() {
+                                set_im_risk_cooldown(&state, &listener_account_id);
+                            }
+                            update_im_status(
+                                &app,
+                                &listener_account_id,
+                                "risk_cooldown",
+                                &format!(
+                                    "闲鱼 IM 认证连续失败，账号进入 {} 秒风控冷却",
+                                    IM_RISK_COOLDOWN_SECS
+                                ),
+                            );
+                            clear_terminated_chat_listener(&app, &listener_account_id);
+                            break;
+                        } else {
+                            let delay = (5_u64
+                                .saturating_mul(1_u64 << auth_failures.saturating_sub(1).min(3)))
+                            .min(30);
+                            update_im_status(
+                                &app,
+                                &listener_account_id,
+                                "connecting",
+                                &format!("闲鱼 IM 认证失败，{} 秒后重试", delay),
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        }
+                        continue;
+                    }
+                    let connected_duration = connection_started_at.elapsed();
+                    if connected_duration >= std::time::Duration::from_secs(IM_SHORT_CONNECTION_THRESHOLD_SECS) {
+                        short_disconnects.clear();
+                        network_failures = 0;
+                    } else {
+                        short_disconnects.push(std::time::Instant::now());
+                        let window_start = std::time::Instant::now()
+                            .checked_sub(std::time::Duration::from_secs(IM_SHORT_DISCONNECT_WINDOW_SECS))
+                            .unwrap_or_else(std::time::Instant::now);
+                        short_disconnects.retain(|at| *at >= window_start);
+                        network_failures = network_failures.saturating_add(1);
+                    }
+                    if short_disconnects.len() >= IM_SHORT_DISCONNECT_LIMIT
+                        || network_failures >= IM_NETWORK_FAILURE_LIMIT
+                    {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            set_im_risk_cooldown(&state, &listener_account_id);
+                        }
+                        update_im_status(
+                            &app,
+                            &listener_account_id,
+                            "risk_cooldown",
+                            &format!(
+                                "闲鱼 IM 网络连接异常，账号进入 {} 秒冷却",
+                                IM_RISK_COOLDOWN_SECS
+                            ),
+                        );
+                        clear_terminated_chat_listener(&app, &listener_account_id);
+                        break;
+                    }
                     reconnect_attempt = if connection_started_at.elapsed() >= std::time::Duration::from_secs(60) { 1 } else { reconnect_attempt.saturating_add(1) };
                     update_im_status(&app, &listener_account_id, "connecting", &format!("{error}；正在重连"));
                 }
             }
-            // This mirrors the official web client's capped exponential
-            // reconnect backoff (100 ms, 200 ms, … up to 5 s) and prevents a
-            // transient gateway reset from leaving the account "offline" for
-            // a fixed 15-second interval.
-            let exponent = reconnect_attempt.saturating_sub(1).min(6);
-            let delay_ms = (100_u64.saturating_mul(1_u64 << exponent)).min(5_000);
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            // Match the reference connection manager: network reconnects
+            // start at two seconds, grow exponentially and cap at one
+            // minute, with a small jitter so multiple accounts do not retry
+            // in the same burst.
+            let exponent = reconnect_attempt.saturating_sub(1).min(5);
+            let delay_secs = (2_u64.saturating_mul(1_u64 << exponent)).min(60);
+            let jitter_ms = delay_secs
+                .saturating_mul(1000)
+                .saturating_mul(fastrand::u64(0..31))
+                / 100;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                delay_secs.saturating_mul(1000).saturating_add(jitter_ms),
+            ))
+            .await;
         }
     });
     listeners.insert(account_id, handle);
@@ -2692,12 +3556,23 @@ async fn start_chat_listener(
 
 #[tauri::command]
 fn stop_chat_listener(account_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if let Some(handle) = state.chat_listeners.lock().map_err(to_error)?.remove(&account_id) {
+    stop_chat_listener_state(&state, &account_id)?;
+    Ok(())
+}
+
+fn stop_chat_listener_state(state: &AppState, account_id: &str) -> Result<(), String> {
+    if let Some(handle) = state.chat_listeners.lock().map_err(to_error)?.remove(account_id) {
         handle.abort();
     }
-    state.im_request_senders.lock().map_err(to_error)?.remove(&account_id);
+    state.im_request_senders.lock().map_err(to_error)?.remove(account_id);
+    state.im_validation_urls.lock().map_err(to_error)?.remove(account_id);
+    state.im_validation_cookies.lock().map_err(to_error)?.remove(account_id);
+    state.im_validation_embedded.lock().map_err(to_error)?.remove(account_id);
+    state.im_validation_baseline_x5.lock().map_err(to_error)?.remove(account_id);
+    state.im_validation_attempted_x5.lock().map_err(to_error)?.remove(account_id);
+    state.service_login_challenges.lock().map_err(to_error)?.remove(account_id);
     if let Ok(mut statuses) = state.im_statuses.lock() {
-        statuses.insert(account_id, "stopped".to_owned());
+        statuses.insert(account_id.to_owned(), "stopped".to_owned());
     }
     Ok(())
 }
@@ -2712,77 +3587,268 @@ fn get_im_verification_state(
     account_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<ImVerificationState, String> {
-    let required = state
-        .im_validation_urls
-        .lock()
-        .map_err(to_error)?
-        .contains_key(&account_id);
+    let required = state.im_validation_urls.lock().map_err(to_error)?.contains_key(&account_id)
+        || state.service_login_challenges.lock().map_err(to_error)?
+            .get(&account_id).is_some_and(|challenge| !challenge.verification_url.is_empty());
     Ok(ImVerificationState { required })
 }
 
 #[tauri::command]
-fn open_im_verification(
+async fn get_im_verification_progress(
     account_id: String,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let verification_url = state
-        .im_validation_urls
-        .lock()
-        .map_err(to_error)?
-        .get(&account_id)
-        .cloned()
-        .filter(|url| !url.is_empty())
-        .ok_or("验证地址已失效。请先重新连接 IM，以获取新的验证请求。")?;
-    let cookie = state
-        .im_validation_cookies
-        .lock()
-        .map_err(to_error)?
-        .get(&account_id)
-        .cloned()
-        .map(Ok)
-        .unwrap_or_else(|| {
-            let conn = state.db.lock().map_err(to_error)?;
-            local_session(&conn, &account_id, &state.secret_key)
-        })?;
+) -> Result<ImVerificationProgress, String> {
+    let required = state.im_validation_urls.lock().map_err(to_error)?.contains_key(&account_id)
+        || state.service_login_challenges.lock().map_err(to_error)?
+            .get(&account_id).is_some_and(|challenge| !challenge.verification_url.is_empty());
+    if !required {
+        return Ok(ImVerificationProgress { window_open: false, ready: false });
+    }
+    let Some(window) = app.get_webview(&validation_window_label(&account_id)) else {
+        return Ok(ImVerificationProgress { window_open: false, ready: false });
+    };
+    let current_url = window.url().map_err(to_error)?.to_string();
+    let challenge_url = state.im_validation_urls.lock().map_err(to_error)?.get(&account_id).cloned()
+        .or_else(|| state.service_login_challenges.lock().ok()?.get(&account_id).map(|challenge| challenge.verification_url.clone()))
+        .filter(|url| !url.is_empty());
+    let mut current_cookies = HashMap::new();
+    for cookie in window.cookies().map_err(to_error)? {
+        let name = cookie.name().to_owned();
+        if !name.trim().is_empty() && !cookie.value().trim().is_empty() {
+            current_cookies.insert(name, cookie.value().to_owned());
+        }
+    }
+    if let Ok(url) = window.url() {
+        for cookie in window.cookies_for_url(url).map_err(to_error)? {
+            let name = cookie.name().to_owned();
+            if !name.trim().is_empty() && !cookie.value().trim().is_empty() {
+                current_cookies.insert(name, cookie.value().to_owned());
+            }
+        }
+    }
+    if let Some(url) = challenge_url.as_deref().and_then(|value| reqwest::Url::parse(value).ok()) {
+        for cookie in window.cookies_for_url(url).map_err(to_error)? {
+            let name = cookie.name().to_owned();
+            if !name.trim().is_empty() && !cookie.value().trim().is_empty() {
+                current_cookies.insert(name, cookie.value().to_owned());
+            }
+        }
+    }
+    let current_x5 = current_cookies
+        .iter()
+        .find(|(name, value)| name.eq_ignore_ascii_case("x5sec") && !value.trim().is_empty())
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    let embedded = state.im_validation_embedded.lock().map_err(to_error)?.get(&account_id).copied().unwrap_or(false);
+    let still_on_punish = !embedded && is_im_punish_url(&current_url);
+    let mut baselines = state.im_validation_baseline_x5.lock().map_err(to_error)?;
+    let mut baseline_x5 = baselines.get(&account_id).cloned();
+    if embedded {
+        // An embedded challenge briefly has no x5sec while its iframe is
+        // booting. Do not record that empty value as the baseline: the first
+        // Set-Cookie from the challenge must be treated as the pre-slider
+        // state, otherwise the poller can report success before the user has
+        // moved the slider.
+        if baseline_x5.is_none() && !current_x5.is_empty() {
+            baselines.insert(account_id.clone(), current_x5.clone());
+            baseline_x5 = Some(current_x5.clone());
+        }
+    } else if still_on_punish || baseline_x5.is_none() {
+        // The reference captures x5sec after the challenge document loads but
+        // before the slider is operated. While still on punish, refresh this
+        // baseline so cookies set during initial page load cannot look like a
+        // successful slider result.
+        baselines.insert(account_id.clone(), current_x5.clone());
+        baseline_x5 = Some(current_x5.clone());
+    }
+    drop(baselines);
+    let attempted_x5 = state.im_validation_attempted_x5.lock().map_err(to_error)?
+        .get(&account_id).cloned().unwrap_or_default();
+    let ready = !still_on_punish
+        && baseline_x5.is_some()
+        && !current_x5.is_empty()
+        && current_x5 != baseline_x5.unwrap_or_default()
+        && current_x5 != attempted_x5;
+    Ok(ImVerificationProgress { window_open: true, ready })
+}
+
+#[tauri::command]
+async fn open_im_verification(
+    account_id: String,
+    bounds: VerificationBounds,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let rect = bounds.rect()?;
+    let service_challenge = state.service_login_challenges.lock().map_err(to_error)?
+        .get(&account_id).filter(|challenge| !challenge.verification_url.is_empty()).cloned();
+    let (initial_url, initial_cookie) = if let Some(challenge) = service_challenge.as_ref() {
+        (challenge.verification_url.clone(), challenge.cookie.clone())
+    } else {
+        let url = state.im_validation_urls.lock().map_err(to_error)?
+            .get(&account_id).cloned().filter(|url| !url.is_empty())
+            .ok_or("验证地址已失效。请重新连接 IM，以获取新的验证请求。")?;
+        let cookie = state.im_validation_cookies.lock().map_err(to_error)?
+            .get(&account_id).cloned().map(Ok).unwrap_or_else(|| {
+                let conn = state.db.lock().map_err(to_error)?;
+                local_session(&conn, &account_id, &state.secret_key)
+            })?;
+        (url, cookie)
+    };
+    let label = validation_window_label(&account_id);
+    if let Some(window) = app.get_webview(&label) {
+        window.set_bounds(rect).map_err(to_error)?;
+        window.set_focus().map_err(to_error)?;
+        return Ok("opened".to_owned());
+    }
+
+    let (verification_url, cookie) = if service_challenge.is_some() {
+        state.im_validation_baseline_x5.lock().map_err(to_error)?.remove(&account_id);
+        state.im_validation_attempted_x5.lock().map_err(to_error)?.remove(&account_id);
+        (initial_url, initial_cookie)
+    } else {
+        // Refresh once before opening the browser, matching the reference
+        // flow's URL provider and avoiding a stale punish URL.
+        xianyu_im_local::invalidate_im_token_for_cookie(&initial_cookie);
+        match xianyu_im_local::request_im_token(&initial_cookie).await {
+            Ok((_, renewed_cookie)) => {
+                {
+                    let conn = state.db.lock().map_err(to_error)?;
+                    save_renewed_session(&conn, &account_id, &renewed_cookie, &state.secret_key)?;
+                }
+                if let Ok(mut urls) = state.im_validation_urls.lock() {
+                    urls.remove(&account_id);
+                }
+                if let Ok(mut cookies) = state.im_validation_cookies.lock() {
+                    cookies.remove(&account_id);
+                }
+                if let Ok(mut attempted) = state.im_validation_attempted_x5.lock() {
+                    attempted.remove(&account_id);
+                }
+                if let Ok(mut baseline) = state.im_validation_baseline_x5.lock() {
+                    baseline.remove(&account_id);
+                }
+                stop_chat_listener(account_id.clone(), state.clone())?;
+                start_chat_listener(account_id, app, state).await?;
+                return Ok("already_cleared".to_owned());
+            }
+            Err(error) => {
+                if let Some(fresh_url) = xianyu_local::im_validation_url(&error)
+                    .filter(|url| !url.is_empty())
+                {
+                    let fresh_cookie = xianyu_local::take_im_validation_cookie(fresh_url)
+                        .or_else(|| xianyu_im_local::take_renewed_cookie(&initial_cookie))
+                        .unwrap_or_else(|| initial_cookie.clone());
+                    if let Ok(mut urls) = state.im_validation_urls.lock() {
+                        urls.insert(account_id.clone(), fresh_url.to_owned());
+                    }
+                    if let Ok(mut cookies) = state.im_validation_cookies.lock() {
+                        cookies.insert(account_id.clone(), fresh_cookie.clone());
+                    }
+                    if let Ok(mut attempted) = state.im_validation_attempted_x5.lock() {
+                        attempted.remove(&account_id);
+                    }
+                    if let Ok(mut baseline) = state.im_validation_baseline_x5.lock() {
+                        baseline.remove(&account_id);
+                    }
+                    if let Ok(conn) = state.db.lock() {
+                        let _ = save_renewed_session(&conn, &account_id, &fresh_cookie, &state.secret_key);
+                    }
+                    (fresh_url.to_owned(), fresh_cookie)
+                } else {
+                    (initial_url, initial_cookie)
+                }
+            }
+        }
+    };
     let target = reqwest::Url::parse(&verification_url)
         .map_err(|_| "闲鱼返回的验证地址无效".to_owned())?;
     if !is_xianyu_official_url(&target) {
         return Err("只允许打开闲鱼官方风控验证地址".to_owned());
     }
-    let label = validation_window_label(&account_id);
-    if let Some(window) = app.get_webview_window(&label) {
-        window.set_focus().map_err(to_error)?;
-        return Ok(());
-    }
-    let bootstrap_url = reqwest::Url::parse("https://passport.goofish.com/")
-        .map_err(to_error)?;
-    let window = tauri::WebviewWindowBuilder::new(
-        &app,
-        label,
-        tauri::WebviewUrl::External(bootstrap_url),
-    )
-    .title("闲鱼安全验证")
-    .inner_size(480.0, 760.0)
-    .min_inner_size(420.0, 640.0)
-    .center()
-    .focused(true)
-    .user_agent(xianyu_local::web_user_agent())
-    .build()
-    .map_err(to_error)?;
-    let target_host = target.host_str().unwrap_or("passport.goofish.com");
-    for (name, value) in session_cookie_entries(&cookie) {
-        for domain in verification_cookie_domains(target_host) {
-            let cookie = tauri::webview::Cookie::build((name.clone(), value.clone()))
-                .domain(domain)
+    let main_window = app.get_window("main").ok_or("应用主窗口不存在")?;
+    // The child WebView occupies the dialog's content area in the main window.
+    // It starts locally; the official challenge loads only after its account
+    // cookies have been installed, preserving the existing result handoff.
+    let window = main_window.add_child(
+        tauri::webview::WebviewBuilder::new(label, tauri::WebviewUrl::App("index.html".into()))
+            .user_agent(xianyu_local::USER_AGENT_VALUE),
+        tauri::LogicalPosition::new(bounds.x, bounds.y),
+        tauri::LogicalSize::new(bounds.width, bounds.height),
+    ).map_err(to_error)?;
+    let target_host = target.host_str().unwrap_or("passport.goofish.com").to_owned();
+    let load_challenge = async {
+        // WebKit can reject a cookie for another registrable domain while the
+        // child view is still on app://localhost. Establish the official
+        // origin first, then write the challenge session into that same view
+        // before loading the signed punish URL.
+        let origin = reqwest::Url::parse("https://seller.goofish.com/?site=COMMONPRO#/im")
+            .map_err(|error| error.to_string())?;
+        window.navigate(origin).map_err(to_error)?;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let cookie_domain = verification_cookie_domains(&target_host)
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| target_host.clone());
+        for (name, value) in session_cookie_entries(&cookie) {
+            let cookie = tauri::webview::Cookie::build((name, value))
+                .domain(cookie_domain.clone())
                 .path("/")
                 .secure(true)
                 .same_site(tauri::webview::cookie::SameSite::None)
                 .build();
             window.set_cookie(cookie).map_err(to_error)?;
         }
+        // Keep the signed challenge inside the seller IM document. The
+        // browser risk system binds the punish URL to its top-level site and
+        // session; opening it as a standalone WebView loses that context.
+        let frame_url = serde_json::to_string(&verification_url).map_err(to_error)?;
+        state.im_validation_embedded.lock().map_err(to_error)?.insert(account_id.clone(), true);
+        window.eval(format!(r#"(() => {{
+            const install = () => {{
+                if (!document.body) {{ window.setTimeout(install, 50); return; }}
+                const frame = document.createElement('iframe');
+                frame.id = 'xianyu-risk-frame';
+                frame.src = {frame_url};
+                frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0;background:#fff;z-index:2147483647;';
+                document.documentElement.style.cssText = 'background:#fff;overflow:hidden;';
+                document.body.innerHTML = '';
+                document.body.style.cssText = 'margin:0;overflow:hidden;background:#fff;';
+                document.body.appendChild(frame);
+            }};
+            install();
+        }})();"#)).map_err(to_error)?;
+        Ok::<(), String>(())
+    }.await;
+    if let Err(error) = load_challenge {
+        let _ = state.im_validation_embedded.lock().map_err(to_error)?.remove(&account_id);
+        let _ = window.close();
+        return Err(error);
     }
-    window.navigate(target).map_err(to_error)?;
+    Ok("opened".to_owned())
+}
+
+#[tauri::command]
+fn position_im_verification(
+    account_id: String,
+    bounds: VerificationBounds,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    if let Some(window) = app.get_webview(&validation_window_label(&account_id)) {
+        window.set_bounds(bounds.rect()?).map_err(to_error)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn close_im_verification(account_id: String, app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview(&validation_window_label(&account_id)) {
+        window.close().map_err(to_error)?;
+    }
+    if let Some(state) = app.try_state::<AppState>() {
+        state.im_validation_embedded.lock().map_err(to_error)?.remove(&account_id);
+    }
     Ok(())
 }
 
@@ -2791,58 +3857,179 @@ async fn complete_im_verification(
     account_id: String,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let label = validation_window_label(&account_id);
     let window = app
-        .get_webview_window(&label)
-        .ok_or("验证窗口未打开。请先打开验证页并完成闲鱼安全验证。")?;
-    let x5_cookies = window
-        .cookies()
-        .map_err(to_error)?
-        .into_iter()
-        .filter_map(|cookie| {
-            let name = cookie.name().to_owned();
-            name.to_ascii_lowercase()
-                .starts_with("x5")
-                .then(|| (name, cookie.value().to_owned()))
-        })
-        .collect::<Vec<_>>();
-    if x5_cookies.is_empty() {
-        return Err("尚未检测到 x5sec 风控 Cookie。请先在验证窗口完成挑战后再继续。".to_owned());
-    }
-    let merged_cookie = {
-        let conn = state.db.lock().map_err(to_error)?;
-        let current_cookie = local_session(&conn, &account_id, &state.secret_key)?;
-        let mut cookies = session_cookie_entries(&current_cookie)
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        for (name, value) in x5_cookies {
-            cookies.insert(name, value);
+        .get_webview(&label)
+        .ok_or("验证弹窗未打开。请先打开验证页并完成闲鱼安全验证。")?;
+    let challenge_url = state.im_validation_urls.lock().map_err(to_error)?.get(&account_id).cloned()
+        .or_else(|| state.service_login_challenges.lock().ok()?.get(&account_id).map(|challenge| challenge.verification_url.clone()))
+        .filter(|url| !url.is_empty());
+    let mut browser_cookies = HashMap::new();
+    // Only the x5 cookies are output of the challenge.  The WebView also has
+    // unrelated passport cookies (and sometimes an older `_m_h5_tk`/`unb`);
+    // copying those back by name can overwrite the QR session that the IM
+    // token request is meant to use.
+    for cookie in window.cookies().map_err(to_error)? {
+        let name = cookie.name().to_owned();
+        if name.to_ascii_lowercase().starts_with("x5") && !cookie.value().trim().is_empty() {
+            browser_cookies.insert(name, cookie.value().to_owned());
         }
-        let merged_cookie = cookies
-            .into_iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        save_renewed_session(&conn, &account_id, &merged_cookie, &state.secret_key)?;
-        merged_cookie
+    }
+    if let Ok(url) = window.url() {
+        for cookie in window.cookies_for_url(url).map_err(to_error)? {
+            let name = cookie.name().to_owned();
+            if name.to_ascii_lowercase().starts_with("x5") && !cookie.value().trim().is_empty() {
+                browser_cookies.insert(name, cookie.value().to_owned());
+            }
+        }
+    }
+    if let Some(url) = challenge_url.as_deref().and_then(|value| reqwest::Url::parse(value).ok()) {
+        for cookie in window.cookies_for_url(url).map_err(to_error)? {
+            let name = cookie.name().to_owned();
+            if name.to_ascii_lowercase().starts_with("x5") && !cookie.value().trim().is_empty() {
+                browser_cookies.insert(name, cookie.value().to_owned());
+            }
+        }
+    }
+    let service_cookie = state.service_login_challenges.lock().map_err(to_error)?
+        .get(&account_id).filter(|challenge| !challenge.verification_url.is_empty())
+        .map(|challenge| challenge.cookie.clone());
+    let cookie_before_challenge = if let Some(cookie) = service_cookie {
+        cookie
+    } else {
+        state.im_validation_cookies.lock().map_err(to_error)?
+            .get(&account_id).cloned().unwrap_or_else(|| {
+                state.db.lock().ok()
+                    .and_then(|conn| local_session(&conn, &account_id, &state.secret_key).ok())
+                    .unwrap_or_default()
+            })
     };
-    xianyu_im_local::invalidate_im_token_for_cookie(&merged_cookie);
+    let mut cookies = session_cookie_entries(&cookie_before_challenge)
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    for (name, value) in browser_cookies {
+        cookies.insert(name, value);
+    }
+    let candidate_cookie = cookies
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let attempted_x5 = im_x5sec_cookie(&candidate_cookie);
+    if !attempted_x5.is_empty() {
+        state
+            .im_validation_attempted_x5
+            .lock()
+            .map_err(to_error)?
+            .insert(account_id.clone(), attempted_x5);
+    }
+    {
+        let mut challenges = state.service_login_challenges.lock().map_err(to_error)?;
+        if let Some(challenge) = challenges.get_mut(&account_id)
+            .filter(|challenge| !challenge.verification_url.is_empty()) {
+            challenge.cookie = candidate_cookie;
+            drop(challenges);
+            window.close().map_err(to_error)?;
+            state.im_validation_embedded.lock().map_err(to_error)?.remove(&account_id);
+            return Ok("service_login_ready".to_owned());
+        }
+    }
+
+    // A page can show success before WebKit has exposed its final Set-Cookie.
+    // Confirm release through the same IM token endpoint used by the listener;
+    // the endpoint response also supplies any last cookie rotation.
+    xianyu_im_local::invalidate_im_token_for_cookie(&candidate_cookie);
+    let (_, merged_cookie) = match xianyu_im_local::request_im_token(&candidate_cookie).await {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(next_url) = xianyu_local::im_validation_url(&error).filter(|url| !url.is_empty()) {
+                let next_cookie = xianyu_local::take_im_validation_cookie(next_url)
+                    .or_else(|| xianyu_im_local::take_renewed_cookie(&candidate_cookie))
+                    .unwrap_or_else(|| candidate_cookie.clone());
+                let next_target = reqwest::Url::parse(next_url)
+                    .map_err(|_| "闲鱼返回的新验证地址无效".to_owned())?;
+                if !is_xianyu_official_url(&next_target) {
+                    return Err("只允许继续打开闲鱼官方风控验证地址".to_owned());
+                }
+                if let Ok(mut urls) = state.im_validation_urls.lock() {
+                    urls.insert(account_id.clone(), next_url.to_owned());
+                }
+                if let Ok(mut cookies) = state.im_validation_cookies.lock() {
+                    cookies.insert(account_id.clone(), next_cookie.clone());
+                }
+                {
+                    let conn = state.db.lock().map_err(to_error)?;
+                    save_renewed_session(&conn, &account_id, &next_cookie, &state.secret_key)?;
+                }
+                let target_host = next_target.host_str().unwrap_or("passport.goofish.com");
+                let cookie_domain = verification_cookie_domains(target_host)
+                    .into_iter()
+                    .last()
+                    .unwrap_or_else(|| target_host.to_owned());
+                for (name, value) in session_cookie_entries(&next_cookie) {
+                    let cookie = tauri::webview::Cookie::build((name, value))
+                        .domain(cookie_domain.clone())
+                        .path("/")
+                        .secure(true)
+                        .same_site(tauri::webview::cookie::SameSite::None)
+                        .build();
+                    window.set_cookie(cookie).map_err(to_error)?;
+                }
+                let frame_url = serde_json::to_string(next_url).map_err(to_error)?;
+                state.im_validation_embedded.lock().map_err(to_error)?.insert(account_id.clone(), true);
+                window.eval(format!(r#"(() => {{
+                    const install = () => {{
+                        if (!document.body) {{ window.setTimeout(install, 50); return; }}
+                        const frame = document.createElement('iframe');
+                        frame.id = 'xianyu-risk-frame';
+                        frame.src = {frame_url};
+                        frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0;background:#fff;z-index:2147483647;';
+                        document.documentElement.style.cssText = 'background:#fff;overflow:hidden;';
+                        document.body.innerHTML = '';
+                        document.body.style.cssText = 'margin:0;overflow:hidden;background:#fff;';
+                        document.body.appendChild(frame);
+                    }};
+                    install();
+                }})();"#)).map_err(to_error)?;
+                return Err("闲鱼服务端尚未确认验证完成，请在验证弹窗继续操作后重试。".to_owned());
+            }
+            return Err(format!(
+                "验证页面已提交，但 IM Token 校验未通过：{error}。请保持验证弹窗打开并重试；如仍失败，请重新扫码登录。"
+            ));
+        }
+    };
+    {
+        let conn = state.db.lock().map_err(to_error)?;
+        save_renewed_session(&conn, &account_id, &merged_cookie, &state.secret_key)?;
+    }
+    clear_im_risk_cooldown(&state, &account_id);
     if let Ok(mut urls) = state.im_validation_urls.lock() {
         urls.remove(&account_id);
     }
     if let Ok(mut cookies) = state.im_validation_cookies.lock() {
         cookies.remove(&account_id);
     }
-    let _ = window.close();
+    if let Ok(mut attempted) = state.im_validation_attempted_x5.lock() {
+        attempted.remove(&account_id);
+    }
+    if let Ok(mut baseline) = state.im_validation_baseline_x5.lock() {
+        baseline.remove(&account_id);
+    }
+    window.close().map_err(to_error)?;
+    state.im_validation_embedded.lock().map_err(to_error)?.remove(&account_id);
     stop_chat_listener(account_id.clone(), state.clone())?;
-    start_chat_listener(account_id, app, state).await
+    start_chat_listener(account_id, app, state).await?;
+    Ok("im_reconnecting".to_owned())
 }
 
 fn account_im_sender(
     state: &AppState,
     account_id: &str,
 ) -> Result<Option<xianyu_im_local::ImRequestSender>, String> {
+    if let Some(remaining) = im_risk_cooldown_remaining(state, account_id) {
+        return Err(format!("闲鱼 IM 账号处于风控冷却中，约 {} 秒后再试", remaining));
+    }
     state
         .im_request_senders
         .lock()
@@ -3173,7 +4360,7 @@ fn read_chat_emojis(
 }
 
 #[tauri::command]
-fn list_chat_emojis(
+async fn list_chat_emojis(
     account_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<xianyu_im_local::ChatEmoji>, String> {
@@ -3243,7 +4430,7 @@ fn remove_near_duplicate_messages(
 }
 
 #[tauri::command]
-fn list_chat_messages(
+async fn list_chat_messages(
     account_id: String,
     chat_id: String,
     state: tauri::State<'_, AppState>,
@@ -3798,7 +4985,14 @@ fn export_backup(state: tauri::State<'_, AppState>) -> Result<BackupData, String
 async fn sync_account(
     account_id: String,
     state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<SyncResult, String> {
+    // Product details and orders can issue hundreds of MTop requests.  Keep
+    // one account's background login sync single-flight so a manual refresh,
+    // QR completion and app-start task cannot overlap and rotate the same H5
+    // cookies concurrently.
+    let sync_lock = account_sync_lock(&state, &account_id);
+    let _sync_guard = sync_lock.lock().await;
     let now = Utc::now().to_rfc3339();
     let local_cookie = {
         let conn = state.db.lock().map_err(to_error)?;
@@ -3821,30 +5015,72 @@ async fn sync_account(
             products_changed: 0,
             orders_changed: 0,
             source_connected: false,
+            profile_warning: false,
         });
     }
 
+    // Account identity is independent from IM and must be persisted even when
+    // a later product/order request is slow or temporarily unavailable.
+    let (initial_profile, initial_profile_warning) = match fetch_account_profile(&local_cookie).await {
+        Ok(profile) => (Some(profile), false),
+        Err(error) => {
+            append_app_log(
+                &app,
+                "warn",
+                "账号资料",
+                &account_id,
+                &account_profile_error_summary(&error),
+            );
+            (None, true)
+        }
+    };
+    let sync_cookie = initial_profile
+        .as_ref()
+        .filter(|profile| !profile.cookie.is_empty())
+        .map(|profile| profile.cookie.clone())
+        .unwrap_or_else(|| local_cookie.clone());
+    if let Some(profile) = initial_profile.as_ref() {
+        let conn = state.db.lock().map_err(to_error)?;
+        save_account_profile(&conn, &account_id, profile)?;
+        if !profile.cookie.is_empty() {
+            save_renewed_session(&conn, &account_id, &profile.cookie, &state.secret_key)?;
+        }
+    }
+
     let response = async {
-        // Product/order calls refresh a stale MTop token when needed. Query
-        // the profile afterwards so existing local sessions can be backfilled
-        // even if their saved token had expired.
-        let (items, renewed_cookie) = xianyu_local::fetch_products(&local_cookie).await?;
+        // Product/order calls refresh a stale MTop token when needed. Profile
+        // data was already saved above, so a later sync failure cannot hide
+        // the current account identity from the UI.
+        let (items, renewed_cookie) = xianyu_local::fetch_products(&sync_cookie).await?;
         let (orders, renewed_cookie) = xianyu_local::fetch_orders(&renewed_cookie).await?;
-        let profile = fetch_account_profile(&renewed_cookie).await.ok();
+        let (profile, profile_warning) = match fetch_account_profile(&renewed_cookie).await {
+            Ok(profile) => (Some(profile), false),
+            Err(error) => {
+                append_app_log(
+                    &app,
+                    "warn",
+                    "账号资料",
+                    &account_id,
+                    &account_profile_error_summary(&error),
+                );
+                (initial_profile, initial_profile_warning)
+            }
+        };
         let renewed_cookie = profile
             .as_ref()
             .filter(|profile| !profile.cookie.is_empty())
             .map(|profile| profile.cookie.clone())
             .unwrap_or(renewed_cookie);
-        Ok::<(Value, Value, String, Option<AccountProfile>), String>((
+        Ok::<(Value, Value, String, Option<AccountProfile>, bool), String>((
             Value::Array(items),
             Value::Array(orders),
             renewed_cookie,
             profile,
+            profile_warning,
         ))
     }
     .await;
-    let (items_payload, orders_payload, renewed_cookie, profile) = match response {
+    let (items_payload, orders_payload, renewed_cookie, profile, profile_warning) = match response {
         Ok(payload) => payload,
         Err(error) => {
             let conn = state.db.lock().map_err(to_error)?;
@@ -3935,6 +5171,7 @@ async fn sync_account(
         products_changed,
         orders_changed,
         source_connected: true,
+        profile_warning,
     })
 }
 
@@ -3968,11 +5205,22 @@ pub fn run() {
                 im_statuses: Mutex::new(HashMap::new()),
                 im_validation_urls: Mutex::new(HashMap::new()),
                 im_validation_cookies: Mutex::new(HashMap::new()),
+                im_validation_embedded: Mutex::new(HashMap::new()),
+                im_validation_baseline_x5: Mutex::new(HashMap::new()),
+                im_validation_attempted_x5: Mutex::new(HashMap::new()),
+                im_risk_cooldowns: Mutex::new(HashMap::new()),
+                account_sync_locks: Mutex::new(HashMap::new()),
+                service_login_challenges: Mutex::new(HashMap::new()),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_accounts,
+            sync_service_accounts,
+            create_service_account,
+            login_service_account,
+            send_service_login_sms,
+            submit_service_login_sms,
             update_conversation_name,
             list_products,
             list_orders,
@@ -3999,7 +5247,10 @@ pub fn run() {
             chat_unread_totals,
             get_im_statuses,
             get_im_verification_state,
+            get_im_verification_progress,
             open_im_verification,
+            position_im_verification,
+            close_im_verification,
             complete_im_verification,
             list_app_logs,
             start_chat_listener,
@@ -4043,7 +5294,7 @@ pub fn run() {
 mod tests {
     use super::{
         decrypt_secret, delete_account_records, encrypt_secret, initialize_database,
-        normalize_order_status, normalize_product_status, remove_near_duplicate_messages,
+        is_paid_member_order, normalize_order_status, normalize_phone, normalize_product_status, remove_near_duplicate_messages,
         verification_cookie_domains,
     };
     use rusqlite::Connection;
@@ -4066,6 +5317,15 @@ mod tests {
         assert_eq!(normalize_order_status("已发货".to_owned()), "待收货");
         assert_eq!(normalize_order_status("退款成功".to_owned()), "已退款");
         assert_eq!(normalize_order_status("交易关闭".to_owned()), "已关闭");
+    }
+
+    #[test]
+    fn member_identity_uses_normalized_phone_and_paid_statuses() {
+        assert_eq!(normalize_phone("+86 138-0013-8000"), "13800138000");
+        assert!(is_paid_member_order("WAIT_SHIP", "待发货"));
+        assert!(is_paid_member_order("REFUND_SUCCESS", "已退款"));
+        assert!(!is_paid_member_order("WAIT_PAY", "待付款"));
+        assert!(!is_paid_member_order("CLOSED", "已关闭"));
     }
 
     #[test]

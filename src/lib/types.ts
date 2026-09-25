@@ -14,6 +14,10 @@ export interface Account {
   conversationName: string
   avatarUrl: string
   memberName: string
+  parentAccountId: string
+  serviceLoginName: string
+  serviceRole: string
+  serviceMobile: string
 }
 
 export interface Product {
@@ -62,6 +66,14 @@ export interface Order {
   note: string
 }
 
+export interface MemberAccount {
+  accountId: string
+  displayName: string
+  shopName: string
+  avatarUrl: string
+  chatId: string
+}
+
 export interface Member {
   id: string
   accountId: string
@@ -84,6 +96,7 @@ export interface Member {
   createdAt: string
   updatedAt: string
   lastSyncedAt: string
+  relatedAccounts: MemberAccount[]
 }
 
 export interface MemberOrder {
@@ -112,11 +125,17 @@ export interface ImVerificationState {
   required: boolean
 }
 
+export interface ImVerificationProgress {
+  windowOpen: boolean
+  ready: boolean
+}
+
 export interface SyncResult {
   account: Account
   productsChanged: number
   ordersChanged: number
   sourceConnected: boolean
+  profileWarning: boolean
 }
 
 export interface SyncJob {
@@ -233,6 +252,7 @@ export interface QrLoginStatus {
   accountId: string
   displayName: string
   isNewAccount: boolean
+  profileWarning: boolean
 }
 
 export interface BackupData {
