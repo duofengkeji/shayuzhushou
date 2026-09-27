@@ -25,6 +25,7 @@ const IM_SHORT_CONNECTION_THRESHOLD_SECS: u64 = 30;
 const IM_SHORT_DISCONNECT_WINDOW_SECS: u64 = 5 * 60;
 const IM_SHORT_DISCONNECT_LIMIT: usize = 5;
 const IM_NETWORK_FAILURE_LIMIT: u32 = 20;
+const SERVICE_LOGIN_CHALLENGE_TTL_SECS: i64 = 10 * 60;
 
 struct AppState {
     db: Mutex<Connection>,
@@ -263,6 +264,13 @@ fn is_im_punish_url(url: &str) -> bool {
     ["punish", "x5step=2", "action=captcha", "purecaptcha", "/captcha"]
         .iter()
         .any(|marker| url.contains(marker))
+}
+
+fn is_service_verification_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    is_im_punish_url(&lower)
+        || lower.contains("identity_verify")
+        || lower.contains("verify_modes")
 }
 
 fn is_im_risk_error(error: &str) -> bool {
@@ -1626,7 +1634,22 @@ async fn login_service_account(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceLoginStatus, String> {
-    let pending_challenge = state.service_login_challenges.lock().map_err(to_error)?.remove(&account_id);
+    // Keep the challenge record after the slider window closes. The next
+    // login.do request must reuse the cookies issued before and during the
+    // slider; removing it here starts a fresh risk session and makes a valid
+    // slider result look unrelated to the password login.
+    let pending_challenge = {
+        let mut challenges = state.service_login_challenges.lock().map_err(to_error)?;
+        let challenge = challenges.get(&account_id).cloned();
+        if challenge.as_ref().is_some_and(|value| {
+            Utc::now().timestamp() - value.created_at > SERVICE_LOGIN_CHALLENGE_TTL_SECS
+        }) {
+            challenges.remove(&account_id);
+            None
+        } else {
+            challenge
+        }
+    };
     let (login_name, password, parent_id, mobile, parent_cookie) = {
         let conn = state.db.lock().map_err(to_error)?;
         let account = get_account(&conn, &account_id).map_err(to_error)?;
@@ -1654,21 +1677,11 @@ async fn login_service_account(
         .filter(|challenge| !challenge.verification_url.is_empty())
         .map(|challenge| challenge.cookie.as_str());
     let initial_cookie = challenge_cookie.or(Some(parent_cookie.as_str()));
-    let mut result = service_account::password_login(&login_name, &password, initial_cookie).await?;
-    // 账号列表返回的登录名通常是“主账号前缀:后缀”。部分登录节点
-    // 只接受后缀，但仍要求主账号 Cookie；仅在平台明确返回子账号不支持
-    // 时尝试一次，避免对普通密码错误或风控响应重复提交。
-    if result.status == "failed" && result.message.contains("暂不支持子账号登录") {
-        if let Some((_, suffix)) = login_name.rsplit_once(':') {
-            if !suffix.is_empty() && suffix != login_name {
-                result = service_account::password_login(suffix, &password, initial_cookie).await?;
-            }
-        }
-    }
+    let result = service_account::password_login(&login_name, &password, initial_cookie).await?;
     let verification_url = if result.status == "verification_required" {
         reqwest::Url::parse(&result.verification_url).ok()
             .filter(is_xianyu_official_url)
-            .filter(|url| is_im_punish_url(url.as_str()))
+            .filter(|url| is_service_verification_url(url.as_str()))
             .map(|url| url.to_string()).unwrap_or_default()
     } else { String::new() };
     if result.status == "sms_required" || !verification_url.is_empty() {
@@ -1687,10 +1700,36 @@ async fn login_service_account(
         let remote_id = session_cookie_entries(&result.cookie).into_iter()
             .find(|(name, value)| name == "unb" && !value.is_empty())
             .map(|(_, value)| value).ok_or("登录成功，但未取得客服独立会话 Cookie".to_owned())?;
+        let (service, parent) = {
+            let conn = state.db.lock().map_err(to_error)?;
+            (
+                get_account(&conn, &account_id).map_err(to_error)?,
+                get_account(&conn, &parent_id).map_err(to_error)?,
+            )
+        };
+        if remote_id == parent.remote_account_id {
+            return Err("登录返回的是主账号，请核对客服登录名".to_owned());
+        }
+        if !service.remote_account_id.is_empty() && remote_id != service.remote_account_id {
+            return Err("登录返回的不是当前客服账号，已拒绝写入会话".to_owned());
+        }
+        let profile = if service.remote_account_id.is_empty() {
+            let profile = fetch_account_profile(&result.cookie).await?;
+            if profile.member_name != service.service_login_name
+                && profile.nickname != service.service_login_name
+            {
+                return Err("登录身份与客服登录名不一致，已拒绝写入会话".to_owned());
+            }
+            Some(profile)
+        } else {
+            None
+        };
+        let cookie = profile.as_ref().map(|value| value.cookie.as_str()).unwrap_or(&result.cookie);
         let conn = state.db.lock().map_err(to_error)?;
-        let parent = get_account(&conn, &parent_id).map_err(to_error)?;
-        if remote_id == parent.remote_account_id { return Err("登录返回的是主账号，请核对客服登录名".to_owned()); }
-        let encrypted_cookie = encrypt_secret(&state.secret_key, &result.cookie)?;
+        if let Some(profile) = profile.as_ref() {
+            save_account_profile(&conn, &account_id, profile)?;
+        }
+        let encrypted_cookie = encrypt_secret(&state.secret_key, cookie)?;
         let encrypted_password = encrypt_secret(&state.secret_key, &password)?;
         let now = Utc::now().to_rfc3339();
         conn.execute("INSERT INTO account_credentials (account_id, cookie, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET cookie = excluded.cookie, updated_at = excluded.updated_at", params![account_id, encrypted_cookie, now]).map_err(to_error)?;
@@ -2415,7 +2454,33 @@ fn update_account(
 }
 
 #[tauri::command]
-fn delete_account(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn delete_account(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    // A客服账号 is owned by the official seller account. Delete it remotely
+    // first, then clear local credentials and chat data only after the mtop
+    // request succeeds. Main-account deletion remains local because the
+    // seller platform does not expose an account-delete operation for it.
+    let remote_delete = {
+        let conn = state.db.lock().map_err(to_error)?;
+        match conn.query_row(
+            "SELECT parent_account_id, platform_sub_id FROM service_accounts WHERE account_id = ?1",
+            [&id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ) {
+            Ok((parent_account_id, platform_sub_id)) => {
+                let cookie = local_session(&conn, &parent_account_id, &state.secret_key);
+                Some((parent_account_id, platform_sub_id, cookie))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(to_error(error)),
+        }
+    };
+    if let Some((parent_account_id, platform_sub_id, cookie)) = remote_delete {
+        let cookie = cookie?;
+        let renewed_cookie = service_account::delete(&cookie, &platform_sub_id).await?;
+        let conn = state.db.lock().map_err(to_error)?;
+        save_renewed_session(&conn, &parent_account_id, &renewed_cookie, &state.secret_key)?;
+    }
+
     let mut conn = state.db.lock().map_err(to_error)?;
     let child_ids = {
         let mut statement = conn
@@ -3865,21 +3930,24 @@ async fn complete_im_verification(
     let challenge_url = state.im_validation_urls.lock().map_err(to_error)?.get(&account_id).cloned()
         .or_else(|| state.service_login_challenges.lock().ok()?.get(&account_id).map(|challenge| challenge.verification_url.clone()))
         .filter(|url| !url.is_empty());
+    let is_service_challenge = state.service_login_challenges.lock().map_err(to_error)?
+        .get(&account_id).is_some_and(|challenge| !challenge.verification_url.is_empty());
     let mut browser_cookies = HashMap::new();
-    // Only the x5 cookies are output of the challenge.  The WebView also has
-    // unrelated passport cookies (and sometimes an older `_m_h5_tk`/`unb`);
-    // copying those back by name can overwrite the QR session that the IM
-    // token request is meant to use.
+    // A service-password challenge uses one browser context for the slider and
+    // the following SMS redirect. Keep its complete cookie jar, because the
+    // redirect may depend on context cookies besides x5sec. For the main IM
+    // flow only x5* is handed back, so unrelated passport cookies cannot
+    // overwrite the QR session used by the IM token request.
     for cookie in window.cookies().map_err(to_error)? {
         let name = cookie.name().to_owned();
-        if name.to_ascii_lowercase().starts_with("x5") && !cookie.value().trim().is_empty() {
+        if (is_service_challenge || name.to_ascii_lowercase().starts_with("x5")) && !cookie.value().trim().is_empty() {
             browser_cookies.insert(name, cookie.value().to_owned());
         }
     }
     if let Ok(url) = window.url() {
         for cookie in window.cookies_for_url(url).map_err(to_error)? {
             let name = cookie.name().to_owned();
-            if name.to_ascii_lowercase().starts_with("x5") && !cookie.value().trim().is_empty() {
+            if (is_service_challenge || name.to_ascii_lowercase().starts_with("x5")) && !cookie.value().trim().is_empty() {
                 browser_cookies.insert(name, cookie.value().to_owned());
             }
         }
@@ -3887,7 +3955,7 @@ async fn complete_im_verification(
     if let Some(url) = challenge_url.as_deref().and_then(|value| reqwest::Url::parse(value).ok()) {
         for cookie in window.cookies_for_url(url).map_err(to_error)? {
             let name = cookie.name().to_owned();
-            if name.to_ascii_lowercase().starts_with("x5") && !cookie.value().trim().is_empty() {
+            if (is_service_challenge || name.to_ascii_lowercase().starts_with("x5")) && !cookie.value().trim().is_empty() {
                 browser_cookies.insert(name, cookie.value().to_owned());
             }
         }

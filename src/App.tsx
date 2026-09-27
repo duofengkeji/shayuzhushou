@@ -511,15 +511,18 @@ function MainApp() {
       })
       if (cancelled) stop()
       else unlisten = stop
+      const hasServiceAccount = new Set(accounts.filter((account) => account.parentAccountId).map((account) => account.parentAccountId))
       const listenerAccounts = accounts.filter((account) =>
-        account.parentAccountId && account.remoteAccountId && account.status !== '已停用' && !deferredImRemoteIdsRef.current.has(account.remoteAccountId),
+        account.remoteAccountId && account.status !== '已停用'
+        && (account.parentAccountId || !hasServiceAccount.has(account.id))
+        && !deferredImRemoteIdsRef.current.has(account.remoteAccountId),
       )
       await Promise.all(listenerAccounts.map((account) => api.startChatListener(account.id).catch(() => undefined)))
     })()
     return () => {
       cancelled = true
       unlisten?.()
-      void Promise.all(accounts.filter((account) => account.parentAccountId).map((account) => api.stopChatListener(account.id).catch(() => undefined)))
+      void Promise.all(accounts.filter((account) => account.remoteAccountId).map((account) => api.stopChatListener(account.id).catch(() => undefined)))
     }
   // IM listeners belong to the application/account lifecycle, not the
   // currently visible page.  Including `page` here would disconnect every
@@ -685,9 +688,14 @@ function MainApp() {
       // Re-authenticating an existing account does not change its React
       // lifecycle key, so explicitly replace a listener that may have exited
       // after an authentication failure.
-      const account = (await api.accounts()).find((item) => item.remoteAccountId === remoteAccountId)
+      const refreshedAccounts = await api.accounts()
+      const account = refreshedAccounts.find((item) => item.remoteAccountId === remoteAccountId)
       if (account) {
         serviceListSyncAttemptedRef.current.delete(account.id)
+        const hasServiceAccount = refreshedAccounts.some((item) => item.parentAccountId === account.id)
+        if (!hasServiceAccount) {
+          await api.startChatListener(account.id)
+        }
         // 商品和订单接口只依赖本机登录 Cookie，不依赖 IM WebSocket。
         // 登录成功后在后台同步，二维码流程和账号资料展示不被网络耗时阻塞。
         void api.syncAccount(account.id)
@@ -700,7 +708,8 @@ function MainApp() {
             void refresh()
           })
       }
-      setNotice(`扫码登录成功，主账号 IM 默认不连接；如需使用主账号会话，可在账号卡片点击“登录 IM”。${profileWarning ? '账号头像、昵称或会员名暂未刷新，详情见“账号资料”日志。' : ''}`)
+      const hasServiceAccount = account ? refreshedAccounts.some((item) => item.parentAccountId === account.id) : false
+      setNotice(`扫码登录成功，${hasServiceAccount ? '客服账号按已保存的登录状态连接' : '主账号 IM 已自动连接'}；商品和订单正在后台同步。${profileWarning ? '账号头像、昵称或会员名暂未刷新，详情见“账号资料”日志。' : ''}`)
     } catch (error) {
       handleError(error)
     }
@@ -947,6 +956,7 @@ function Accounts({ accounts, imStatuses, onQrLogin, onVerify, onLoginIm, onEdit
     }
     return grouped
   }, [accounts])
+  const showServiceManagement = false
   const toggleAll = () => setSelected(selected.length === visible.length ? [] : visible.map((account) => account.id))
   const toggle = (id: string) => setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])
   return <div className="page account-page">
@@ -961,7 +971,7 @@ function Accounts({ accounts, imStatuses, onQrLogin, onVerify, onLoginIm, onEdit
         <div className="account-card-badges"><span className={account.remoteAccountId ? 'account-card-connected' : 'account-card-muted'}>{account.remoteAccountId ? <><CheckCircle2 size={13} />已登录</> : '仅本地资料'}</span><ImStatusBadge value={imStatuses[account.id]} /></div>
         <div className="account-card-info"><div><span>账号别名</span><strong>{account.alias || '未设置别名'}</strong></div><div><span>最后同步</span><strong>{formatDate(account.lastSyncAt)}</strong></div></div>
         <div className="account-card-metrics"><div><span>商品</span><b>{account.productCount}</b></div><div><span>订单</span><b>{account.orderCount}</b></div><div><span>同步状态</span><b>{account.status === '授权有效' ? '正常' : '需关注'}</b></div></div>
-        <div className="service-management">
+        {showServiceManagement && <div className="service-management">
           <div className="service-management-head">
             <div className="service-management-title"><strong>客服管理</strong><span>{serviceAccounts.length} 位客服</span></div>
             <div className="service-management-actions">
@@ -987,12 +997,13 @@ function Accounts({ accounts, imStatuses, onQrLogin, onVerify, onLoginIm, onEdit
                     ? <button className="service-account-action-primary" type="button" onClick={() => onVerify(child)}><ShieldCheck size={14} />滑块验证</button>
                     : <button className={imStatus === 'connected' ? 'service-account-action-secondary' : 'service-account-action-primary'} type="button" onClick={() => onLoginService(child)}><LogIn size={14} />登录客服</button>}
                   <button className={imStatus === 'connected' ? 'service-account-action-primary' : 'service-account-action-secondary'} type="button" onClick={() => onOpenService(child)}><MessageCircle size={14} />进入会话</button>
+                  <button className="service-account-action-danger" type="button" onClick={() => onDelete(child)}><Trash2 size={14} />删除</button>
                 </div>
               </div>
             })}
             {serviceAccounts.length === 0 && <p className="service-management-empty">暂无客服，添加后可独立连接 IM。</p>}
           </div>
-        </div>
+        </div>}
         <footer className="account-card-rich-footer account-card-manage-footer">
           <span>主账号操作</span>
           {imStatuses[account.id] === 'verification_required'
@@ -1154,7 +1165,8 @@ function DeleteAccountDialog({ account, onClose, onDelete }: { account: Account;
       setDeleting(false)
     }
   }
-  return <Modal title="删除账号" onClose={() => { if (!deleting) onClose() }}><div className="delete-account-confirm"><div className="delete-warning-icon"><Trash2 size={24} /></div><h3>确认删除“{account.displayName}”吗？</h3><p>将从当前电脑永久删除此账号及其登录会话、聊天记录、已读状态、同步记录、{account.productCount} 个商品和 {account.orderCount} 个订单。</p><p className="delete-warning-note">此操作不会删除闲鱼平台上的账号、商品或订单，但本地数据无法恢复。</p>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button className="secondary" disabled={deleting} onClick={onClose}>取消</button><button className="danger-button" disabled={deleting} onClick={() => void confirm()}><Trash2 size={16} />{deleting ? '正在删除…' : '确认删除'}</button></div></div></Modal>
+  const isService = Boolean(account.parentAccountId)
+  return <Modal title={isService ? '删除客服' : '删除账号'} onClose={() => { if (!deleting) onClose() }}><div className="delete-account-confirm"><div className="delete-warning-icon"><Trash2 size={24} /></div><h3>确认删除“{account.displayName}”吗？</h3><p>{isService ? '将先从闲鱼官方后台删除此客服账号，远程删除成功后再清理本机保存的密码、Cookie、聊天记录和会话数据。' : `将从当前电脑永久删除此账号及其登录会话、聊天记录、已读状态、同步记录、${account.productCount} 个商品和 ${account.orderCount} 个订单`}。</p><p className="delete-warning-note">{isService ? '官方删除后不可恢复；如果远程接口失败，本地数据会保留。' : '此操作不会删除闲鱼平台上的账号、商品或订单，但本地数据无法恢复。'}</p>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button className="secondary" disabled={deleting} onClick={onClose}>取消</button><button className="danger-button" disabled={deleting} onClick={() => void confirm()}><Trash2 size={16} />{deleting ? '正在删除…' : isService ? '确认删除客服' : '确认删除'}</button></div></div></Modal>
 }
 
 function AccountDialog({ value, onClose, onSave }: { value?: Account; onClose: () => void; onSave: (input: AccountInput, current?: Account) => void }) {

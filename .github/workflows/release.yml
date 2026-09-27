@@ -114,3 +114,35 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: --bundles appimage
+
+  # Tauri uses the bare semantic version in bundle filenames while the
+  # release title uses the tag (for example, v0.1.7). Normalize uploaded
+  # assets so downloaded filenames match the visible release version.
+  normalize-asset-names:
+    needs: [desktop-release, linux-release]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Add v prefix to bundle filenames
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag
+            });
+            const version = tag.replace(/^v/, '');
+            const marker = `_${version}_`;
+            const replacement = `_${tag}_`;
+            for (const asset of release.data.assets) {
+              if (!asset.name.includes(marker) || asset.name.includes(replacement)) continue;
+              const name = asset.name.replace(marker, replacement);
+              await github.rest.repos.updateReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                asset_id: asset.id,
+                name
+              });
+              core.info(`Renamed ${asset.name} -> ${name}`);
+            }

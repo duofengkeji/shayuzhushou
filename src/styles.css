@@ -970,6 +970,8 @@
 .service-account-action-primary:hover { background: #f5c900; }
 .service-account-action-secondary { color: #45626b; background: #fff; border-color: #dfe7e5 !important; }
 .service-account-action-secondary:hover { color: #246e59; border-color: #acd0c2 !important; background: #f8fcfa; }
+.service-account-action-danger { color: #b43d3d; background: #fff7f7; border-color: #f1d1d1 !important; }
+.service-account-action-danger:hover { color: #922f2f; background: #ffeded; border-color: #e9b7b7 !important; }
 .service-account-actions button:focus-visible, .service-management-actions button:focus-visible, .account-card-manage-footer button:focus-visible { outline: 2px solid #278a6e; outline-offset: 2px; }
 .service-management-empty { margin: 0; padding: 15px 12px; border: 1px dashed #dce7e1; border-radius: 9px; color: #8b9b9d; background: #fbfcfb; font-size: 11px; text-align: center; }
 .account-card-manage-footer { flex-wrap: wrap; justify-content: flex-end; gap: 7px; margin-top: 14px; padding-top: 12px; border-top: 1px solid #edf1ee; }
